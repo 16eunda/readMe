@@ -65,35 +65,38 @@ function decodeTextSafe(buffer: Buffer): string {
   return iconv.decode(buffer, 'utf-8');
 }
 
+// BASE_URL을 컴포넌트 외부로 이동
+const getBaseURL = () => {
+  if (Platform.OS === "web") {
+    return "http://localhost:8080";
+  } else if (Platform.OS === "android") {
+    return "http://10.0.2.2:8080";
+  } else if (Platform.OS === "ios") {
+    return "http://127.0.0.1:8080";
+  } else {
+    return "http://192.168.35.99:8080";
+  }
+};
+
+const BASE_URL = getBaseURL();
+
 export default function Home() {
   console.log("🔵 RN 화면 렌더링 시작됨");
 
-  console.log("SearchBar 👉", SearchBar);
-console.log("EditModal 👉", EditModal);
-console.log("PreviewModal 👉", PreviewModal);
-console.log("FolderOptionsModal 👉", FolderOptionsModal);
-console.log("EditModal 👉", EditModal);
-console.log("FileMoveModal 👉", FileMoveModal);
-console.log("FolderRenameModal 👉", FolderRenameModal);
-console.log("CreateFolderModal 👉", CreateFolderModal);
-
+  // ========== 1. 외부 Hooks (useRouter, useLocalSearchParams) ==========
   const router = useRouter();
-
   const { folder } = useLocalSearchParams();
-  const currentFolder = folder ?? "root"; // 현재 위치한 폴더
+  const currentFolder = folder ?? "root";
 
+  // ========== 2. 모든 useState ==========
   const [search, setSearch] = useState("");
-
-  useEffect(() => {
-    console.log(" currentFolder =", currentFolder);
-  }, [currentFolder]);
-
+  
   // 파일 상태
   const [files, setFiles] = useState<any[]>([]);
   const [fileOptionsVisible, setFileOptionsVisible] = useState(false);
   const [moveModalVisible, setMoveModalVisible] = useState(false);
   const [selectedFile, setSelectedFile] = useState<FileItem | null>(null);
-  const [showEditModal, setShowEditModal] = useState(false)
+  const [showEditModal, setShowEditModal] = useState(false);
 
   // 폴더 상태
   const [folders, setFolders] = useState<any[]>([]);
@@ -116,20 +119,37 @@ console.log("CreateFolderModal 👉", CreateFolderModal);
   // 무한 스크롤
   const [displayCount, setDisplayCount] = useState(10);
 
-  let BASE_URL = "";
+  // ========== 3. 모든 useMemo ==========
+  const filteredFiles = useMemo(() => {
+    const listInCurrentFolder = files
+      .filter((f) => f && f.path !== undefined)
+      .filter((f) => f.path === currentFolder);
 
-  if (Platform.OS === "web") {
-    BASE_URL = "http://localhost:8080";
-  } else if (Platform.OS === "android") {
-    // ▫ Android Emulator일 경우, Expo Go(실기기)는 아님
-    BASE_URL = "http://10.0.2.2:8080";
-  } else if (Platform.OS === "ios") {
-    // ▫ iOS Simulator는 localhost 사용 가능
-    BASE_URL = "http://127.0.0.1:8080";
-  } else {
-    // 마지막으로, Expo Go(실제 기기)는 이렇게 override 필요
-    BASE_URL = "http://192.168.35.99:8080"; // ← 너 PC의 실제 IP로 바꿔야 함
-  }
+    if (!search.trim()) return listInCurrentFolder;
+
+    const text = search.toLowerCase();
+    return listInCurrentFolder.filter((item) =>
+      item.title.toLowerCase().includes(text)
+    );
+  }, [search, files, currentFolder]);
+
+  const visibleFolders = useMemo(() => {
+    return folders.filter((f) => f && f.name && f.path === currentFolder);
+  }, [folders, currentFolder]);
+
+  // ========== 4. 모든 useEffect ==========
+  useEffect(() => {
+    console.log(" currentFolder =", currentFolder);
+  }, [currentFolder]);
+
+  useEffect(() => {
+    fetchFiles();
+    fetchFolders();
+  }, []);
+
+  useEffect(() => {
+    setDisplayCount(10);
+  }, [search, currentFolder]);
   // -----------------------------
   // 파일 조회
   // -----------------------------
@@ -352,28 +372,6 @@ console.log("CreateFolderModal 👉", CreateFolderModal);
   };
 
   // -----------------------------
-  // 검색 기능
-  // -----------------------------
-  const filteredFiles = useMemo(() => {
-    const listInCurrentFolder = files
-  .filter((f) => f && f.path !== undefined)
-  .filter((f) => f.path === currentFolder);
-
-    if (!search.trim()) return listInCurrentFolder;
-
-    const text = search.toLowerCase();
-    return listInCurrentFolder.filter((item) =>
-      item.title.toLowerCase().includes(text)
-    );
-  }, [search, files, currentFolder]);
-
-  // 현재 폴더의 폴더 리스트
-  // 현재 폴더의 폴더 리스트 (안전 버전)
-  const visibleFolders = folders.filter(
-    (f) => f && f.name && f.path === currentFolder
-  );
-
-   // -----------------------------
   // 파일 카드 클릭 기능
   // -----------------------------
   const handleFilePress = async (file : any) => {
@@ -434,18 +432,9 @@ console.log("CreateFolderModal 👉", CreateFolderModal);
     } finally {
       setShowEditModal(false);
     }
-};
+  };
 
-  useEffect(() => {
-    fetchFiles();
-    //fetchFolders();
-  }, []);
-
-  // 검색어 변경 시 displayCount 리셋
-  useEffect(() => {
-    setDisplayCount(10);
-  }, [search, currentFolder]);
-
+  // 검색어 변경 시 displayCount 리셋 (이미 위에 useEffect로 처리됨)
   const isInitial = files.length === 0 && !search;
   const noSearchResult = filteredFiles.length === 0 && search;
   console.log("🟣 before return");

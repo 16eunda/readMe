@@ -1,11 +1,12 @@
 // app/(tabs)/settings.tsx
 import { useEffect, useState } from "react";
 import {
-    Dimensions,
-    ScrollView,
-    StyleSheet,
-    Text,
-    View
+  Dimensions,
+  Platform,
+  SafeAreaView,
+  StyleSheet,
+  Text,
+  View
 } from "react-native";
 
 type FileStats = {
@@ -14,32 +15,43 @@ type FileStats = {
   fiveStarCount: number;
 };
 
-const [stats, setStats] = useState<FileStats | null>(null);
-const [loading, setLoading] = useState(true);
+// BASE_URL을 컴포넌트 외부로 이동
+const getBaseURL = () => {
+  if (Platform.OS === "web") {
+    return "http://localhost:8080";
+  } else if (Platform.OS === "android") {
+    return "http://10.0.2.2:8080";
+  } else if (Platform.OS === "ios") {
+    return "http://127.0.0.1:8080";
+  } else {
+    return "http://192.168.35.99:8080";
+  }
+};
 
-useEffect(() => {
-  fetch("http://localhost:8080/files/stats")
-    .then((res) => res.json())
-    .then((data) => {
-      setStats(data);
-    })
-    .catch((err) => {
-      console.error("stats fetch error", err);
-    })
-    .finally(() => {
-      setLoading(false);
-    });
-}, []);
-
+const BASE_URL = getBaseURL();
 const SCREEN_HEIGHT = Dimensions.get("window").height;
 
 export default function SettingsScreen() {
+  // ========== Hooks는 컴포넌트 안에서만! ==========
+  const [stats, setStats] = useState<FileStats | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch(`${BASE_URL}/files/stats`)
+      .then((res) => res.json())
+      .then((data) => {
+        setStats(data);
+      })
+      .catch((err) => {
+        console.error("stats fetch error", err);
+      })
+      .finally(() => {
+        setLoading(false);
+      });
+  }, []);
   return (
-    <ScrollView
-      style={styles.container}
-      contentContainerStyle={styles.content}
-      showsVerticalScrollIndicator={false}
-    >
+    <SafeAreaView style={styles.container}>
+      <View style={styles.content}>
       {/* 프로필 */}
       <View style={styles.profileSection}>
         <View style={styles.avatar} />
@@ -77,7 +89,8 @@ export default function SettingsScreen() {
           </View>
         </View>
       </View>
-    </ScrollView>
+      </View>
+    </SafeAreaView>
   );
 }
 
@@ -99,8 +112,9 @@ const styles = StyleSheet.create({
   },
 
   content: {
-    flexGrow: 1,
+    flex: 1,
     padding: 20,
+    paddingTop: 30,
   },
 
   profileSection: {
@@ -142,7 +156,7 @@ const styles = StyleSheet.create({
   },
 
   quoteSection: {
-    flexGrow: 1,
+    flex: 1,
     marginTop: 16,
   },
 
@@ -153,7 +167,7 @@ const styles = StyleSheet.create({
   },
 
   quoteCard: {
-    minHeight: SCREEN_HEIGHT * 0.45,
+    flex: 1,
     backgroundColor: "#e0e0e0",
     borderRadius: 12,
   },

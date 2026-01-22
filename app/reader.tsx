@@ -123,14 +123,23 @@ export default function ReaderScreen() {
     read();
   }, [uri, name]);
 
+  // 서버에서 불러온 초기 progress 저장 (0으로 덮어쓰기 방지)
+  const initialProgressRef = useRef<number>(0);
+
   useEffect(() => {
   const load = async () => {
     try {
+      console.log("🔍 서버에서 파일 정보 불러오는 중...", fileId);
       const res = await fetch(`${BASE_URL}/files/${fileId}`);
       const fileInfo = await res.json();
+      console.log("📚 서버에서 받은 데이터:", fileInfo);
 
       if (fileInfo.progress > 0) {
-        setProgress(fileInfo.progress);   // 진행도만 넣어둔다
+        console.log("✅ 저장된 progress 발견:", fileInfo.progress);
+        setProgress(fileInfo.progress);
+        initialProgressRef.current = fileInfo.progress;
+      } else {
+        console.log("⚠️ 저장된 progress 없음");
       }
 
       // ⭐ EPUB 이어 읽기: 저장된 CFI 있으면 기억
@@ -143,24 +152,30 @@ export default function ReaderScreen() {
   };
 
   load();
-}, []);
+}, [fileId, BASE_URL]);
 
 // TXT 컨텐츠 렌더링이 끝나고 높이가 계산된 뒤, 저장된 progress대로 스크롤 이동
 useEffect(() => {
-  // EPUB일 땐 스크롤 안 쓰니까 TXT일 때만
+  console.log("🔍 이어읽기 체크:", { isEpub, progress, contentHeight, viewHeight });
+  
+  // EPUB일 땀 스크롤 안 쓰니까 TXT일 때만
   if (isEpub) return;
 
-  // 아직 ref 없으면 패스
+  // 아직 ref 없으더나 높이 없으면 패스
   if (!scrollRef.current) return;
+  if (contentHeight <= 0 || viewHeight <= 0) return;
 
-  // progress 0이면 처음부터 읽는 거니까 패스
+  // progress 0이면 처음부터 읽기
   if (!progress || progress <= 0) return;
 
   const maxScroll = contentHeight - viewHeight;
   if (maxScroll <= 0) return;
 
+  const scrollY = maxScroll * progress;
+  console.log("📚 TXT 이어읽기 실행! progress:", progress, "scrollY:", scrollY);
+
   scrollRef.current.scrollTo({
-    y: maxScroll * progress,
+    y: scrollY,
     animated: false,
   });
 }, [contentHeight, viewHeight, progress, isEpub]);
@@ -332,35 +347,97 @@ useEffect(() => {
 
   const title = String(name || "").replace(/\.[^.]+$/, ""); // 확장자 제거
 
-  async function saveProgressToServer() {
-  if (!fileId) return;
-
-  const body: any = { progress };
-
-  // ⭐ EPUB이면 CFI도 같이 보내기
-  if (isEpub && lastCfi) {
-    body.epubCfi = lastCfi;
-  }
-
-  try {
-    await fetch(`${BASE_URL}/files/${fileId}/progress`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    console.log("🔵 진행도 저장됨:", progress);
-  } catch (e) {
-    console.log("❌ 진행도 저장 실패:", e);
-  }
-}
-
   // ===================== 진행도 자동 저장 =====================
+  // unmount 시점에 최신 progress를 저장하기 위해 useRef 사용
+  const progressRef = useRef(progress);
+  const lastCfiRef = useRef(lastCfi);
+  const saveTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastSavedProgressRef = useRef<number>(0); // 마지막으로 저장한 progress
+
   useEffect(() => {
-  return () => {
-    // 여기가 unmount 시점
-    saveProgressToServer();
+    progressRef.current = progress;
+  }, [progress]);
+
+  useEffect(() => {
+    lastCfiRef.current = lastCfi;
+  }, [lastCfi]);
+
+  // 서버에 저장하는 함수
+  const saveProgressToServer = async (forceLog = false) => {
+    if (!fileId) return;
+
+    const currentProgress = progressRef.current;
+    
+    // 0으로 덮어쓰기 방지
+    if (currentProgress === 0 && initialProgressRef.current > 0) {
+      console.log("⚠️ progress가 0으로 초기화됨. 저장 안 함.");
+      return;
+    }
+
+    // 이전과 같은 값이면 저장 안 함 (중복 방지)
+    if (currentProgress === lastSavedProgressRef.current && !forceLog) {
+      return;
+    }
+
+    const body: any = { 
+      progress: currentProgress,
+      recordReadLog: forceLog || currentProgress > 0  // 강제 로그 또는 progress가 있을 때
+    };
+
+    if (isEpub && lastCfiRef.current) {
+      body.epubCfi = lastCfiRef.current;
+    }
+
+    try {
+      console.log("📤 서버로 전송하는 데이터:", body);
+      
+      const response = await fetch(`${BASE_URL}/files/${fileId}/progress`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (response.ok) {
+        lastSavedProgressRef.current = currentProgress;
+        console.log("🔵 진행도 저장됨:", currentProgress);
+      }
+    } catch (e) {
+      console.log("❌ 진행도 저장 실패:", e);
+    }
   };
-}, []);
+
+  // progress 변경 시 3초 후 자동 저장 (debounce)
+  useEffect(() => {
+    // 이전 타이머 취소
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+    }
+
+    // progress가 0이거나 초기 로딩 중이면 저장 안 함
+    if (progress === 0) return;
+
+    // 3초 후 자동 저장
+    saveTimerRef.current = setTimeout(() => {
+      saveProgressToServer(false);
+    }, 3000);
+
+    return () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+      }
+    };
+  }, [progress]);
+
+  // unmount 시 저장 (백업)
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+      }
+      // unmount 시에는 로그 기록
+      saveProgressToServer(true);
+    };
+  }, [fileId, isEpub, BASE_URL]);
 
   return (
     <View style={styles.root}>
