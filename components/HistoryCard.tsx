@@ -1,28 +1,37 @@
-import { StyleSheet, Text, View } from 'react-native';
+import { router } from 'expo-router';
+import { StyleSheet, Text, TouchableOpacity } from 'react-native';
 import StarRating from './StarRating';
 
 type Props = {
+  id: number;
   title: string;
   date: string;
+  uri?: string;
   rating: number;
 };
 
-export default function HistoryCard({ title, date, rating }: Props) {
+export default function HistoryCard({ id, title, date, uri, rating }: Props) {
   return (
-    <View style={styles.card}>
+    <TouchableOpacity style={styles.card} onPress={() => {
+      router.push({
+        pathname: "/reader",
+        params: { fileId: id, uri: uri, name: title  }
+      })
+    }}>
       <Text style={styles.title}>{title}</Text>
       <Text style={styles.date}>{date}</Text>
       <StarRating rating={rating} />
-    </View>
+    </TouchableOpacity>
   );
 }
 
 const styles = StyleSheet.create({
   card: {
-    backgroundColor: '#E5E5E5',
-    borderRadius: 12,
+    backgroundColor: '#f7f7f7',
+    borderRadius: 16,
     padding: 14,
     marginVertical: 8,
+    elevation: 2,
   },
   title: {
     fontSize: 15,

@@ -15,8 +15,9 @@ export type SortOrder = 'recent' | 'oldest';
 export interface FileRankingDto {
   fileId: number;
   title: string;
-  uploadDate: string;
+  lastReadAt: string;
   progress: number;
+  uri : string;
   rating: number;
   readCount: number;
 }

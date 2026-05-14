@@ -2,9 +2,13 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true,
+    "moduleResolution": "bundler",
     "paths": {
       "@/*": [
         "./*"
+      ],
+      "expo-router": [
+        "./node_modules/expo-router"
       ]
     }
   },

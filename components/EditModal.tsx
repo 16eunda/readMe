@@ -1,4 +1,4 @@
-import { MaterialIcons } from "@expo/vector-icons";
+import { FontAwesome5 } from "@expo/vector-icons";
 import React, { useState } from "react";
 import {
     Modal,
@@ -21,31 +21,40 @@ export default function EditModal({ file, onClose, onSave }: any) {
           <Text style={styles.header}>Info</Text>
 
           {/* 제목 */}
-          <Text style={styles.label}>제목</Text>
-          <TextInput
-            style={styles.input}
-            value={title}
-            onChangeText={setTitle}
-          />
+          <View>
+            <Text style={styles.label}>제목</Text>
+            <TextInput
+              style={styles.input}
+              value={title}
+              onChangeText={setTitle}
+              maxLength={50}
+            />
+            <Text style={styles.counter}>{title.length}/50자</Text>
+          </View>
 
           {/* 리뷰 */}
-          <Text style={styles.label}>리뷰</Text>
-          <TextInput
-            style={[styles.input, { height: 100 }]}
-            value={review}
-            onChangeText={setReview}
-            multiline
-          />
+          <View>
+            <Text style={styles.label}>리뷰</Text>
+            <TextInput
+              style={[styles.input, { height: 100 }]}
+              value={review}
+              onChangeText={setReview}
+              multiline
+              maxLength={300}
+            />
+            <Text style={styles.counter}>{review.length}/300자</Text>
+          </View>
 
           {/* 별점 */}
           <Text style={styles.label}>별점</Text>
           <View style={styles.starRow}>
             {[1, 2, 3, 4, 5].map((n) => (
               <TouchableOpacity key={n} onPress={() => setRating(n)}>
-                <MaterialIcons
-                  name={n <= rating ? "star" : "star-border"}
+                <FontAwesome5
+                  name="star"
                   size={32}
-                  color={n <= rating ? "#FFC149" : "#ccc"}
+                  solid={n <= rating}
+                  color={n <= rating ? "#FFD84E" : "#D1D1D1"}
                 />
               </TouchableOpacity>
             ))}
@@ -77,25 +86,29 @@ const styles = StyleSheet.create({
     padding: 20,
   },
   modal: {
-    backgroundColor: "#e6e6e6",
+    backgroundColor: "#FFFFFF",
     borderRadius: 20,
     padding: 20,
   },
   header: {
     fontSize: 22,
+    fontWeight: "600",
     textAlign: "center",
     marginBottom: 20,
   },
   label: {
     fontSize: 16,
+    fontWeight: "500",
     marginTop: 10,
     marginBottom: 4,
   },
   input: {
-    backgroundColor: "#faf5f5",
+    backgroundColor: "#F5F5F5",
     borderRadius: 12,
-    padding: 10,
+    padding: 12,
     fontSize: 16,
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
   },
   starRow: {
     flexDirection: "row",
@@ -122,5 +135,11 @@ const styles = StyleSheet.create({
   },
   cancelText: {
     color: "#444",
+  },
+  counter: {
+    fontSize: 12,
+    color: "#666",
+    textAlign: "right",
+    marginTop: 4,
   },
 });

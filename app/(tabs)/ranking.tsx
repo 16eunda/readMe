@@ -1,7 +1,11 @@
 // app/(tabs)/ranking.tsx
 import { API_BASE_URL } from "@/constants/config";
 import { FileRankingDto } from "@/types/file";
-import React, { useCallback, useEffect, useState } from "react";
+import { getDeviceId } from "@/utils/deviceId";
+import { FontAwesome5 } from "@expo/vector-icons";
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { router, useFocusEffect } from 'expo-router';
+import React, { useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   NativeScrollEvent,
@@ -13,10 +17,12 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { useUser } from '../../contexts/UserContext';
 
 const ITEMS_PER_PAGE = 10;
 
 export default function RankingScreen() {
+  const { isPremium } = useUser();
   const [period, setPeriod] = useState<"한달" | "올해">("한달");
   const [rankings, setRankings] = useState<FileRankingDto[]>([]);
   const [displayedItems, setDisplayedItems] = useState(ITEMS_PER_PAGE);
@@ -24,26 +30,43 @@ export default function RankingScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // 클라이언트 사이드 통계 계산
+  const stats = useMemo(() => {
+    if (rankings.length === 0) return null;
+    const totalReadCount = rankings.reduce((sum, r) => sum + r.readCount, 0);
+    const ratedBooks = rankings.filter(r => r.rating > 0);
+    const avgRating = ratedBooks.length > 0
+      ? ratedBooks.reduce((sum, r) => sum + r.rating, 0) / ratedBooks.length
+      : 0;
+    const completedCount = rankings.filter(r => r.progress >= 0.95).length;
+    return {
+      totalReadCount,
+      avgRating: Math.round(avgRating * 10) / 10,
+      completedCount,
+    };
+  }, [rankings]);
+
+
   const fetchRankings = async (showLoading = true) => {
     if (showLoading) setLoading(true);
     setError(null);
-    
     try {
-      const endpoint = period === "한달" 
+      const token = await AsyncStorage.getItem("accessToken");
+      const deviceId = await getDeviceId();
+      const endpoint = period === "한달"
         ? `${API_BASE_URL}/ranking/month`
         : `${API_BASE_URL}/ranking/year`;
-      
-      const response = await fetch(endpoint);
-      
-      if (!response.ok) {
-        throw new Error(`서버 오류: ${response.status}`);
-      }
-
+      const response = await fetch(endpoint, {
+        headers: {
+          "X-Device-Id": deviceId,
+          ...(token && { Authorization: `Bearer ${token}` }),
+        },
+      });
+      if (!response.ok) throw new Error(`서버 오류: ${response.status}`);
       const data: FileRankingDto[] = await response.json();
       setRankings(data);
       setDisplayedItems(ITEMS_PER_PAGE);
     } catch (err) {
-      console.error("랭킹 로드 실패:", err);
       setError(err instanceof Error ? err.message : "랭킹을 불러오는데 실패했습니다");
     } finally {
       setLoading(false);
@@ -51,9 +74,12 @@ export default function RankingScreen() {
     }
   };
 
-  useEffect(() => {
-    fetchRankings();
-  }, [period]);
+  useFocusEffect(
+    useCallback(() => {
+      console.log('🎯 랜킹 페이지: 화면 포커스됨, period:', period);
+      fetchRankings();
+    }, [period])
+  );
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
@@ -73,12 +99,14 @@ export default function RankingScreen() {
 
   const renderStars = (rating: number) => {
     return Array.from({ length: 5 }, (_, i) => (
-      <Text
+      <FontAwesome5
         key={i}
-        style={i < rating ? styles.starOn : styles.starOff}
-      >
-        ★
-      </Text>
+        name="star"
+        size={18}
+        solid={i < rating}
+        color={i < rating ? "#FFD84E" : "#D1D1D1"}
+        style={{ marginRight: 2 }}
+      />
     ));
   };
 
@@ -159,7 +187,14 @@ export default function RankingScreen() {
 
       {/* 랭킹 카드 목록 */}
       {!loading && !error && visibleRankings.map((item, index) => (
-        <View key={item.fileId} style={styles.card}>
+        <TouchableOpacity key={item.fileId} style={styles.card} 
+        onPress={() => {
+          // 파일 상세 페이지로 이동
+          router.push({
+            pathname: "/reader",
+            params: { fileId: item.fileId, uri: item.uri, name: item.title }
+          })
+        }}>
           <Text style={styles.rank}>{index + 1}.</Text>
 
           <View style={styles.cardContent}>
@@ -168,10 +203,12 @@ export default function RankingScreen() {
             </Text>
 
             <Text style={styles.date}>
-              {new Date(item.uploadDate).toLocaleDateString('ko-KR')}
+              {item.lastReadAt
+                ? new Date(item.lastReadAt).toLocaleDateString("ko-KR")
+                : '날짜 정보 없음'}
             </Text>
             <Text style={styles.progress}>
-              진행도: {Math.round(item.progress)}%
+              진행도: {Math.round(item.progress * 100)}%
             </Text>
 
             <View style={styles.starRow}>
@@ -180,7 +217,7 @@ export default function RankingScreen() {
           </View>
 
           <Text style={styles.readCount}>{item.readCount}회</Text>
-        </View>
+        </TouchableOpacity>
       ))}
 
       {/* 더 보기 로딩 */}
@@ -193,7 +230,33 @@ export default function RankingScreen() {
         </View>
       )}
 
+      {/* 프리미엄 유도 배너 */}
+      {!isPremium && !loading && rankings.length > 0 && (
+        <TouchableOpacity
+          style={styles.premiumTeaser}
+          onPress={() => router.push('/ranking-premium' as any)}
+          activeOpacity={0.8}
+        >
+          <View style={styles.teaserLeft}>
+            <Text style={styles.teaserEmoji}>📅</Text>
+            <View>
+              <Text style={styles.teaserTitle}>지난 달 / 다른 년도 랭킹도 보고 싶다면?</Text>
+              <Text style={styles.teaserSub}>프리미엄으로 모든 기간 조회 + 상세 통계</Text>
+            </View>
+          </View>
+          <Text style={styles.teaserChevron}>›</Text>
+        </TouchableOpacity>
+      )}
+
       {/* 하단 여백 */}
+      {/* TODO: 테스트용 버튼 - 완성 후 삭제 */}
+      <TouchableOpacity
+        onPress={() => router.push('/ranking-premium' as any)}
+        style={{ backgroundColor: '#7C3AED', borderRadius: 12, padding: 14, alignItems: 'center', marginTop: 16, marginBottom: 8 }}
+      >
+        <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>🧪 프리미엄 랭킹 페이지 테스트</Text>
+      </TouchableOpacity>
+
       {visibleRankings.length > 0 && (
         <View style={styles.bottomPadding} />
       )}
@@ -245,12 +308,13 @@ const styles = StyleSheet.create({
   /* 카드 */
   card: {
     flexDirection: "row",
-    backgroundColor: "#e0e0e0",
+    backgroundColor: "#f7f7f7",
     borderRadius: 16,
     padding: 16,
     marginBottom: 16,
     alignItems: "flex-start",
     minHeight: 120,
+    elevation: 2,
   },
 
   rank: {
@@ -283,18 +347,6 @@ const styles = StyleSheet.create({
 
   starRow: {
     flexDirection: "row",
-  },
-
-  starOn: {
-    fontSize: 18,
-    color: "#f4a261",
-    marginRight: 2,
-  },
-
-  starOff: {
-    fontSize: 18,
-    color: "#bbb",
-    marginRight: 2,
   },
 
   readCount: {
@@ -357,4 +409,27 @@ const styles = StyleSheet.create({
   bottomPadding: {
     height: 40,
   },
+
+  /* 프리미엄 유도 배너 */
+  premiumTeaser: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#FAF5FF',
+    borderRadius: 16,
+    padding: 16,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: '#E8DCFF',
+  },
+  teaserLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    gap: 12,
+  },
+  teaserEmoji: { fontSize: 28 },
+  teaserTitle: { fontSize: 14, fontWeight: '700', color: '#7C3AED' },
+  teaserSub: { fontSize: 12, color: '#9F67E8', marginTop: 2 },
+  teaserChevron: { fontSize: 28, color: '#7C3AED', fontWeight: '700' },
 });

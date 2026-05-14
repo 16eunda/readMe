@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>구독 시스템 구현 가이드</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f7; color: #1d1d1f; line-height: 1.6; }
+    .header { background: linear-gradient(135deg, #7C3AED, #a855f7); color: white; padding: 40px; text-align: center; }
+    .header h1 { font-size: 2rem; margin-bottom: 8px; }
+    .header p { opacity: 0.85; font-size: 1rem; }
+    .container { max-width: 900px; margin: 0 auto; padding: 30px 20px; }
+    h2 { font-size: 1.4rem; color: #7C3AED; margin: 36px 0 14px; padding-bottom: 6px; border-bottom: 2px solid #e8dcff; }
+    h3 { font-size: 1.1rem; color: #374151; margin: 20px 0 10px; }
+    p { margin-bottom: 10px; color: #374151; }
+
+    /* 카드 */
+    .card { background: white; border-radius: 14px; padding: 20px 24px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); }
+
+    /* 흐름도 */
+    .flow { display: flex; flex-direction: column; gap: 6px; margin: 14px 0; }
+    .flow-item { display: flex; align-items: center; gap: 10px; }
+    .flow-box { background: #FAF5FF; border: 1.5px solid #E8DCFF; border-radius: 10px; padding: 10px 16px; font-size: 0.9rem; color: #5b21b6; font-weight: 600; flex: 1; }
+    .flow-box.server { background: #EFF6FF; border-color: #BFDBFE; color: #1d4ed8; }
+    .flow-box.db { background: #F0FDF4; border-color: #BBF7D0; color: #166534; }
+    .flow-box.apple { background: #FFF7ED; border-color: #FED7AA; color: #c2410c; }
+    .flow-box.google { background: #F0FDF4; border-color: #BBF7D0; color: #15803d; }
+    .flow-arrow { font-size: 1.3rem; color: #9ca3af; text-align: center; padding: 2px 0; }
+
+    /* 테이블 */
+    table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.9rem; }
+    th { background: #7C3AED; color: white; padding: 10px 14px; text-align: left; }
+    td { padding: 10px 14px; border-bottom: 1px solid #f0e6ff; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #FAF5FF; }
+
+    /* 상태 배지 */
+    .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 0.78rem; font-weight: 700; }
+    .badge-done { background: #D1FAE5; color: #065F46; }
+    .badge-soon { background: #FEF3C7; color: #92400E; }
+    .badge-later { background: #E5E7EB; color: #374151; }
+
+    /* 코드 */
+    pre { background: #1e1e2e; color: #cdd6f4; border-radius: 10px; padding: 18px; font-size: 0.82rem; overflow-x: auto; margin: 12px 0; line-height: 1.7; }
+    code { font-family: 'Fira Code', 'Courier New', monospace; }
+    .inline-code { background: #f0e6ff; color: #7C3AED; padding: 2px 7px; border-radius: 5px; font-size: 0.85rem; font-family: monospace; }
+
+    /* 경고/노트 */
+    .note { background: #FFFBEB; border-left: 4px solid #F59E0B; border-radius: 0 8px 8px 0; padding: 12px 16px; margin: 12px 0; font-size: 0.9rem; color: #92400E; }
+    .info { background: #EFF6FF; border-left: 4px solid #3B82F6; border-radius: 0 8px 8px 0; padding: 12px 16px; margin: 12px 0; font-size: 0.9rem; color: #1e40af; }
+
+    /* API 블록 */
+    .api-block { background: #1e1e2e; border-radius: 10px; padding: 16px 20px; margin: 12px 0; }
+    .api-method { display: inline-block; padding: 3px 10px; border-radius: 5px; font-size: 0.8rem; font-weight: 700; margin-right: 8px; font-family: monospace; }
+    .get { background: #61AFEF; color: #1e1e2e; }
+    .post { background: #98C379; color: #1e1e2e; }
+    .api-path { color: #cdd6f4; font-family: monospace; font-size: 0.95rem; }
+    .api-desc { color: #ABB2BF; font-size: 0.82rem; margin-top: 6px; }
+
+    /* 파일 목록 */
+    .file-list { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 12px 0; }
+    .file-item { background: #FAF5FF; border-radius: 8px; padding: 10px 14px; border: 1px solid #E8DCFF; }
+    .file-name { font-family: monospace; font-size: 0.82rem; color: #7C3AED; font-weight: 700; }
+    .file-role { font-size: 0.8rem; color: #6B7280; margin-top: 4px; }
+
+    @media (max-width: 600px) { .file-list { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <h1>👑 readMe 구독 시스템 구현 가이드</h1>
+  <p>2026-04-06 작성 · 오늘 만든 코드 + 전체 흐름 정리</p>
+</div>
+
+<div class="container">
+
+  <!-- 전체 구조 -->
+  <h2>🗺️ 전체 구조</h2>
+  <div class="card">
+    <div class="flow">
+      <div class="flow-item"><div class="flow-box">📱 앱 (React Native)</div></div>
+      <div class="flow-arrow">↕ HTTP</div>
+      <div class="flow-item"><div class="flow-box server">🖥️ 백엔드 (Spring Boot)</div></div>
+      <div class="flow-arrow">↕ HTTP 검증 요청</div>
+      <div class="flow-item" style="gap:10px">
+        <div class="flow-box apple" style="flex:1">🍎 애플 서버</div>
+        <div class="flow-box google" style="flex:1">🤖 구글 서버</div>
+      </div>
+      <div class="flow-arrow">↕ 저장</div>
+      <div class="flow-item"><div class="flow-box db">🗄️ DB (subscriptions 테이블)</div></div>
+    </div>
+  </div>
+
+  <!-- 오늘 만든 파일 -->
+  <h2>📁 오늘 만든 파일 목록</h2>
+  <div class="card">
+    <h3>백엔드 (Spring Boot)</h3>
+    <div class="file-list">
+      <div class="file-item"><div class="file-name">Subscription.java</div><div class="file-role">DB 테이블 엔티티</div></div>
+      <div class="file-item"><div class="file-name">Platform.java</div><div class="file-role">enum: IOS / ANDROID</div></div>
+      <div class="file-item"><div class="file-name">SubscriptionStatus.java</div><div class="file-role">enum: ACTIVE / EXPIRED / CANCELLED</div></div>
+      <div class="file-item"><div class="file-name">SubscriptionRepository.java</div><div class="file-role">DB 쿼리 인터페이스</div></div>
+      <div class="file-item"><div class="file-name">SubscriptionService.java</div><div class="file-role">isPremium 판단, 검증, 저장 로직</div></div>
+      <div class="file-item"><div class="file-name">SubscriptionController.java</div><div class="file-role">API 엔드포인트 4개</div></div>
+    </div>
+    <h3 style="margin-top:16px">프론트엔드 (React Native)</h3>
+    <div class="file-list">
+      <div class="file-item"><div class="file-name">UserContext.tsx</div><div class="file-role">isPremium, checkSubscription() 추가</div></div>
+      <div class="file-item"><div class="file-name">subscription.tsx</div><div class="file-role">구독 화면 UI (NEW)</div></div>
+      <div class="file-item"><div class="file-name">ranking-premium.tsx</div><div class="file-role">프리미엄 전용 랭킹 (NEW)</div></div>
+      <div class="file-item"><div class="file-name">ranking.tsx</div><div class="file-role">프리미엄 유도 배너 추가</div></div>
+      <div class="file-item"><div class="file-name">settings.tsx</div><div class="file-role">프리미엄 상태 배너 추가</div></div>
+      <div class="file-item"><div class="file-name">recommend.tsx</div><div class="file-role">비프리미엄 → 구독 화면 이동</div></div>
+    </div>
+  </div>
+
+  <!-- Subscription 테이블 -->
+  <h2>🗄️ Subscription 테이블 구조</h2>
+  <div class="card">
+    <table>
+      <tr><th>필드</th><th>타입</th><th>설명</th></tr>
+      <tr><td><span class="inline-code">id</span></td><td>Long</td><td>PK</td></tr>
+      <tr><td><span class="inline-code">user</span></td><td>UserEntity</td><td>로그인 유저 (게스트면 null)</td></tr>
+      <tr><td><span class="inline-code">deviceId</span></td><td>String</td><td>게스트 기기 ID (로그인이면 null)</td></tr>
+      <tr><td><span class="inline-code">platform</span></td><td>IOS / ANDROID</td><td>결제 플랫폼</td></tr>
+      <tr><td><span class="inline-code">planType</span></td><td>monthly / yearly</td><td>구독 플랜</td></tr>
+      <tr><td><span class="inline-code">startedAt</span></td><td>LocalDateTime</td><td>구독 시작일</td></tr>
+      <tr><td><span class="inline-code" style="background:#ffe4e4;color:#c00">expiresAt</span></td><td>LocalDateTime</td><td>⭐ 핵심: 만료일. 이게 지나면 isPremium = false</td></tr>
+      <tr><td><span class="inline-code">status</span></td><td>ACTIVE/EXPIRED/CANCELLED</td><td>구독 상태</td></tr>
+      <tr><td><span class="inline-code">autoRenew</span></td><td>Boolean</td><td>자동 갱신 여부</td></tr>
+      <tr><td><span class="inline-code">receipt</span></td><td>TEXT</td><td>iOS 영수증 (매우 긴 문자열)</td></tr>
+      <tr><td><span class="inline-code">purchaseToken</span></td><td>String</td><td>Android 구매 토큰</td></tr>
+      <tr><td><span class="inline-code">originalTransactionId</span></td><td>String</td><td>iOS 최초 구매 ID (갱신 묶음용)</td></tr>
+      <tr><td><span class="inline-code">createdAt / updatedAt</span></td><td>LocalDateTime</td><td>레코드 생성/변경 시각</td></tr>
+    </table>
+    <div class="info">
+      <strong>expiresAt + status 동시 체크가 핵심</strong><br>
+      <code>status == ACTIVE && expiresAt.isAfter(now())</code><br>
+      → status만 보면 취소됐는데도 프리미엄으로 보일 수 있음. 만료일도 같이 체크해야 정확함.
+    </div>
+  </div>
+
+  <!-- isPremium 판단 -->
+  <h2>🔍 isPremium 판단 로직</h2>
+  <div class="card">
+    <div class="flow">
+      <div class="flow-item"><div class="flow-box">앱에서 API 호출: GET /subscriptions/status</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box server">Controller → Service.isPremium(user, deviceId) 호출</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box server">로그인 유저? → userId로 조회 / 게스트? → deviceId로 조회</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box db">DB에서 status=ACTIVE 구독 조회</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box">expiresAt &gt; 현재시각? → true / 아니면 false</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box server">{ "isPremium": true | false } 응답</div></div>
+    </div>
+    <pre><code>// SubscriptionService.java
+public boolean isPremium(UserEntity user, String deviceId) {
+    Optional&lt;Subscription&gt; sub = (user != null)
+        ? repo.findTopByUserAndStatusOrderByExpiresAtDesc(user, ACTIVE)
+        : repo.findTopByDeviceIdAndStatusOrderByExpiresAtDesc(deviceId, ACTIVE);
+
+    return sub.map(s -> s.getExpiresAt().isAfter(LocalDateTime.now()))
+              .orElse(false);
+}</code></pre>
+  </div>
+
+  <!-- API 목록 -->
+  <h2>🔌 API 목록</h2>
+  <div class="card">
+
+    <div class="api-block">
+      <span class="api-method get">GET</span>
+      <span class="api-path">/subscriptions/status</span>
+      <div class="api-desc">구독 상태 확인. 앱 시작 / 로그인 시 자동 호출됨. 응답: { "isPremium": true }</div>
+    </div>
+
+    <div class="api-block" style="margin-top:10px">
+      <span class="api-method post">POST</span>
+      <span class="api-path">/subscriptions/subscribe</span>
+      <div class="api-desc">결제 후 구독 활성화. 앱스토어/구글플레이 영수증을 받아 검증 후 DB 저장</div>
+    </div>
+
+    <div class="api-block" style="margin-top:10px">
+      <span class="api-method post">POST</span>
+      <span class="api-path">/subscriptions/webhook/apple</span>
+      <div class="api-desc">애플이 자동으로 보내는 알림 수신. 갱신/취소/만료 이벤트 → DB 업데이트</div>
+    </div>
+
+    <div class="api-block" style="margin-top:10px">
+      <span class="api-method post">POST</span>
+      <span class="api-path">/subscriptions/webhook/google</span>
+      <div class="api-desc">구글 Pub/Sub 알림 수신. notificationType으로 갱신(1)/취소(3)/만료(13) 분기</div>
+    </div>
+
+    <div class="api-block" style="margin-top:10px">
+      <span class="api-method post">POST</span>
+      <span class="api-path">/subscriptions/test-activate</span>
+      <div class="api-desc">⚠️ 테스트용. 결제 없이 1년짜리 구독 DB에 직접 생성. 배포 전 삭제</div>
+    </div>
+  </div>
+
+  <!-- 애플 결제 흐름 -->
+  <h2>🍎 애플(iOS) 결제 + 검증 흐름</h2>
+  <div class="card">
+    <div class="flow">
+      <div class="flow-item"><div class="flow-box">① 유저가 앱 내에서 구독 버튼 클릭 (react-native-iap)</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box apple">② 앱스토어 결제 완료 → 영수증(receipt-data) 발급</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box">③ 앱이 영수증을 백엔드로 전송: POST /subscriptions/subscribe</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box server">④ 백엔드 → 애플 서버에 영수증 검증 요청</div></div>
+    </div>
+    <pre><code>POST https://buy.itunes.apple.com/verifyReceipt
+Body: {
+  "receipt-data": "영수증 문자열",
+  "password": "App Store Connect 공유 비밀키"
+}
+
+응답:
+  status: 0     → 유효한 영수증 ✅
+  status: 21007 → 샌드박스 영수증 (샌드박스 URL로 재시도)
+  그 외         → 유효하지 않음 ❌</code></pre>
+    <div class="flow">
+      <div class="flow-item"><div class="flow-box db">⑤ 검증 성공 → DB에 구독 저장 (status=ACTIVE, expiresAt 설정)</div></div>
+      <div class="flow-arrow">↓ (이후 자동 갱신/취소 시)</div>
+      <div class="flow-item"><div class="flow-box apple">⑥ 앱스토어가 등록된 URL로 자동 POST (webhook)</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box db">⑦ 백엔드가 이벤트 수신 → DB status/expiresAt 업데이트</div></div>
+    </div>
+    <div class="note">
+      <strong>필요한 설정:</strong><br>
+      App Store Connect → 앱 내 구입 → 공유 비밀키 발급<br>
+      App Store Connect → 앱 정보 → App Store Server Notifications URL 등록
+    </div>
+  </div>
+
+  <!-- 구글 결제 흐름 -->
+  <h2>🤖 구글(Android) 결제 + 검증 흐름</h2>
+  <div class="card">
+    <div class="flow">
+      <div class="flow-item"><div class="flow-box">① 유저가 구글플레이에서 결제 완료 → purchaseToken 발급</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box">② 앱이 purchaseToken을 백엔드로 전송</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box server">③ 백엔드 → 구글 서버에 토큰 검증 요청</div></div>
+    </div>
+    <pre><code>GET https://androidpublisher.googleapis.com/androidpublisher/v3/
+    applications/{packageName}/purchases/subscriptions/{subscriptionId}/tokens/{token}
+
+응답:
+  paymentState: 1 → 결제 완료 ✅
+  paymentState: 0 → 결제 대기 중
+  paymentState: 2 → 무료 체험</code></pre>
+    <div class="flow">
+      <div class="flow-item"><div class="flow-box db">④ 검증 성공 → DB에 구독 저장</div></div>
+      <div class="flow-arrow">↓ (이후 갱신/취소 시)</div>
+      <div class="flow-item"><div class="flow-box google">⑤ Google Cloud Pub/Sub → 백엔드 URL로 자동 전송</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box">notificationType: 1=갱신 / 3=취소 / 13=만료</div></div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-item"><div class="flow-box db">⑥ DB status/expiresAt 업데이트</div></div>
+    </div>
+    <div class="note">
+      <strong>필요한 설정:</strong><br>
+      Google Play Console → 서비스 계정 생성 → JSON 키 파일 발급<br>
+      Google Cloud Console → Pub/Sub 토픽 생성 → 백엔드 URL 등록
+    </div>
+  </div>
+
+  <!-- 프론트 흐름 -->
+  <h2>📱 프론트 isPremium 흐름</h2>
+  <div class="card">
+    <pre><code>앱 시작
+  → UserContext 초기화
+  → AsyncStorage에서 로그인 정보 로드
+  → checkSubscription() 호출
+      → GET /subscriptions/status
+      → isPremium 상태 저장
+      → AsyncStorage에 캐시 (오프라인 대비)
+
+로그인 시
+  → login() 호출 → checkSubscription() 자동 호출
+
+로그아웃 시
+  → logout() 호출
+  → isPremium = false
+  → AsyncStorage 'isPremium' 키 삭제
+
+프리미엄 기능 접근 시
+  → isPremium 체크
+  → false면 /subscription 화면으로 이동
+  → true면 기능 사용 가능</code></pre>
+  </div>
+
+  <!-- 현재 구현 상태 -->
+  <h2>✅ 현재 구현 상태</h2>
+  <div class="card">
+    <table>
+      <tr><th>기능</th><th>상태</th><th>비고</th></tr>
+      <tr><td>Subscription 엔티티</td><td><span class="badge badge-done">완료</span></td><td></td></tr>
+      <tr><td>Platform / SubscriptionStatus enum</td><td><span class="badge badge-done">완료</span></td><td></td></tr>
+      <tr><td>SubscriptionRepository</td><td><span class="badge badge-done">완료</span></td><td></td></tr>
+      <tr><td>GET /subscriptions/status</td><td><span class="badge badge-done">완료</span></td><td></td></tr>
+      <tr><td>POST /subscriptions/test-activate</td><td><span class="badge badge-done">완료</span></td><td>⚠️ 배포 전 삭제</td></tr>
+      <tr><td>POST /subscriptions/subscribe</td><td><span class="badge badge-soon">코드 작성됨</span></td><td>애플/구글 키 발급 필요</td></tr>
+      <tr><td>POST /subscriptions/webhook</td><td><span class="badge badge-soon">코드 작성됨</span></td><td>Pub/Sub 설정 필요</td></tr>
+      <tr><td>프론트 isPremium 상태관리</td><td><span class="badge badge-done">완료</span></td><td>UserContext</td></tr>
+      <tr><td>구독 화면 UI (/subscription)</td><td><span class="badge badge-done">완료</span></td><td></td></tr>
+      <tr><td>프리미엄 랭킹 (/ranking-premium)</td><td><span class="badge badge-done">완료</span></td><td>테스트 모드 (게이트 주석처리 중)</td></tr>
+      <tr><td>추천 페이지 프리미엄 게이트</td><td><span class="badge badge-done">완료</span></td><td></td></tr>
+      <tr><td>설정 페이지 배너</td><td><span class="badge badge-done">완료</span></td><td></td></tr>
+      <tr><td>react-native-iap 연동</td><td><span class="badge badge-later">나중에</span></td><td>앱 심사 직전</td></tr>
+    </table>
+  </div>
+
+  <!-- 내일 할 것 -->
+  <h2>📌 내일 할 것 (우선순위 순)</h2>
+  <div class="card">
+    <table>
+      <tr><th>#</th><th>작업</th></tr>
+      <tr><td>1</td><td>Postman으로 <span class="inline-code">GET /subscriptions/status</span> 테스트</td></tr>
+      <tr><td>2</td><td><span class="inline-code">POST /subscriptions/test-activate</span> 호출 후 isPremium=true 되는지 확인</td></tr>
+      <tr><td>3</td><td>프리미엄 랭킹 페이지 UI 확인 후 테스트 코드 제거 (게이트 주석 해제)</td></tr>
+      <tr><td>4</td><td>(나중에) 애플 공유 비밀키 발급 → <span class="inline-code">verifyAppleReceipt</span> 완성</td></tr>
+      <tr><td>5</td><td>(나중에) 구글 서비스 계정 설정 → <span class="inline-code">verifyGooglePurchase</span> 완성</td></tr>
+    </table>
+  </div>
+
+  <div style="height:40px"></div>
+</div>
+</body>
+</html>

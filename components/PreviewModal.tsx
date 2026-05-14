@@ -1,5 +1,6 @@
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import { Modal, Pressable, Text, View } from "react-native";
+import { Modal, Pressable, Text, TouchableOpacity, View } from "react-native";
 
 export default function PreviewModal({
   visible,
@@ -28,9 +29,30 @@ export default function PreviewModal({
             backgroundColor: "#fff",
             padding: 20,
             borderRadius: 12,
+            position: "relative",
           }}
         >
-          <Text style={{ fontSize: 20, fontWeight: "bold" }}>
+          {/* X 닫기 버튼 */}
+          <TouchableOpacity
+            onPress={onClose}
+            style={{
+              position: "absolute",
+              top: 15,
+              right: 15,
+              zIndex: 10,
+              padding: 4,
+              backgroundColor: "#f0f0f0",
+              borderRadius: 15,
+              width: 30,
+              height: 30,
+              justifyContent: "center",
+              alignItems: "center",
+            }}
+          >
+            <MaterialCommunityIcons name="close" size={20} color="#333" />
+          </TouchableOpacity>
+
+          <Text style={{ fontSize: 20, fontWeight: "bold", paddingRight: 40 }}>
             {file.title}
           </Text>
 

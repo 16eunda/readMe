@@ -1,4 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import { getDeviceId } from '@/utils/deviceId';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useFocusEffect } from 'expo-router';
+import React, { useCallback, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -22,20 +25,32 @@ export default function HistoryScreen() {
   const [error, setError] = useState<string | null>(null);
   const [sortOrder, setSortOrder] = useState<SortOrder>('recent');
   const [displayCount, setDisplayCount] = useState(15); // 초기 15개 표시
-
+  
   const fetchRecentFiles = useCallback(async () => {
+
     try {
+      const token = await AsyncStorage.getItem("accessToken");
+      const deviceId = await getDeviceId();
+      
       setError(null);
-      const res = await fetch(`${API_BASE_URL}/files/history`);
+      const res = await fetch(`${API_BASE_URL}/files/history`, {
+        headers: {
+          "X-Device-Id": deviceId,
+          ...(token && { Authorization: `Bearer ${token}` })
+        },
+      });
+      
+      console.log('📥 서버 응답 상태:', res.status, res.statusText);
       
       if (!res.ok) {
         throw new Error('서버 응답 오류');
       }
       
       const data = await res.json();
+      console.log('✅ 받은 데이터 개수:', data.length);
       setFiles(data);
     } catch (e) {
-      console.error('Error fetching history:', e);
+      console.error('❌ Error fetching history:', e);
       setError('히스토리를 불러오는데 실패했습니다.');
     } finally {
       setLoading(false);
@@ -71,18 +86,21 @@ export default function HistoryScreen() {
     return sortOrder === 'recent' ? '최신순' : '오래된순';
   };
 
-  useEffect(() => {
-    fetchRecentFiles();
-  }, [fetchRecentFiles]);
+  useFocusEffect(
+    useCallback(() => {
+      console.log('🎯 히스토리 페이지: 화면 포커스됨!');
+      fetchRecentFiles();
+    }, [fetchRecentFiles])
+  );
 
   // 로딩 상태
   if (loading) {
     return (
       <SafeAreaView style={styles.container}>
-        <Text style={styles.header}>히스토리</Text>
+        <Text style={styles.header}>History</Text>
         <View style={styles.centerContainer}>
           <ActivityIndicator size="large" color="#007AFF" />
-          <Text style={styles.loadingText}>불러오는 중...</Text>
+          <Text style={styles.loadingText}>Loading...</Text>
         </View>
       </SafeAreaView>
     );
@@ -92,11 +110,11 @@ export default function HistoryScreen() {
   if (error) {
     return (
       <SafeAreaView style={styles.container}>
-        <Text style={styles.header}>히스토리</Text>
+        <Text style={styles.header}>History</Text>
         <View style={styles.centerContainer}>
           <Text style={styles.errorText}>{error}</Text>
           <TouchableOpacity style={styles.retryButton} onPress={fetchRecentFiles}>
-            <Text style={styles.retryButtonText}>다시 시도</Text>
+            <Text style={styles.retryButtonText}>Retry</Text>
           </TouchableOpacity>
         </View>
       </SafeAreaView>
@@ -105,7 +123,7 @@ export default function HistoryScreen() {
 
   return (
     <SafeAreaView style={styles.container}>
-      <Text style={styles.header}>히스토리</Text>
+      <Text style={styles.header}>History</Text>
 
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionTitle}>최근 본</Text>
@@ -152,13 +170,12 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 20,
+    paddingTop: 40,
   },
   header: {
-    fontSize: 22,
-    fontWeight: '700',
-    color: '#111',
-    marginTop: 30,
-    marginBottom: 16,
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginBottom: 12,
   },
   sectionHeader: {
     flexDirection: 'row',
