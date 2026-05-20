@@ -1,13 +1,12 @@
 export interface HistoryFile {
   id: number;
   title: string;
-  date: string;
+  date: string;       // ISO 형식: "2026-05-07T12:17:33.267"
   rating: number;
-  lastReadAt: string;
   preview?: string;
   uri?: string;
   path?: string;
-  progress?: number;
+  review?: string | null;
 }
 
 export type SortOrder = 'recent' | 'oldest';

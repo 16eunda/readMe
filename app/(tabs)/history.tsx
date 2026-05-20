@@ -1,7 +1,7 @@
 import { getDeviceId } from '@/utils/deviceId';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from 'expo-router';
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -19,12 +19,22 @@ import { HistoryFile, SortOrder } from '../../types/file';
 const HistoryCardMemo = React.memo(HistoryCard);
 
 export default function HistoryScreen() {
-  const [files, setFiles] = useState<HistoryFile[]>([]);
+  const [rawFiles, setRawFiles] = useState<HistoryFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sortOrder, setSortOrder] = useState<SortOrder>('recent');
   const [displayCount, setDisplayCount] = useState(15); // 초기 15개 표시
+
+  // 정렬된 파일 목록 (rawFiles + sortOrder로 파생)
+  const files = useMemo(() => {
+    return [...rawFiles].sort((a, b) => {
+      const timeA = new Date(a.date).getTime();
+      const timeB = new Date(b.date).getTime();
+      if (isNaN(timeA) || isNaN(timeB)) return 0;
+      return sortOrder === 'recent' ? timeB - timeA : timeA - timeB;
+    });
+  }, [rawFiles, sortOrder]);
   
   const fetchRecentFiles = useCallback(async () => {
 
@@ -48,7 +58,7 @@ export default function HistoryScreen() {
       
       const data = await res.json();
       console.log('✅ 받은 데이터 개수:', data.length);
-      setFiles(data);
+      setRawFiles(data);
     } catch (e) {
       console.error('❌ Error fetching history:', e);
       setError('히스토리를 불러오는데 실패했습니다.');
@@ -65,22 +75,9 @@ export default function HistoryScreen() {
   }, [fetchRecentFiles]);
 
   const handleSort = useCallback(() => {
-    const nextOrder: SortOrder = sortOrder === 'recent' ? 'oldest' : 'recent';
-    
-    setSortOrder(nextOrder);
-    
-    const sorted = [...files].sort((a, b) => {
-      const timeA = new Date(a.lastReadAt).getTime();
-      const timeB = new Date(b.lastReadAt).getTime();
-      
-      return nextOrder === 'recent' 
-        ? timeB - timeA  // 최신순 (내림차순)
-        : timeA - timeB; // 오래된순 (오름차순)
-    });
-    
-    setDisplayCount(15); // 정렬 시 다시 15개로 리셋
-    setFiles(sorted);
-  }, [sortOrder, files]);
+    setSortOrder((prev) => (prev === 'recent' ? 'oldest' : 'recent'));
+    setDisplayCount(15);
+  }, []);
 
   const getSortLabel = () => {
     return sortOrder === 'recent' ? '최신순' : '오래된순';

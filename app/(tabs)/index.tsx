@@ -575,7 +575,12 @@ export default function Home() {
       let fileList = [];
       if (data.content && Array.isArray(data.content)) {
         fileList = data.content;
-        setHasMore(!data.last);
+        // Spring Data 새 형식: data.page.number, data.page.totalPages
+        if (data.page) {
+          setHasMore(data.page.number + 1 < data.page.totalPages);
+        } else {
+          setHasMore(!data.last); // 구형 형식 폴백
+        }
       } else if (Array.isArray(data)) {
         fileList = data;
         setHasMore(false);
@@ -926,43 +931,25 @@ export default function Home() {
     setSelectedFile(file);
     setLastProgress(info.progress);
 
-    let preview = "";
+    // 서버에 저장된 readingPreview 사용 (없으면 파일에서 직접 추출)
+    let preview = info.readingPreview || "";
 
-    if (file.title?.endsWith(".epub") || file.uri?.endsWith(".epub")) {
-      // EPUB: progress 위치 기반 미리보기
-      preview = await extractEpubPreview(file.uri, info.progress);
-    } else {
-      // TXT: 진행 위치 기반으로 일부 텍스트 추출
+    if (!preview) {
+      // TXT 미리보기: progress 위치의 줄을 보여줌
       const base64 = await FileSystem.readAsStringAsync(file.uri, { 
         encoding: FileSystem.EncodingType.Base64 
       });
-
       const buffer = Buffer.from(base64, 'base64');
       const localContent = decodeTextSafe(buffer);
 
-      const startPos = Math.floor(localContent.length * info.progress);
-      let previewSlice = localContent.slice(startPos, startPos + 500);
+      const lines = localContent
+        .replace(/\r/g, '')
+        .split('\n')
+        .map((l: string) => l.trim())
+        .filter((l: string) => l.length > 0);
 
-      // 빈 줄 여러 개 → 1개로, 앞뒤 공백 정리
-      previewSlice = previewSlice
-        .replace(/\r\n/g, '\n')           // Windows 줄바꿈 통일
-        .replace(/\n{3,}/g, '\n\n')       // 3개 이상 연속 줄바꿈 → 2개로
-        .replace(/[^\S\n]{2,}/g, ' ')     // 줄바꿈 제외 연속 공백 → 1개
-        .trim();
-
-      // 실제 글자가 너무 적으면 더 가져오기
-      const actualText = previewSlice.replace(/\s+/g, '');
-      if (actualText.length < 80 && startPos + 1000 < localContent.length) {
-        previewSlice = localContent.slice(startPos, startPos + 1000)
-          .replace(/\r\n/g, '\n')
-          .replace(/\n{3,}/g, '\n\n')
-          .replace(/[^\S\n]{2,}/g, ' ')
-          .trim();
-      }
-
-      // 최대 5줄까지만 표시
-      const lines = previewSlice.split('\n').filter(l => l.trim() !== '');
-      preview = lines.slice(0, 5).join('\n') + (lines.length > 5 ? '...' : '');
+      const lineIndex = Math.max(0, Math.floor(info.progress * lines.length) - 1);
+      preview = lines.slice(lineIndex, lineIndex + 4).join('\n');
     }
 
     setPreviewText(preview);

@@ -59,6 +59,12 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
+        name="ranking-premium"
+        options={{
+          href: null, // 탭 메뉴에서 숨김
+        }}
+      />
+      <Tabs.Screen
         name="explore"
         options={{
           href: null, // 탭 메뉴에서 숨김

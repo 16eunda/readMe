@@ -76,9 +76,14 @@ export default function RankingScreen() {
 
   useFocusEffect(
     useCallback(() => {
+      // 프리미엄 유저는 프리미엄 랝킹 페이지로 이동
+      if (isPremium) {
+        router.replace('/(tabs)/ranking-premium' as any);
+        return;
+      }
       console.log('🎯 랜킹 페이지: 화면 포커스됨, period:', period);
       fetchRankings();
-    }, [period])
+    }, [period, isPremium])
   );
 
   const onRefresh = useCallback(() => {
@@ -234,7 +239,7 @@ export default function RankingScreen() {
       {!isPremium && !loading && rankings.length > 0 && (
         <TouchableOpacity
           style={styles.premiumTeaser}
-          onPress={() => router.push('/ranking-premium' as any)}
+          onPress={() => router.push('/subscription' as any)}
           activeOpacity={0.8}
         >
           <View style={styles.teaserLeft}>
@@ -248,14 +253,6 @@ export default function RankingScreen() {
         </TouchableOpacity>
       )}
 
-      {/* 하단 여백 */}
-      {/* TODO: 테스트용 버튼 - 완성 후 삭제 */}
-      <TouchableOpacity
-        onPress={() => router.push('/ranking-premium' as any)}
-        style={{ backgroundColor: '#7C3AED', borderRadius: 12, padding: 14, alignItems: 'center', marginTop: 16, marginBottom: 8 }}
-      >
-        <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>🧪 프리미엄 랭킹 페이지 테스트</Text>
-      </TouchableOpacity>
 
       {visibleRankings.length > 0 && (
         <View style={styles.bottomPadding} />

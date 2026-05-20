@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>파일 열기 흐름 완벽 가이드 — readMe 앱</title>
+  <style>
+    :root {
+      --purple: #7C3AED;
+      --purple-light: #EDE9FE;
+      --blue: #2563EB;
+      --blue-light: #DBEAFE;
+      --green: #059669;
+      --green-light: #D1FAE5;
+      --orange: #D97706;
+      --orange-light: #FEF3C7;
+      --red: #DC2626;
+      --red-light: #FEE2E2;
+      --gray: #6B7280;
+      --gray-light: #F3F4F6;
+      --text: #111827;
+      --border: #E5E7EB;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #F9FAFB;
+      color: var(--text);
+      line-height: 1.7;
+      padding: 0 0 80px;
+    }
+    header {
+      background: linear-gradient(135deg, var(--purple) 0%, #4F46E5 100%);
+      color: #fff;
+      padding: 48px 32px 40px;
+      text-align: center;
+    }
+    header h1 { font-size: 2rem; font-weight: 800; margin-bottom: 10px; }
+    header p { opacity: 0.85; font-size: 1.05rem; }
+    .badge {
+      display: inline-block;
+      background: rgba(255,255,255,0.2);
+      border-radius: 999px;
+      padding: 3px 14px;
+      font-size: 0.82rem;
+      margin-top: 12px;
+    }
+    main { max-width: 900px; margin: 0 auto; padding: 40px 24px; }
+    h2 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: var(--purple);
+      margin: 48px 0 16px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid var(--purple-light);
+    }
+    h3 {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: var(--blue);
+      margin: 28px 0 12px;
+    }
+    p { margin: 8px 0 14px; color: #374151; }
+
+    /* 방법 카드 */
+    .method-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin: 20px 0;
+    }
+    @media(max-width:600px){ .method-grid { grid-template-columns: 1fr; } }
+    .method-card {
+      border-radius: 16px;
+      padding: 20px 22px;
+      border: 1.5px solid var(--border);
+      background: #fff;
+    }
+    .method-card.blue { border-color: #93C5FD; background: var(--blue-light); }
+    .method-card.purple { border-color: #C4B5FD; background: var(--purple-light); }
+    .method-card .num {
+      font-size: 1.6rem;
+      font-weight: 900;
+      margin-bottom: 6px;
+    }
+    .method-card.blue .num { color: var(--blue); }
+    .method-card.purple .num { color: var(--purple); }
+    .method-card h4 { font-size: 1rem; font-weight: 700; margin-bottom: 6px; }
+    .method-card p { font-size: 0.9rem; margin: 0; }
+
+    /* 플로우 다이어그램 */
+    .flow {
+      background: #fff;
+      border: 1.5px solid var(--border);
+      border-radius: 16px;
+      padding: 28px 28px 20px;
+      margin: 16px 0 24px;
+      overflow-x: auto;
+    }
+    .flow-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+      margin-bottom: 6px;
+    }
+    .flow-connector {
+      display: flex;
+      align-items: center;
+      margin: 2px 0 2px 21px;
+    }
+    .flow-connector span {
+      font-size: 1.3rem;
+      color: var(--gray);
+      line-height: 1;
+    }
+    .step-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .step-icon.purple { background: var(--purple-light); }
+    .step-icon.blue   { background: var(--blue-light); }
+    .step-icon.green  { background: var(--green-light); }
+    .step-icon.orange { background: var(--orange-light); }
+    .step-icon.red    { background: var(--red-light); }
+    .step-icon.gray   { background: var(--gray-light); }
+    .step-body h5 { font-size: 0.95rem; font-weight: 700; margin-bottom: 2px; }
+    .step-body p  { font-size: 0.88rem; color: var(--gray); margin: 0; }
+    .step-body code {
+      font-size: 0.82rem;
+      background: var(--gray-light);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+
+    /* 분기 박스 */
+    .branch {
+      margin: 12px 0 12px 50px;
+      border-left: 3px solid var(--border);
+      padding-left: 18px;
+    }
+    .branch-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin: 8px 0;
+    }
+    .branch-label {
+      font-size: 0.78rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 999px;
+      white-space: nowrap;
+      margin-top: 2px;
+    }
+    .branch-label.yes  { background: var(--green-light); color: var(--green); }
+    .branch-label.no   { background: var(--blue-light); color: var(--blue); }
+    .branch-label.warn { background: var(--orange-light); color: var(--orange); }
+    .branch-desc { font-size: 0.88rem; color: #374151; }
+
+    /* 코드 블록 */
+    pre {
+      background: #1E1E2E;
+      color: #CDD6F4;
+      border-radius: 12px;
+      padding: 18px 20px;
+      overflow-x: auto;
+      font-size: 0.84rem;
+      line-height: 1.65;
+      margin: 12px 0 20px;
+      font-family: 'SF Mono', 'Fira Code', 'Courier New', monospace;
+    }
+    pre .comment { color: #6C7086; }
+    pre .key     { color: #89DCEB; }
+    pre .val     { color: #A6E3A1; }
+    pre .url     { color: #F38BA8; }
+
+    /* 테이블 */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 24px;
+      background: #fff;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.07);
+    }
+    th {
+      background: var(--gray-light);
+      font-size: 0.85rem;
+      font-weight: 700;
+      padding: 10px 16px;
+      text-align: left;
+      border-bottom: 1.5px solid var(--border);
+    }
+    td {
+      padding: 10px 16px;
+      font-size: 0.88rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    tr:last-child td { border-bottom: none; }
+    td code {
+      background: var(--gray-light);
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-family: 'SF Mono', monospace;
+      font-size: 0.82rem;
+    }
+
+    /* 콜아웃 */
+    .callout {
+      border-radius: 12px;
+      padding: 14px 18px;
+      margin: 16px 0;
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .callout.info  { background: var(--blue-light); border-left: 4px solid var(--blue); }
+    .callout.warn  { background: var(--orange-light); border-left: 4px solid var(--orange); }
+    .callout.tip   { background: var(--green-light); border-left: 4px solid var(--green); }
+    .callout-icon  { font-size: 1.2rem; flex-shrink: 0; margin-top: 1px; }
+    .callout-body  { font-size: 0.9rem; color: #374151; }
+    .callout-body strong { display: block; font-weight: 700; margin-bottom: 4px; }
+
+    /* Case 탭 */
+    .case-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin: 16px 0;
+    }
+    @media(max-width:640px){ .case-grid { grid-template-columns: 1fr; } }
+    .case-box {
+      border-radius: 14px;
+      padding: 20px;
+      border: 1.5px solid var(--border);
+      background: #fff;
+    }
+    .case-box h4 {
+      font-size: 0.95rem;
+      font-weight: 700;
+      margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 1.5px solid var(--border);
+    }
+    .case-box.cold h4 { color: var(--red); border-color: #FECACA; }
+    .case-box.warm h4 { color: var(--orange); border-color: var(--orange-light); }
+
+    /* 문제 해결 카드 */
+    .problem-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      margin: 16px 0;
+    }
+    .problem-card {
+      background: #fff;
+      border: 1.5px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 12px;
+    }
+    @media(max-width:640px){ .problem-card { grid-template-columns: 1fr; } }
+    .problem-card .label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 4px;
+    }
+    .problem-card .label.problem { color: var(--red); }
+    .problem-card .label.cause   { color: var(--orange); }
+    .problem-card .label.fix     { color: var(--green); }
+    .problem-card .content       { font-size: 0.88rem; color: #374151; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>📖 파일 열기 흐름 완벽 가이드</h1>
+  <p>readMe 앱에서 파일이 어떤 과정을 거쳐 읽히는지 단계별로 설명합니다</p>
+  <span class="badge">readMe App — Android/iOS</span>
+</header>
+
+<main>
+
+  <!-- ===================== 두 가지 방법 ===================== -->
+  <h2>파일을 앱에 추가하는 방법 2가지</h2>
+
+  <div class="method-grid">
+    <div class="method-card blue">
+      <div class="num">①</div>
+      <h4>앱 내 + 버튼</h4>
+      <p>앱 안에서 직접 시스템 파일 선택창을 열어 파일을 고릅니다.<br>진입점: <code>index.tsx → pickFile()</code></p>
+    </div>
+    <div class="method-card purple">
+      <div class="num">②</div>
+      <h4>외부 "다른 앱으로 열기"</h4>
+      <p>파일 탐색기나 다른 앱에서 공유/열기로 readMe를 선택합니다.<br>진입점: <code>_layout.tsx</code> 또는 <code>+not-found.tsx</code></p>
+    </div>
+  </div>
+
+  <!-- ===================== 방법 1 ===================== -->
+  <h2>① 앱 내 + 버튼으로 파일 추가</h2>
+
+  <div class="flow">
+
+    <div class="flow-step">
+      <div class="step-icon blue">👆</div>
+      <div class="step-body">
+        <h5>사용자가 + 버튼 클릭</h5>
+        <p><code>pickFile()</code> 함수 실행</p>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon blue">📂</div>
+      <div class="step-body">
+        <h5>시스템 파일 선택창 열림</h5>
+        <p><code>DocumentPicker.getDocumentAsync({ type: [".txt", ".epub"], copyToCacheDirectory: true })</code></p>
+        <p>사용자가 파일 선택 → 시스템이 캐시 디렉토리에 임시 복사</p>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon orange">🔍</div>
+      <div class="step-body">
+        <h5>서버에 중복 체크</h5>
+        <p><code>GET /files/check?title=파일명&path=현재폴더</code></p>
+      </div>
+    </div>
+
+    <div class="branch">
+      <div class="branch-item">
+        <span class="branch-label warn">중복 있음</span>
+        <span class="branch-desc">DuplicateConfirmModal 표시 → 사용자가 "덮어쓰기" or "취소" 선택</span>
+      </div>
+      <div class="branch-item">
+        <span class="branch-label no">중복 없음</span>
+        <span class="branch-desc">바로 <code>addFileToSystem()</code> 실행</span>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon green">💾</div>
+      <div class="step-body">
+        <h5>영구 저장소로 복사</h5>
+        <p><code>FileSystem.copyAsync(캐시 → documentDirectory)</code></p>
+        <p>임시 경로 → <code>file:///data/.../files/파일명.epub</code> (영구)</p>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon purple">📝</div>
+      <div class="step-body">
+        <h5>미리보기 텍스트 추출 (50자)</h5>
+        <p><strong>.epub:</strong> JSZip → container.xml → OPF → 첫 챕터 HTML → html-to-text → 50자</p>
+        <p><strong>.txt:</strong> Base64 읽기 → Buffer → BOM/인코딩 자동감지 (UTF-16, UTF-8, CP949...) → 50자</p>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon blue">🌐</div>
+      <div class="step-body">
+        <h5>서버 DB에 파일 정보 저장</h5>
+        <p><code>POST /files</code></p>
+      </div>
+    </div>
+
+    <pre><span class="comment">// 서버로 보내는 데이터</span>
+{
+  <span class="key">"title"</span>:    <span class="val">"어린왕자.epub"</span>,
+  <span class="key">"preview"</span>:  <span class="val">"어린 왕자 생텍쥐페리 출판사..."</span>,
+  <span class="key">"date"</span>:     <span class="val">"2026-05-19T09:43:00.000Z"</span>,
+  <span class="key">"rating"</span>:   <span class="val">0</span>,
+  <span class="key">"uri"</span>:      <span class="url">"file:///data/.../files/어린왕자.epub"</span>,
+  <span class="key">"path"</span>:     <span class="val">"root"</span>,
+  <span class="key">"deviceId"</span>: <span class="val">"xxxx-xxxx-xxxx"</span>
+}</pre>
+
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon green">⚡</div>
+      <div class="step-body">
+        <h5>React Query 캐시 즉시 업데이트</h5>
+        <p>서버 재조회 없이 화면에 새 파일 카드 즉시 표시 (Optimistic Update)</p>
+        <p>백그라운드에서 서버와 동기화</p>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon purple">📖</div>
+      <div class="step-body">
+        <h5>reader.tsx로 이동</h5>
+        <p><code>router.push('/reader', { fileId, uri, name })</code></p>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ===================== 방법 2 ===================== -->
+  <h2>② 외부 "다른 앱으로 열기" (Open With)</h2>
+
+  <h3>안드로이드에서 URL이 어떻게 전달되나?</h3>
+
+  <p>파일 탐색기에서 파일을 선택하면 시스템이 앱을 실행하면서 <strong>딥링크 URL</strong>을 전달합니다.</p>
+
+  <pre><span class="comment">// 파일 탐색기 → readMe 앱 선택 시 전달되는 URL</span>
+myreaderapp2://media/external/file/1000020537
+
+<span class="comment">// 왜 myreaderapp2:// 로 오나?</span>
+<span class="comment">// → app.json의 "scheme": "myreaderapp2" 설정 때문</span>
+<span class="comment">// 안드로이드는 content://media/... URI를 앱 스킴으로 변환해서 전달</span>
+<span class="comment">//   content://media/external/file/1000020537</span>
+<span class="comment">//       ↓  앱스킴으로 변환</span>
+<span class="comment">// myreaderapp2://media/external/file/1000020537</span></pre>
+
+  <div class="callout info">
+    <span class="callout-icon">ℹ️</span>
+    <div class="callout-body">
+      <strong>숫자 ID란?</strong>
+      <code>1000020537</code>은 파일명이 아니라 안드로이드 미디어 스토어의 파일 고유 ID입니다. 이 URI는 직접 읽을 수 없고 반드시 앱 전용 저장소로 <strong>복사</strong>해야 합니다.
+    </div>
+  </div>
+
+  <h3>앱 실행 상태에 따른 처리 분기</h3>
+
+  <div class="case-grid">
+    <div class="case-box cold">
+      <h4>🔴 Cold Start (앱이 완전히 꺼진 상태)</h4>
+      <div class="flow-step" style="margin-bottom:8px">
+        <div class="step-icon red" style="width:28px;height:28px;font-size:0.9rem">1</div>
+        <div class="step-body"><h5>Expo Router가 URL을 라우트로 해석</h5><p>/media/external/file/... 라우트 없음!</p></div>
+      </div>
+      <div class="flow-step" style="margin-bottom:8px">
+        <div class="step-icon red" style="width:28px;height:28px;font-size:0.9rem">2</div>
+        <div class="step-body"><h5>+not-found.tsx 실행</h5><p>Unmatched Route를 여기서 가로챔</p></div>
+      </div>
+      <div class="flow-step" style="margin-bottom:8px">
+        <div class="step-icon red" style="width:28px;height:28px;font-size:0.9rem">3</div>
+        <div class="step-body"><h5>Linking.getInitialURL()로 URL 분석</h5><p>media/ 패턴 감지 → content:// 복원</p></div>
+      </div>
+      <div class="flow-step">
+        <div class="step-icon red" style="width:28px;height:28px;font-size:0.9rem">4</div>
+        <div class="step-body"><h5>파일 복사 → setIncomingFile</h5><p>router.replace('/(tabs)')</p></div>
+      </div>
+    </div>
+    <div class="case-box warm">
+      <h4>🟡 Warm Start (앱이 백그라운드 상태)</h4>
+      <div class="flow-step" style="margin-bottom:8px">
+        <div class="step-icon orange" style="width:28px;height:28px;font-size:0.9rem">1</div>
+        <div class="step-body"><h5>Linking.addEventListener 콜백 실행</h5><p>_layout.tsx에서 URL 이벤트 수신</p></div>
+      </div>
+      <div class="flow-step" style="margin-bottom:8px">
+        <div class="step-icon orange" style="width:28px;height:28px;font-size:0.9rem">2</div>
+        <div class="step-body"><h5>processIncomingUrl() 실행</h5><p>myreaderapp2:// → content:// 변환</p></div>
+      </div>
+      <div class="flow-step" style="margin-bottom:8px">
+        <div class="step-icon orange" style="width:28px;height:28px;font-size:0.9rem">3</div>
+        <div class="step-body"><h5>파일 복사</h5><p>content:// → 캐시 디렉토리</p></div>
+      </div>
+      <div class="flow-step">
+        <div class="step-icon orange" style="width:28px;height:28px;font-size:0.9rem">4</div>
+        <div class="step-body"><h5>setIncomingFile → 홈으로 이동</h5><p>router.replace('/(tabs)')</p></div>
+      </div>
+    </div>
+  </div>
+
+  <h3>공통 처리 — index.tsx</h3>
+
+  <div class="callout tip">
+    <span class="callout-icon">💡</span>
+    <div class="callout-body">
+      Cold Start / Warm Start 두 경우 모두 결국 <code>UserContext.incomingFile</code>에 파일 정보가 세팅되고, <code>index.tsx</code>의 <code>useEffect([incomingFile])</code>이 이를 감지해서 처리합니다.
+    </div>
+  </div>
+
+  <div class="flow">
+    <div class="flow-step">
+      <div class="step-icon purple">🎯</div>
+      <div class="step-body">
+        <h5>useEffect([incomingFile]) 트리거</h5>
+        <p><code>setIncomingFile(null)</code>로 즉시 초기화 (중복 처리 방지)</p>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon orange">🔍</div>
+      <div class="step-body">
+        <h5>중복 체크</h5>
+        <p><code>GET /files/check?title=파일명&path=root</code></p>
+      </div>
+    </div>
+
+    <div class="branch">
+      <div class="branch-item">
+        <span class="branch-label warn">중복 있음</span>
+        <span class="branch-desc">
+          Alert 표시<br>
+          "그냥 열기" → 기존 파일 찾아서 reader 이동<br>
+          "새로 추가" → addFileToSystem() 후 reader 이동
+        </span>
+      </div>
+      <div class="branch-item">
+        <span class="branch-label no">중복 없음</span>
+        <span class="branch-desc">addFileToSystem() 실행 → reader로 이동</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== reader.tsx ===================== -->
+  <h2>reader.tsx에서 파일 읽기</h2>
+
+  <div class="flow">
+
+    <div class="flow-step">
+      <div class="step-icon blue">🚀</div>
+      <div class="step-body">
+        <h5>router.push('/reader') 진입</h5>
+        <p>파라미터: <code>fileId</code>, <code>uri</code> (로컬 경로), <code>name</code></p>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon purple">📡</div>
+      <div class="step-body">
+        <h5>① 서버에서 이전 진행도 로드</h5>
+        <p><code>GET /files/{fileId}</code></p>
+        <p>응답: <code>progress</code> (0.0~1.0), <code>epubCfi</code> (epub 위치 문자열)</p>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon orange">🔀</div>
+      <div class="step-body">
+        <h5>② 파일 형식 판단</h5>
+      </div>
+    </div>
+
+    <div class="branch">
+      <div class="branch-item">
+        <span class="branch-label yes">.epub</span>
+        <span class="branch-desc">WebView + epub.js 렌더링. JS 브리지로 페이지 이동/위치 수신</span>
+      </div>
+      <div class="branch-item">
+        <span class="branch-label no">.txt</span>
+        <span class="branch-desc">FlatList 가상화. 텍스트를 문단 배열로 쪼개서 화면에 보이는 것만 렌더링</span>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon green">📍</div>
+      <div class="step-body">
+        <h5>③ 이어읽기 처리</h5>
+        <p><strong>.epub:</strong> <code>epubCfi</code>로 해당 위치 이동</p>
+        <p><strong>.txt:</strong> <code>progress × 전체높이 = scrollY</code> 로 스크롤</p>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon blue">📊</div>
+      <div class="step-body">
+        <h5>④ 읽는 중 진행도 추적</h5>
+        <p><strong>.epub:</strong> epub.js <code>relocated</code> 이벤트 → WebView 메시지 수신</p>
+        <p><strong>.txt:</strong> <code>onScroll</code> → <code>scrollY / (contentHeight - viewHeight)</code></p>
+      </div>
+    </div>
+    <div class="flow-connector"><span>↓</span></div>
+
+    <div class="flow-step">
+      <div class="step-icon purple">💾</div>
+      <div class="step-body">
+        <h5>⑤ 진행도 저장 (2가지 시점)</h5>
+        <p><code>PATCH /files/{fileId}/progress</code></p>
+      </div>
+    </div>
+
+    <div class="branch">
+      <div class="branch-item">
+        <span class="branch-label yes">뒤로가기/닫기</span>
+        <span class="branch-desc">useEffect cleanup (unmount) 시 즉시 저장</span>
+      </div>
+      <div class="branch-item">
+        <span class="branch-label no">강제종료 (스와이프 킬)</span>
+        <span class="branch-desc">AppState 'background' 감지 → 즉시 저장</span>
+      </div>
+    </div>
+
+    <pre><span class="comment">// 서버로 보내는 진행도 데이터</span>
+{
+  <span class="key">"progress"</span>:      <span class="val">0.73</span>,
+  <span class="key">"epubCfi"</span>:       <span class="val">"epubcfi(/6/4[chap01]!/4/2/1:0)"</span>,  <span class="comment">// epub만</span>
+  <span class="key">"recordReadLog"</span>: <span class="val">true</span>   <span class="comment">// 읽기 기록 남기기 (종료 시)</span>
+}</pre>
+
+  </div>
+
+  <!-- ===================== 경로 정리 ===================== -->
+  <h2>파일 경로 종류 정리</h2>
+
+  <table>
+    <thead>
+      <tr><th>경로 종류</th><th>예시</th><th>특징</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>content://</strong></td>
+        <td><code>content://media/external/file/1000020537</code></td>
+        <td>안드로이드 미디어 스토어. 직접 읽기 불가, 반드시 복사 필요</td>
+      </tr>
+      <tr>
+        <td><strong>캐시 디렉토리</strong></td>
+        <td><code>file:///data/.../cache/파일명.epub</code></td>
+        <td>임시 저장. OS가 언제든 삭제 가능</td>
+      </tr>
+      <tr>
+        <td><strong>documentDirectory</strong></td>
+        <td><code>file:///data/.../files/파일명.epub</code></td>
+        <td>영구 저장. 앱 삭제 전까지 유지</td>
+      </tr>
+      <tr>
+        <td><strong>서버 DB uri 필드</strong></td>
+        <td><code>file:///data/.../files/파일명.epub</code></td>
+        <td>documentDirectory 경로를 DB에 저장해둠</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <span class="callout-icon">⚠️</span>
+    <div class="callout-body">
+      <strong>앱 재설치 시 경로 변경 문제</strong>
+      앱을 재설치하면 <code>documentDirectory</code> 경로의 일부(UUID 부분)가 변경될 수 있습니다. 이 경우 DB에 저장된 uri로 파일을 찾지 못해 ENOENT 에러가 발생합니다. <code>readWithFallback()</code> 함수로 파일명만으로 새 경로를 재시도해 해결합니다.
+    </div>
+  </div>
+
+  <!-- ===================== 문제 해결 ===================== -->
+  <h2>자주 발생하는 문제와 원인</h2>
+
+  <div class="problem-grid">
+    <div class="problem-card">
+      <div>
+        <div class="label problem">문제</div>
+        <div class="content">"Unmatched Route" 에러 화면</div>
+      </div>
+      <div>
+        <div class="label cause">원인</div>
+        <div class="content">외부 딥링크(<code>myreaderapp2://media/...</code>)가 라우트로 잘못 해석됨</div>
+      </div>
+      <div>
+        <div class="label fix">해결</div>
+        <div class="content"><code>+not-found.tsx</code>에서 가로채서 content:// 복원 후 처리</div>
+      </div>
+    </div>
+    <div class="problem-card">
+      <div>
+        <div class="label problem">문제</div>
+        <div class="content">파일 열기 시 ENOENT 에러</div>
+      </div>
+      <div>
+        <div class="label cause">원인</div>
+        <div class="content">앱 재설치 후 <code>documentDirectory</code> 경로 UUID가 변경됨</div>
+      </div>
+      <div>
+        <div class="label fix">해결</div>
+        <div class="content"><code>readWithFallback()</code>으로 파일명 기반 새 경로 재시도</div>
+      </div>
+    </div>
+    <div class="problem-card">
+      <div>
+        <div class="label problem">문제</div>
+        <div class="content">한글 txt 파일이 깨짐</div>
+      </div>
+      <div>
+        <div class="label cause">원인</div>
+        <div class="content">CP949/EUC-KR 인코딩 파일을 UTF-8로 읽음</div>
+      </div>
+      <div>
+        <div class="label fix">해결</div>
+        <div class="content"><code>decodeTextSafe()</code>로 BOM 체크 후 인코딩 자동 감지</div>
+      </div>
+    </div>
+    <div class="problem-card">
+      <div>
+        <div class="label problem">문제</div>
+        <div class="content">이어읽기가 안 됨 (처음부터 시작)</div>
+      </div>
+      <div>
+        <div class="label cause">원인</div>
+        <div class="content">초기화 타이밍에 <code>progress=0</code>으로 덮어쓰기됨</div>
+      </div>
+      <div>
+        <div class="label fix">해결</div>
+        <div class="content"><code>initialProgressRef</code>로 0 덮어쓰기 방지 처리</div>
+      </div>
+    </div>
+    <div class="problem-card">
+      <div>
+        <div class="label problem">문제</div>
+        <div class="content">강제종료 시 진행도 저장 안 됨</div>
+      </div>
+      <div>
+        <div class="label cause">원인</div>
+        <div class="content">스와이프 킬 시 <code>unmount</code>가 실행되지 않음</div>
+      </div>
+      <div>
+        <div class="label fix">해결</div>
+        <div class="content"><code>AppState 'background'</code> 이벤트 감지 시 즉시 저장</div>
+      </div>
+    </div>
+  </div>
+
+</main>
+</body>
+</html>

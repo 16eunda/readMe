@@ -1,23 +1,24 @@
-// app/ranking-premium.tsx
+// app/(tabs)/ranking-premium.tsx
 import { API_BASE_URL } from "@/constants/config";
 import { FileRankingDto } from "@/types/file";
 import { getDeviceId } from "@/utils/deviceId";
 import { FontAwesome5 } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { router, Stack, useFocusEffect } from "expo-router";
-import { useCallback, useMemo, useState } from "react";
+import { router, useFocusEffect } from "expo-router";
+import React, { useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   NativeScrollEvent,
   NativeSyntheticEvent,
   RefreshControl,
+  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from "react-native";
-import { useUser } from "../contexts/UserContext";
+import { useUser } from "../../contexts/UserContext";
 
 const PURPLE = "#7C3AED";
 const ITEMS_PER_PAGE = 10;
@@ -31,7 +32,7 @@ export default function RankingPremiumScreen() {
   const [selectedMonth, setSelectedMonth] = useState(now.getMonth() + 1);
   const [rankings, setRankings] = useState<FileRankingDto[]>([]);
   const [displayedItems, setDisplayedItems] = useState(ITEMS_PER_PAGE);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -175,10 +176,7 @@ export default function RankingPremiumScreen() {
   const visibleRankings = rankings.slice(0, displayedItems);
 
   return (
-    <>
-      <Stack.Screen
-        options={{ title: "상세 랭킹", headerBackTitle: "뒤로" }}
-      />
+    <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
       <ScrollView
         style={styles.container}
         showsVerticalScrollIndicator={false}
@@ -347,7 +345,7 @@ export default function RankingPremiumScreen() {
 
         <View style={{ height: 40 }} />
       </ScrollView>
-    </>
+    </SafeAreaView>
   );
 }
 

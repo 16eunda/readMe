@@ -9,6 +9,7 @@ import iconv from 'iconv-lite';
 import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  AppState,
   FlatList,
   NativeScrollEvent,
   NativeSyntheticEvent,
@@ -116,7 +117,7 @@ const FONT_PRESETS = [
 
 export default function ReaderScreen() {
   const router = useRouter();
-  const { fileId, uri, name } = useLocalSearchParams();
+  const { fileId, uri, name, resetProgress } = useLocalSearchParams();
   const insets = useSafeAreaInsets();
 
   const [isEpub, setIsEpub] = useState(false);
@@ -138,6 +139,10 @@ export default function ReaderScreen() {
   const scrollRef = useRef<ScrollView>(null);
   const [contentHeight, setContentHeight] = useState(1);
   const [viewHeight, setViewHeight] = useState(1);
+  const contentHeightRef = useRef(1); // setTimeout 내부에서 최신값 읽기용
+  const viewHeightRef = useRef(1);
+  const hasResumedRef = useRef(false); // TXT 이어읽기 한 번만 실행
+  const contentRef = useRef<string[]>([]); // 현재 렌더링 중인 문단 배열 (저장 시 preview 생성용)
 
   // epub 전용 base64 데이터
   const [epubBase64, setEpubBase64] = useState("");
@@ -238,6 +243,7 @@ export default function ReaderScreen() {
             .map((p: string) => p.replace(/\r/g, '').trim())
             .filter((p: string) => p.length > 0);
           setContent(paragraphs.length > 0 ? paragraphs : [text]);
+          contentRef.current = paragraphs.length > 0 ? paragraphs : [text];
           setTxtLoading(false);
         }
       } catch (e) {
@@ -258,8 +264,9 @@ export default function ReaderScreen() {
     read();
   }, [uri, name]);
 
-  // 서버에서 불러온 초기 progress 저장 (0으로 덮어쓰기 방지)
-  const initialProgressRef = useRef<number>(0);
+  // 서버에서 불러온 초기 progress (이어읽기 시작점)
+  const [initialProgress, setInitialProgress] = useState<number>(0);
+  const initialProgressRef = useRef<number>(0); // saveProgressToServer에서 사용
 
   useEffect(() => {
   const load = async () => {
@@ -272,6 +279,7 @@ export default function ReaderScreen() {
       if (fileInfo.progress > 0) {
         console.log("✅ 저장된 progress 발견:", fileInfo.progress);
         setProgress(fileInfo.progress);
+        setInitialProgress(fileInfo.progress);
         initialProgressRef.current = fileInfo.progress;
       } else {
         console.log("⚠️ 저장된 progress 없음");
@@ -289,38 +297,47 @@ export default function ReaderScreen() {
   load();
 }, [fileId, BASE_URL]);
 
-// TXT 컨텐츠 렌더링이 끝나고 높이가 계산된 뒤, 저장된 progress대로 스크롤 이동
+// TXT 컨텐츠 렌더링이 끝나고 높이가 계산된 뒤, 저장된 progress대로 스크롤 이동 (한 번만)
 useEffect(() => {
-  console.log("🔍 이어읽기 체크:", { isEpub, progress, contentHeight, viewHeight });
-  
-  // EPUB일 땀 스크롤 안 쓰니까 TXT일 때만
+  // EPUB이거나 이미 이어읽기 실행했으면 패스
   if (isEpub) return;
+  if (hasResumedRef.current) return;
+  // 처음부터 읽기 선택 시 이어읽기 스킵
+  if (resetProgress === "true") return;
 
-  // 아직 ref 없으더나 높이 없으면 패스
+  // 아직 ref 없거나 높이 없으면 패스
   if (!scrollRef.current) return;
   if (contentHeight <= 0 || viewHeight <= 0) return;
 
-  // progress 0이면 처음부터 읽기
-  if (!progress || progress <= 0) return;
+  // initialProgressRef에 저장된 값 사용 (서버에서 받은 원본)
+  const savedProgress = initialProgress;
+  if (!savedProgress || savedProgress <= 0) return;
 
   const maxScroll = contentHeight - viewHeight;
   if (maxScroll <= 0) return;
 
-  const scrollY = maxScroll * progress;
-  console.log("📚 TXT 이어읽기 실행! progress:", progress, "scrollY:", scrollY);
+  // 이미 여기서 flag → 중복 실행 방지
+  hasResumedRef.current = true;
 
-  scrollRef.current.scrollTo({
-    y: scrollY,
-    animated: false,
-  });
-}, [contentHeight, viewHeight, progress, isEpub]);
+  // FlatList가 아이템을 완전히 렌더링한 후 스크롤하도록 딜레이
+  // setTimeout 내부에서 ref(최신값)를 읽어야 정확한 위치로 이동
+  setTimeout(() => {
+    const latestMaxScroll = contentHeightRef.current - viewHeightRef.current;
+    if (latestMaxScroll <= 0) return;
+    const scrollY = latestMaxScroll * savedProgress;
+    console.log("📚 TXT 이어읽기 실행! progress:", savedProgress, "scrollY:", scrollY, "maxScroll:", latestMaxScroll);
+    (scrollRef.current as any)?.scrollToOffset({
+      offset: scrollY,
+      animated: false,
+    });
+  }, 600);
+}, [contentHeight, viewHeight, isEpub, resetProgress, initialProgress]);
 
   // 화면 진입 시 즉시 시스템 UI 숨기기, 나갈 때 복원
   useEffect(() => {
     if (Platform.OS !== "android") return;
     StatusBar.setHidden(true, "fade");
     NavigationBar.setVisibilityAsync("hidden");
-    NavigationBar.setBehaviorAsync("overlay-swipe");
     return () => {
       StatusBar.setHidden(false, "fade");
       NavigationBar.setVisibilityAsync("visible");
@@ -350,7 +367,7 @@ useEffect(() => {
       fontFamily: settings.fontFamily,
       lineSpacing: settings.lineSpacing,
       sidePadding: settings.sidePadding,
-      cfi: initialCfi || null,
+      cfi: resetProgress === "true" ? null : (initialCfi || null),
     }));
     epubStartedRef.current = true;
   }, [isEpub, epubReady, initialCfi]);
@@ -788,7 +805,7 @@ useEffect(() => {
                   sendLog("🎨 테마 업데이트: " + currentTheme.bgColor);
                 }
               } catch(err) {
-                sendLog("❌ Message handler error: " + err.message);
+                // WebView 내부 비-JSON 메시지(setImmediate 등) 파싱 실패 → 무시
               }
             });
 
@@ -842,8 +859,15 @@ useEffect(() => {
 
     const body: any = { 
       progress: currentProgress,
-      recordReadLog: forceLog || currentProgress > 0  // 강제 로그 또는 progress가 있을 때
+      recordReadLog: forceLog || currentProgress > 0
     };
+
+    // TXT: 현재 스크롤 위치의 문단을 readingPreview로 저장
+    if (!isEpub && contentRef.current.length > 0) {
+      const paragraphs = contentRef.current;
+      const paraIndex = Math.max(0, Math.floor(currentProgress * paragraphs.length) - 1);
+      body.readingPreview = paragraphs.slice(paraIndex, paraIndex + 3).join('\n').slice(0, 200);
+    }
 
     if (isEpub && lastCfiRef.current) {
       body.epubCfi = lastCfiRef.current;
@@ -867,28 +891,6 @@ useEffect(() => {
     }
   };
 
-  // progress 변경 시 3초 후 자동 저장 (debounce)
-  useEffect(() => {
-    // 이전 타이머 취소
-    if (saveTimerRef.current) {
-      clearTimeout(saveTimerRef.current);
-    }
-
-    // progress가 0이거나 초기 로딩 중이면 저장 안 함
-    if (progress === 0) return;
-
-    // 3초 후 자동 저장
-    saveTimerRef.current = setTimeout(() => {
-      saveProgressToServer(false);
-    }, 3000);
-
-    return () => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-      }
-    };
-  }, [progress]);
-
   // unmount 시 저장 (백업)
   useEffect(() => {
     return () => {
@@ -898,6 +900,16 @@ useEffect(() => {
       // unmount 시에는 로그 기록
       saveProgressToServer(true);
     };
+  }, [fileId, isEpub, BASE_URL]);
+
+  // 앱이 백그라운드로 전환될 때 저장 (강제종료 대비)
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'background' || nextState === 'inactive') {
+        saveProgressToServer(true);
+      }
+    });
+    return () => subscription.remove();
   }, [fileId, isEpub, BASE_URL]);
 
   return (
@@ -998,8 +1010,8 @@ useEffect(() => {
               contentContainerStyle={{ paddingHorizontal: settings.sidePadding, paddingBottom: 40 }}
               onScroll={handleScroll}
               scrollEventThrottle={200}
-              onContentSizeChange={(_, h) => setContentHeight(h)}
-              onLayout={(e) => setViewHeight(e.nativeEvent.layout.height)}
+              onContentSizeChange={(_, h) => { setContentHeight(h); contentHeightRef.current = h; }}
+              onLayout={(e) => { const h = e.nativeEvent.layout.height; setViewHeight(h); viewHeightRef.current = h; }}
               onTouchStart={(e) => {
                 touchStartPos.current = { x: e.nativeEvent.pageX, y: e.nativeEvent.pageY };
                 isTouchMove.current = false;

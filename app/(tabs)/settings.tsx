@@ -1,6 +1,4 @@
 // app/(tabs)/settings.tsx
-import { getDeviceId } from "@/utils/deviceId";
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect, useRouter } from "expo-router";
 import { useCallback, useState } from "react";
 import {
@@ -27,7 +25,7 @@ const SCREEN_HEIGHT = Dimensions.get("window").height;
 
 export default function SettingsScreen() {
   // 전역 상태 사용
-  const { user, login, logout, isPremium } = useUser();
+  const { user, deviceId, login, logout, isPremium, isLoading: userLoading } = useUser();
   const router = useRouter();
 
   // ========== Hooks는 컴포넌트 안에서만! ==========
@@ -37,13 +35,12 @@ export default function SettingsScreen() {
 
   const fetchStats = async () => {
     try {
-    setLoading(true);
-      const token = await AsyncStorage.getItem("accessToken");
-      const deviceId = await getDeviceId();
+      setLoading(true);
+      const token = user?.token;
 
       const response = await fetch(`${BASE_URL}/files/stats`, {
         headers: {
-          "X-Device-Id": deviceId,
+          "X-Device-Id": deviceId ?? "",
           ...(token && { Authorization: `Bearer ${token}` })
         },
       });
@@ -62,11 +59,14 @@ export default function SettingsScreen() {
     }
   };
 
-  // 설정 탭에 포커스될 때마다 통계 새로고침
+  // UserContext 로딩 완료 후, user 상태가 확정되면 통계 조회
+  // (토큰 재발급 완료 전에 fetchStats가 실행되는 race condition 방지)
   useFocusEffect(
     useCallback(() => {
-      fetchStats(); // 포커스될 때마다 통계 새로고침
-    }, [])
+      if (!userLoading) {
+        fetchStats();
+      }
+    }, [userLoading, user])
   );
 
   const handleLoginSuccess = async (userId: string, username: string, token: string) => {
@@ -112,13 +112,12 @@ export default function SettingsScreen() {
   // 실제 탈퇴 처리 함수
   const withdrawAccount = async () => {
     try {
-      const token = await AsyncStorage.getItem("accessToken");
-      const deviceId = await getDeviceId();
+      const token = user?.token;
 
       const res = await fetch(`${BASE_URL}/auth/user/me`, {
         method: "DELETE",
         headers: {
-          "X-Device-Id": deviceId,
+          "X-Device-Id": deviceId ?? "",
           ...(token && { Authorization: `Bearer ${token}` }),
         },
       });

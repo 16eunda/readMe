@@ -2,12 +2,12 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
 import {
-    ActivityIndicator,
-    Modal,
-    ScrollView,
-    Text,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Modal,
+  ScrollView,
+  Text,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { useUser } from "../contexts/UserContext";
 import { BASE_URL } from "../utils/api";
@@ -33,8 +33,7 @@ export default function AiAnalysisModal({
   fileTitle,
   onClose,
 }: AiAnalysisModalProps) {
-  const { isPremium: _isPremium, deviceId } = useUser();
-  const isPremium = true; // TODO: 테스트 끝나면 이 줄 지우고 위 줄을 const { isPremium, deviceId } 로 바꾸기
+  const { isPremium, deviceId } = useUser();
   const router = useRouter();
 
   const [loading, setLoading] = useState(false);
@@ -64,9 +63,26 @@ export default function AiAnalysisModal({
       });
       if (res.ok) {
         const data = await res.json();
+        console.log("📊 AI 분석 결과:", data);
         // keywords가 문자열로 오면 파싱, 없으면 빈 배열
         if (typeof data.keywords === "string") {
-          try { data.keywords = JSON.parse(data.keywords); } catch { data.keywords = []; }
+          console.log("🔍 keywords 문자열 감지:", data.keywords);
+
+          try {
+            // 1) JSON 배열 문자열인 경우
+            const parsed = JSON.parse(data.keywords);
+
+            data.keywords = Array.isArray(parsed) ? parsed : [];
+            console.log("✅ keywords JSON 파싱 성공:", data.keywords);
+          } catch {
+            // 2) 그냥 "가정, 부부, 생활" 같은 쉼표 문자열인 경우
+            data.keywords = data.keywords
+              .split(",")
+              .map((keyword: string) => keyword.trim())
+              .filter(Boolean);
+
+            console.log("✅ keywords 쉼표 문자열 변환 성공:", data.keywords);
+          }
         }
         if (!Array.isArray(data.keywords)) data.keywords = [];
         setAnalysis(data);

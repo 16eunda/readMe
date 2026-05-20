@@ -1,6 +1,6 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import { Modal, Pressable, Text, TouchableOpacity, View } from "react-native";
+import { Modal, Pressable, ScrollView, Text, TouchableOpacity, View } from "react-native";
 
 export default function PreviewModal({
   visible,
@@ -26,6 +26,7 @@ export default function PreviewModal({
         <View
           style={{
             width: "85%",
+            maxHeight: "80%",
             backgroundColor: "#fff",
             padding: 20,
             borderRadius: 12,
@@ -60,16 +61,20 @@ export default function PreviewModal({
             마지막 위치에서 이어 읽기 ({Math.round(lastProgress * 100)}%)
           </Text>
 
-          <Text
-            style={{
-              marginTop: 14,
-              fontSize: 16,
-              color: "#333",
-              lineHeight: 24,
-            }}
+          <ScrollView
+            style={{ marginTop: 14, maxHeight: 200 }}
+            showsVerticalScrollIndicator={false}
           >
-            {previewText}
-          </Text>
+            <Text
+              style={{
+                fontSize: 16,
+                color: "#333",
+                lineHeight: 24,
+              }}
+            >
+              {previewText}
+            </Text>
+          </ScrollView>
 
           <View
             style={{
@@ -86,6 +91,7 @@ export default function PreviewModal({
                     fileId: file.id,
                     uri: file.uri,
                     name: file.title,
+                    resetProgress: "true",
                   },
                 });
                 onClose();
