@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { createContext, useContext, useEffect, useState } from 'react';
+import { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { AppState, AppStateStatus } from 'react-native';
 import { API_BASE_URL } from '../constants/config';
 import { getDeviceId } from '../utils/deviceId';
@@ -43,6 +43,14 @@ const UserContext = createContext<UserContextType>({
 
 export function UserProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User>(null);
+  const userRef = useRef<User>(null); // AppState 클로저에서 최신 user 값 읽기용
+
+  // setUser + userRef 동시 업데이트
+  const setUserSync = (u: User) => {
+    userRef.current = u;
+    setUser(u);
+  };
+
   const [deviceId, setDeviceId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [incomingFile, setIncomingFile] = useState<IncomingFile>(null);
@@ -95,21 +103,46 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
 
       if (!isReturningFromBackground) return;
 
-      console.log('📱 백그라운드에서 복귀');
+      console.log('📱 백그라운드에서 복귀 - 인증 상태 복구 시도');
       const refreshToken = await AsyncStorage.getItem('refreshToken');
       if (refreshToken) {
         const newAccessToken = await refreshAccessToken(refreshToken);
         if (newAccessToken) {
-          setUser(prev => prev ? { ...prev, token: newAccessToken } : null);
+          // user state 복원: 메모리에서 날아간 경우 AsyncStorage에서 다시 읽기
+          const userData = await AsyncStorage.getItem(USER_KEY);
+          if (userData) {
+            const parsedUser = JSON.parse(userData);
+            setUserSync({ ...parsedUser, token: newAccessToken });
+            console.log('✅ 백그라운드 복귀 - 토큰 재발급 + user 상태 복원 완료');
+          } else {
+            const cur = userRef.current;
+            if (cur) setUserSync({ ...cur, token: newAccessToken });
+            console.log('✅ 백그라운드 복귀 - 토큰 재발급 완료');
+          }
         } else {
-          // 재발급 실패해도 바로 로그아웃 X → accessToken이 아직 유효할 수 있음
+          // 재발급 실패 - accessToken도 없으면 로그아웃
           const accessToken = await AsyncStorage.getItem('accessToken');
           if (!accessToken) {
             console.log('❌ accessToken도 없음 → 로그아웃');
             await logout();
           } else {
-            console.log('⚠️ refreshToken 재발급 실패, 기존 accessToken 유지');
+            // accessToken이 아직 살아있으면 user state만 복원 시도
+            const userData = await AsyncStorage.getItem(USER_KEY);
+            if (userData && !userRef.current) {
+              setUserSync(JSON.parse(userData));
+              console.log('⚠️ refreshToken 재발급 실패, 기존 accessToken + user 복원');
+            } else {
+              console.log('⚠️ refreshToken 재발급 실패, 기존 accessToken 유지');
+            }
           }
+        }
+      } else {
+        // refreshToken 없음 - accessToken + userData로 복원 시도
+        const accessToken = await AsyncStorage.getItem('accessToken');
+        const userData = await AsyncStorage.getItem(USER_KEY);
+        if (accessToken && userData && !userRef.current) {
+          setUserSync(JSON.parse(userData));
+          console.log('✅ 백그라운드 복귀 - refreshToken 없지만 accessToken으로 user 복원');
         }
       }
     });
@@ -136,7 +169,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
           const userData = await AsyncStorage.getItem(USER_KEY);
           if (userData) {
             const parsedUser = JSON.parse(userData);
-            setUser({ ...parsedUser, token: newAccessToken });
+            setUserSync({ ...parsedUser, token: newAccessToken });
             console.log('✅ 토큰 재발급 성공 + 로그인 복원');
             await checkSubscription();
             setIsLoading(false);
@@ -160,7 +193,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
             headers: { Authorization: `Bearer ${accessToken}` },
           });
           if (verifyRes.ok) {
-            setUser(JSON.parse(userData));
+            setUserSync(JSON.parse(userData));
             console.log('✅ 기존 로그인 정보 로드 (토큰 유효)');
             await checkSubscription();
           } else {
@@ -170,7 +203,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
           }
         } catch {
           // 네트워크 오류 시 일단 로그인 상태 유지
-          setUser(JSON.parse(userData));
+          setUserSync(JSON.parse(userData));
           console.log('⚠️ 토큰 검증 실패 (네트워크 오류), 기존 로그인 정보 유지');
           await checkSubscription();
         }
@@ -223,10 +256,8 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
 
   const login = async (userId: string, username: string, token: string) => {
     const newUser = { userId, username, token };
-    setUser(newUser);
+    setUserSync(newUser);
     
-    // AsyncStorage에 저장 (앱 재시작해도 유지)
-    // 참고: token은 accessToken을 의미 (향후 refreshToken도 별도 저장 가능)
     await AsyncStorage.setItem(USER_KEY, JSON.stringify({ userId, username }));
     await AsyncStorage.setItem('accessToken', token);
     console.log('✅ 로그인 완료:', username);
@@ -234,7 +265,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = async () => {
-    setUser(null);
+    setUserSync(null);
     setIsPremium(false);
     await AsyncStorage.multiRemove([USER_KEY, 'accessToken', 'refreshToken', 'isPremium']);
     console.log('✅ 로그아웃 완료');

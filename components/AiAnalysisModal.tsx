@@ -1,11 +1,12 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Modal,
   ScrollView,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from "react-native";
@@ -40,6 +41,13 @@ export default function AiAnalysisModal({
   const [analysis, setAnalysis] = useState<AiInfo | null>(null);
   const [failed, setFailed] = useState(false);
 
+  // 전체 편집 모드
+  const [editing, setEditing] = useState(false);
+  const [editedData, setEditedData] = useState<AiInfo | null>(null);
+  const [newTag, setNewTag] = useState("");
+  const [saving, setSaving] = useState(false);
+  const tagInputRef = useRef<TextInput>(null);
+
   useEffect(() => {
     if (visible && isPremium && fileId) {
       fetchAnalysis();
@@ -47,6 +55,9 @@ export default function AiAnalysisModal({
     if (!visible) {
       setAnalysis(null);
       setFailed(false);
+      setEditing(false);
+      setEditedData(null);
+      setNewTag("");
     }
   }, [visible, isPremium, fileId]);
 
@@ -96,6 +107,75 @@ export default function AiAnalysisModal({
     }
   }
 
+  function startEdit() {
+    if (!analysis) return;
+    setEditedData({ ...analysis, keywords: [...analysis.keywords] });
+    setNewTag("");
+    setEditing(true);
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    setEditedData(null);
+    setNewTag("");
+  }
+
+  function addTag() {
+    const tag = newTag.trim();
+    if (!tag || !editedData) { setNewTag(""); return; }
+    if (editedData.keywords.includes(tag)) { setNewTag(""); return; }
+    setEditedData({ ...editedData, keywords: [...editedData.keywords, tag] });
+    setNewTag("");
+    setTimeout(() => tagInputRef.current?.focus(), 50);
+  }
+
+  function removeTag(index: number) {
+    if (!editedData) return;
+    setEditedData({ ...editedData, keywords: editedData.keywords.filter((_, i) => i !== index) });
+  }
+
+  async function saveAll() {
+    if (!fileId || !analysis || !editedData) return;
+    setSaving(true);
+    try {
+      const token = await AsyncStorage.getItem("accessToken");
+      const res = await fetch(`${BASE_URL}/files/${fileId}/ai-info`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token && { Authorization: `Bearer ${token}` }),
+          ...(deviceId && { "X-Device-Id": deviceId }),
+        },
+        body: JSON.stringify(editedData),
+      });
+      if (res.ok) {
+        setAnalysis({ ...editedData });
+        setEditing(false);
+        setEditedData(null);
+      }
+    } catch {
+      // 실패 시 편집 상태 유지
+      console.error("AI 분석 정보 저장 실패");
+    } finally {
+      console.log("저장 완료", editedData);
+      setSaving(false);
+    }
+  }
+
+  const data = editing ? editedData : analysis;
+
+  const inputStyle = (borderColor: string) => ({
+    fontSize: 14 as const,
+    color: "#333" as const,
+    lineHeight: 22 as const,
+    backgroundColor: "#fff" as const,
+    borderRadius: 8 as const,
+    paddingHorizontal: 10 as const,
+    paddingVertical: 6 as const,
+    borderWidth: 1 as const,
+    borderColor,
+  });
+
   return (
     <Modal visible={visible} transparent animationType="slide">
       <View
@@ -115,23 +195,22 @@ export default function AiAnalysisModal({
           }}
         >
           {/* 헤더 */}
-          <View
-            style={{
-              flexDirection: "row",
-              justifyContent: "space-between",
-              alignItems: "center",
-              marginBottom: 6,
-            }}
-          >
-            <Text style={{ fontSize: 18, fontWeight: "bold", color: "#1a1a1a" }}>
-              ✨ AI 분석
-            </Text>
-            <TouchableOpacity
-              onPress={onClose}
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-            >
-              <Text style={{ fontSize: 15, color: "#888" }}>닫기</Text>
-            </TouchableOpacity>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <Text style={{ fontSize: 18, fontWeight: "bold", color: "#1a1a1a" }}>✨ AI 분석</Text>
+            {!editing ? (
+              <TouchableOpacity onPress={onClose} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <Text style={{ fontSize: 15, color: "#888" }}>닫기</Text>
+              </TouchableOpacity>
+            ) : (
+              <View style={{ flexDirection: "row", gap: 8 }}>
+                <TouchableOpacity onPress={cancelEdit} style={{ paddingHorizontal: 14, paddingVertical: 6, backgroundColor: "#F3F4F6", borderRadius: 10 }}>
+                  <Text style={{ fontSize: 14, color: "#666" }}>취소</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={saveAll} disabled={saving} style={{ paddingHorizontal: 14, paddingVertical: 6, backgroundColor: "#7C3AED", borderRadius: 10, minWidth: 52, alignItems: "center" }}>
+                  {saving ? <ActivityIndicator size={14} color="#fff" /> : <Text style={{ fontSize: 14, color: "#fff", fontWeight: "bold" }}>저장</Text>}
+                </TouchableOpacity>
+              </View>
+            )}
           </View>
 
           {/* 파일 제목 */}
@@ -207,99 +286,114 @@ export default function AiAnalysisModal({
           )}
 
           {/* ── 분석 결과 ── */}
-          {isPremium && !loading && analysis && (
-            <ScrollView showsVerticalScrollIndicator={false}>
+          {isPremium && !loading && data && (
+            <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+
+              {/* 편집 버튼 (보기 모드) */}
+              {!editing && (
+                <TouchableOpacity
+                  onPress={startEdit}
+                  style={{ alignSelf: "flex-end", flexDirection: "row", alignItems: "center", gap: 4, marginBottom: 12, paddingHorizontal: 12, paddingVertical: 6, backgroundColor: "#F3F0FF", borderRadius: 10 }}
+                >
+                  <Text style={{ fontSize: 13, color: "#7C3AED" }}>✏️</Text>
+                  <Text style={{ fontSize: 13, color: "#7C3AED", fontWeight: "600" }}>전체 편집</Text>
+                </TouchableOpacity>
+              )}
+
               {/* 요약 */}
-              <View
-                style={{
-                  backgroundColor: "#F5F0FF",
-                  borderRadius: 14,
-                  padding: 16,
-                  marginBottom: 12,
-                }}
-              >
-                <Text style={{ fontWeight: "bold", color: "#7C3AED", marginBottom: 8, fontSize: 14 }}>
-                  📖 요약
-                </Text>
-                <Text style={{ fontSize: 14, color: "#333", lineHeight: 22 }}>
-                  {analysis.summary}
-                </Text>
+              <View style={{ backgroundColor: "#F5F0FF", borderRadius: 14, padding: 16, marginBottom: 12 }}>
+                <Text style={{ fontWeight: "bold", color: "#7C3AED", marginBottom: 8, fontSize: 14 }}>📖 요약</Text>
+                {editing && editedData ? (
+                  <TextInput
+                    value={editedData.summary}
+                    onChangeText={(t) => setEditedData({ ...editedData, summary: t })}
+                    multiline
+                    style={inputStyle("#D8B4FE")}
+                    placeholderTextColor="#999"
+                  />
+                ) : (
+                  <Text style={{ fontSize: 14, color: "#333", lineHeight: 22 }}>{data.summary}</Text>
+                )}
               </View>
 
               {/* 장르 + 분위기 */}
               <View style={{ flexDirection: "row", gap: 8, marginBottom: 12 }}>
-                <View
-                  style={{
-                    flex: 1,
-                    backgroundColor: "#FFF8E1",
-                    borderRadius: 14,
-                    padding: 16,
-                  }}
-                >
-                  <Text style={{ fontWeight: "bold", color: "#D97706", marginBottom: 6, fontSize: 14 }}>
-                    🎭 장르
-                  </Text>
-                  <Text style={{ fontSize: 14, color: "#333" }}>{analysis.genre}</Text>
+                <View style={{ flex: 1, backgroundColor: "#FFF8E1", borderRadius: 14, padding: 16 }}>
+                  <Text style={{ fontWeight: "bold", color: "#D97706", marginBottom: 6, fontSize: 14 }}>🎭 장르</Text>
+                  {editing && editedData ? (
+                    <TextInput
+                      value={editedData.genre}
+                      onChangeText={(t) => setEditedData({ ...editedData, genre: t })}
+                      style={inputStyle("#FDE68A")}
+                      placeholderTextColor="#999"
+                    />
+                  ) : (
+                    <Text style={{ fontSize: 14, color: "#333" }}>{data.genre}</Text>
+                  )}
                 </View>
-                <View
-                  style={{
-                    flex: 1,
-                    backgroundColor: "#F0F9FF",
-                    borderRadius: 14,
-                    padding: 16,
-                  }}
-                >
-                  <Text style={{ fontWeight: "bold", color: "#0284C7", marginBottom: 6, fontSize: 14 }}>
-                    🌈 분위기
-                  </Text>
-                  <Text style={{ fontSize: 14, color: "#333" }}>{analysis.mood}</Text>
+                <View style={{ flex: 1, backgroundColor: "#F0F9FF", borderRadius: 14, padding: 16 }}>
+                  <Text style={{ fontWeight: "bold", color: "#0284C7", marginBottom: 6, fontSize: 14 }}>🌈 분위기</Text>
+                  {editing && editedData ? (
+                    <TextInput
+                      value={editedData.mood}
+                      onChangeText={(t) => setEditedData({ ...editedData, mood: t })}
+                      style={inputStyle("#BAE6FD")}
+                      placeholderTextColor="#999"
+                    />
+                  ) : (
+                    <Text style={{ fontSize: 14, color: "#333" }}>{data.mood}</Text>
+                  )}
                 </View>
               </View>
 
               {/* 키워드 */}
-              <View
-                style={{
-                  backgroundColor: "#F0FFF4",
-                  borderRadius: 14,
-                  padding: 16,
-                  marginBottom: 12,
-                }}
-              >
-                <Text style={{ fontWeight: "bold", color: "#059669", marginBottom: 10, fontSize: 14 }}>
-                  🏷️ 키워드
-                </Text>
+              <View style={{ backgroundColor: "#F0FFF4", borderRadius: 14, padding: 16, marginBottom: 12 }}>
+                <Text style={{ fontWeight: "bold", color: "#059669", marginBottom: 10, fontSize: 14 }}>🏷️ 키워드</Text>
                 <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
-                  {analysis.keywords.map((kw, i) => (
-                    <View
-                      key={i}
-                      style={{
-                        backgroundColor: "#D1FAE5",
-                        borderRadius: 20,
-                        paddingHorizontal: 12,
-                        paddingVertical: 4,
-                      }}
-                    >
+                  {(editing && editedData ? editedData.keywords : data.keywords).map((kw, i) => (
+                    <View key={i} style={{ backgroundColor: "#D1FAE5", borderRadius: 20, paddingHorizontal: 12, paddingVertical: 4, flexDirection: "row", alignItems: "center", gap: 4 }}>
                       <Text style={{ fontSize: 13, color: "#065F46" }}>{kw}</Text>
+                      {editing && (
+                        <TouchableOpacity onPress={() => removeTag(i)} hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }}>
+                          <Text style={{ fontSize: 12, color: "#059669", fontWeight: "bold" }}>✕</Text>
+                        </TouchableOpacity>
+                      )}
                     </View>
                   ))}
                 </View>
+                {editing && (
+                  <View style={{ flexDirection: "row", alignItems: "center", marginTop: 10, gap: 8 }}>
+                    <TextInput
+                      ref={tagInputRef}
+                      value={newTag}
+                      onChangeText={setNewTag}
+                      onSubmitEditing={addTag}
+                      placeholder="새 태그 입력..."
+                      placeholderTextColor="#9CA3AF"
+                      returnKeyType="done"
+                      style={{ flex: 1, backgroundColor: "#fff", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, fontSize: 13, color: "#111", borderWidth: 1, borderColor: "#A7F3D0" }}
+                    />
+                    <TouchableOpacity onPress={addTag} style={{ backgroundColor: "#059669", borderRadius: 10, paddingHorizontal: 14, paddingVertical: 8 }}>
+                      <Text style={{ color: "#fff", fontWeight: "bold", fontSize: 14 }}>+</Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
               </View>
 
               {/* 추천 대상 */}
-              <View
-                style={{
-                  backgroundColor: "#FFF1F2",
-                  borderRadius: 14,
-                  padding: 16,
-                  marginBottom: 16,
-                }}
-              >
-                <Text style={{ fontWeight: "bold", color: "#BE123C", marginBottom: 8, fontSize: 14 }}>
-                  🎯 추천 대상
-                </Text>
-                <Text style={{ fontSize: 14, color: "#333", lineHeight: 22 }}>
-                  {analysis.target}
-                </Text>
+              <View style={{ backgroundColor: "#FFF1F2", borderRadius: 14, padding: 16, marginBottom: 24 }}>
+                <Text style={{ fontWeight: "bold", color: "#BE123C", marginBottom: 8, fontSize: 14 }}>🎯 추천 대상</Text>
+                {editing && editedData ? (
+                  <TextInput
+                    value={editedData.target}
+                    onChangeText={(t) => setEditedData({ ...editedData, target: t })}
+                    multiline
+                    style={inputStyle("#FECDD3")}
+                    placeholderTextColor="#999"
+                  />
+                ) : (
+                  <Text style={{ fontSize: 14, color: "#333", lineHeight: 22 }}>{data.target}</Text>
+                )}
               </View>
             </ScrollView>
           )}

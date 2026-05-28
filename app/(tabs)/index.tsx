@@ -18,6 +18,7 @@ import {
   SafeAreaView,
   ScrollView,
   Text,
+  TextInput,
   TouchableOpacity,
   View
 } from "react-native";
@@ -139,6 +140,7 @@ export default function Home() {
   const [duplicateModalVisible, setDuplicateModalVisible] = useState(false);
   const [duplicateFileName, setDuplicateFileName] = useState("");
   const [pendingFile, setPendingFile] = useState<any>(null);
+  const [inputFileName, setInputFileName] = useState(""); // 사용자 입력 파일명 (외부 파일용)
 
   // 페이지네이션 (추가 페이지 로딩용)
   const [currentPage, setCurrentPage] = useState(0);
@@ -363,13 +365,22 @@ export default function Home() {
     useCallback(() => {
       if (!deviceId) return;
       const now = Date.now();
-      // 30초 이상 지났을 때만 refetch (staleTime과 동일)
-      if (now - lastFocusTimeRef.current > 30_000) {
-        lastFocusTimeRef.current = now;
-        refetchFiles();
-        refetchFolders();
-        refetchAllFolders();
-      }
+
+      AsyncStorage.getItem('reader_exited').then((val) => {
+        if (val === '1') {
+          // reader에서 돌아온 경우 → 쿨다운 무시하고 즉시 refetch
+          AsyncStorage.removeItem('reader_exited');
+          lastFocusTimeRef.current = now;
+          refetchFiles();
+          refetchFolders();
+          refetchAllFolders();
+        } else if (now - lastFocusTimeRef.current > 30_000) {
+          lastFocusTimeRef.current = now;
+          refetchFiles();
+          refetchFolders();
+          refetchAllFolders();
+        }
+      });
     }, [deviceId, currentFolder])
   );
 
@@ -379,76 +390,87 @@ export default function Home() {
   useEffect(() => {
     if (!incomingFile) return;
 
-    const processExternal = async () => {
-      // 중복 처리 방지: 바로 초기화
-      setIncomingFile(null);
-
-      const { uri, name } = incomingFile;
-
-      try {
-        // 중복 체크 (root 폴더 기준)
-        const checkRes = await fetch(
-          `${BASE_URL}/files/check?title=${encodeURIComponent(name)}&path=root`
-        );
-        const { exists } = await checkRes.json();
-
-        if (exists) {
-          Alert.alert(
-            '이미 있는 파일',
-            `"${name}"이(가) 이미 라이브러리에 있어요.`,
-            [
-              {
-                text: '그냥 열기',
-                onPress: async () => {
-                  // 목록에서 찾아 reader로 이동
-                  const res = await fetch(`${BASE_URL}/files?path=root&page=0&size=100`, {
-                    headers: {
-                      'X-Device-Id': deviceId ?? '',
-                    },
-                  });
-                  const data = await res.json();
-                  const list = data.content ?? data;
-                  const found = (list as any[]).find((f: any) => f.title === name);
-                  if (found) {
-                    router.push({
-                      pathname: '/reader',
-                      params: { fileId: found.id, uri: found.uri, name: found.title },
-                    });
-                  }
-                },
-              },
-              {
-                text: '새로 추가',
-                onPress: async () => {
-                  const saved = await addFileToSystem({ uri, name }, 'root');
-                  if (saved) {
-                    router.push({
-                      pathname: '/reader',
-                      params: { fileId: saved.id, uri: saved.uri, name: saved.title },
-                    });
-                  }
-                },
-              },
-            ]
-          );
-          return;
-        }
-
-        // 새 파일 → root에 추가 후 바로 reader로 이동
-        const saved = await addFileToSystem({ uri, name }, 'root');
-        if (saved) {
-          router.push({
-            pathname: '/reader',
-            params: { fileId: saved.id, uri: saved.uri, name: saved.title },
-          });
-        }
-      } catch (e) {
-        console.error('❌ 외부 파일 처리 실패:', e);
-      }
-    };
-
-    processExternal();
+    setIncomingFile(null); // 중복 처리 방지
+    
+    const { uri, name } = incomingFile;
+    
+    // ★ temp_ 형식의 파일명: 사용자 입력 필요
+    if (name.startsWith('temp_')) {
+      const ext = name.endsWith('.epub') ? '.epub' : '.txt';
+      setPendingFile({ uri, name });
+      setInputFileName(`imported${ext}`); // 기본값
+      return;
+    }
+    
+    // DocumentPicker로 온 파일: 바로 처리
+    processExternalFile({ uri, name });
   }, [incomingFile]);
+  
+  // 외부 파일 실제 처리
+  const processExternalFile = async (file: { uri: string; name: string }) => {
+    const { uri, name } = file;
+    
+    try {
+      // 중복 체크 (root 폴더 기준)
+      const checkRes = await fetch(
+        `${BASE_URL}/files/check?title=${encodeURIComponent(name)}&path=root`
+      );
+      const { exists } = await checkRes.json();
+
+      if (exists) {
+        Alert.alert(
+          '이미 있는 파일',
+          `"${name}"이(가) 이미 라이브러리에 있어요.`,
+          [
+            {
+              text: '그냥 열기',
+              onPress: async () => {
+                // 목록에서 찾아 reader로 이동
+                const res = await fetch(`${BASE_URL}/files?path=root&page=0&size=100`, {
+                  headers: {
+                    'X-Device-Id': deviceId ?? '',
+                  },
+                });
+                const data = await res.json();
+                const list = data.content ?? data;
+                const found = (list as any[]).find((f: any) => f.title === name);
+                if (found) {
+                  router.push({
+                    pathname: '/reader',
+                    params: { fileId: found.id, uri: found.uri, name: found.title, type: found.type },
+                  });
+                }
+              },
+            },
+            {
+              text: '새로 추가',
+              onPress: async () => {
+                const saved = await addFileToSystem({ uri, name }, 'root');
+                if (saved) {
+                  router.push({
+                    pathname: '/reader',
+                    params: { fileId: saved.id, uri: saved.uri, name: saved.title, type: saved.type },
+                  });
+                }
+              },
+            },
+          ]
+        );
+        return;
+      }
+
+      // 새 파일 → root에 추가 후 바로 reader로 이동
+      const saved = await addFileToSystem({ uri, name }, 'root');
+      if (saved) {
+        router.push({
+          pathname: '/reader',
+          params: { fileId: saved.id, uri: saved.uri, name: saved.title, type: saved.type },
+        });
+      }
+    } catch (e) {
+      console.error('❌ 외부 파일 처리 실패:', e);
+    }
+  };
 
   // 디바운싱: 검색어 입력 후 0.5초 대기
   useEffect(() => {
@@ -611,7 +633,11 @@ export default function Home() {
   // -----------------------------
   async function saveFileToServer(fileData: any) {
     try {
+      console.log('🚀 서버 요청 시작:', { url: `${BASE_URL}/files`, method: 'POST' });
+      
       const token = await AsyncStorage.getItem("accessToken");
+      console.log('🔐 토큰 확인:', { hasToken: !!token });
+      
       const response = await fetch(`${BASE_URL}/files`, {
         method: "POST",
         headers: {
@@ -622,10 +648,20 @@ export default function Home() {
         body: JSON.stringify(fileData),
       });
 
-      const saved = await response.json(); // 서버 DB에 저장된 객체 반환
+      console.log('📡 서버 응답 상태:', response.status);
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('❌ 서버 응답 에러:', { status: response.status, error: errorText });
+        return null;
+      }
+
+      const saved = await response.json();
+      console.log('✅ 서버 응답 파싱 완료:', { id: saved?.id, title: saved?.title });
       return saved;
     } catch (error) {
-      console.log("Error saving file:", error);
+      console.error("❌ saveFileToServer 에러:", error);
+      return null;
     }
   }
 
@@ -724,107 +760,157 @@ export default function Home() {
   // 파일 추가 (+ 버튼)
   // -----------------------------
   const pickFile = async () => {
-    const res = await DocumentPicker.getDocumentAsync({
-      type: ["text/plain", "application/epub+zip"],
-      copyToCacheDirectory: true, // ★ 반드시 추가
-    });
-    if (res.canceled) return;
-
-    const file = res.assets[0];
-
-    setIsUploading(true);
+    console.log('🔍 pickFile 호출됨');
     try {
-      // 🔵 서버 API로 중복 체크
-      const checkRes = await fetch(
-        `${BASE_URL}/files/check?title=${encodeURIComponent(file.name)}&path=${currentFolder}`
-      );
-      const { exists } = await checkRes.json();
+      const res = await DocumentPicker.getDocumentAsync({
+        type: ["text/plain", "application/epub+zip"],
+        copyToCacheDirectory: true, // ★ 반드시 추가
+      });
       
-      if (exists) {
-        // 중복 파일일 경우 모달 표시 (로딩 끄고)
-        setIsUploading(false);
-        setDuplicateFileName(file.name);
-        setPendingFile(file);
-        setDuplicateModalVisible(true);
+      console.log('📋 DocumentPicker 결과:', { canceled: res.canceled, assets: res.assets?.length });
+      
+      if (res.canceled) {
+        console.log('❌ 파일 선택 취소됨');
         return;
       }
 
-      // 중복이 아니면 바로 추가
-      await addFileToSystem(file);
-    } finally {
-      setIsUploading(false);
+      const file = res.assets[0];
+      console.log('✅ 파일 선택됨:', { name: file.name, uri: file.uri });
+
+      setIsUploading(true);
+      try {
+        // 🔵 서버 API로 중복 체크
+        console.log('🔎 중복 체크 중:', file.name);
+        const checkRes = await fetch(
+          `${BASE_URL}/files/check?title=${encodeURIComponent(file.name)}&path=${currentFolder}`
+        );
+        const { exists } = await checkRes.json();
+        
+        console.log('✓ 중복 체크 완료:', { exists, fileName: file.name });
+        
+        if (exists) {
+          // 중복 파일일 경우 모달 표시 (로딩 끄고)
+          console.log('⚠️ 중복 파일 발견, 모달 표시');
+          setIsUploading(false);
+          setDuplicateFileName(file.name);
+          setPendingFile(file);
+          setDuplicateModalVisible(true);
+          return;
+        }
+
+        // 중복이 아니면 바로 추가
+        console.log('➕ 새 파일 추가 시작');
+        await addFileToSystem(file);
+        console.log('✅ 파일 추가 완료');
+      } catch (e) {
+        console.error('❌ 파일 추가 중 오류:', e);
+        Alert.alert('파일 추가 실패', String(e));
+      } finally {
+        setIsUploading(false);
+      }
+    } catch (e) {
+      console.error('❌ pickFile 오류:', e);
+      Alert.alert('오류', String(e));
     }
   };
 
   // 실제 파일 추가 로직을 별도 함수로 분리 (isUploading은 호출자가 관리)
   const addFileToSystem = async (file: any, targetFolder?: string) => {
+    console.log('📝 addFileToSystem 호출:', { fileName: file.name, uri: file.uri, targetFolder, currentFolder });
     setIsUploading(true);
-    // 🔵 앱 전용 폴더로 복사
-    const newPath = FileSystem.documentDirectory + file.name;
-    await FileSystem.copyAsync({
-      from: file.uri,
-      to: newPath,
-    });
-
-    let preview = "";
-
-    try {
-      if (file.name.endsWith(".epub")) {
-        preview = await extractEpubPreview(newPath);
-      } else {
-        // const text = await FileSystem.readAsStringAsync(newPath, { 
-        //   encoding: FileSystem.EncodingType.UTF8 });
-        // preview = text.slice(0, 100) + "...";
-        // console.log("preview : " + preview);
-
-        // Base64로 읽고 자동 인코딩 감지
-        const base64 = await FileSystem.readAsStringAsync(newPath, { 
-          encoding: FileSystem.EncodingType.Base64 
-        });
-        
-        const buffer = Buffer.from(base64, 'base64');
-        const text = decodeTextSafe(buffer);
-        
-        // 줄바꿈을 공백으로, 연속 공백을 하나로 압축
-        const cleanedText = text.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
-        
-        // 50글자 + "..." 으로 제한
-        const trimmedText = cleanedText.slice(0, 50);
-        preview = trimmedText + (cleanedText.length > 50 ? "..." : "");
-        console.log("preview : " + preview);
-      }
-    } catch(e) {
-      console.log("읽기 실패:", e);
-      preview = "(미리보기를 불러올 수 없습니다)";
-    }
-
     
-    // 백엔드에 보낼 파일 정보
-    const newFile = {
-      title: file.name,
-      preview,
-      date: new Date().toISOString(), // ✅ 전체 ISO 형식 (날짜+시간)
-      rating: 0,
-      uri: newPath,
-      path: targetFolder ?? currentFolder, // ★ 현재 폴더 안에 저장됨
-      deviceId: deviceId, // 🆔 디바이스 ID 추가
-    };
+    try {
+      // 파일명 그대로 사용 (사용자가 입력한 값 또는 원본 파일명)
+      let displayName = file.name;
+      const title = displayName;
+      
+      console.log('📂 파일 복사 시작:', { displayName, title, targetPath: FileSystem.documentDirectory + displayName });
+      
+      // 🔵 앱 전용 폴더로 복사
+      const newPath = FileSystem.documentDirectory + displayName;
+      await FileSystem.copyAsync({
+        from: file.uri,
+        to: newPath,
+      });
+      
+      console.log('✅ 파일 복사 완료:', newPath);
 
-    // 1) 서버에 저장 요청
-    const saved = await saveFileToServer(newFile);
+      let preview = "";
 
-    // 2) Optimistic update: 캐시에 즉시 추가 → 기존 파일 유지하면서 새 파일 표시
-    if (saved) {
-      queryClient.setQueryData(filesQueryKey, (old: any) => ({
-        content: [saved, ...(old?.content ?? [])],
-        hasMore: old?.hasMore ?? false,
-      }));
-      // 백그라운드에서 서버와 동기화
-      refetchFiles();
+      try {
+        if (displayName.endsWith(".epub")) {
+          console.log('📖 EPUB 미리보기 추출 중...');
+          preview = await extractEpubPreview(newPath);
+          console.log('✅ EPUB 미리보기 완료:', preview.slice(0, 50));
+        } else {
+          console.log('📄 TXT 미리보기 추출 중...');
+          // Base64로 읽고 자동 인코딩 감지
+          const base64 = await FileSystem.readAsStringAsync(newPath, { 
+            encoding: FileSystem.EncodingType.Base64 
+          });
+          
+          const buffer = Buffer.from(base64, 'base64');
+          const text = decodeTextSafe(buffer);
+          
+          // 줄바꿈을 공백으로, 연속 공백을 하나로 압축
+          const cleanedText = text.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+          
+          // 50글자 + "..." 으로 제한
+          const trimmedText = cleanedText.slice(0, 50);
+          preview = trimmedText + (cleanedText.length > 50 ? "..." : "");
+          console.log('✅ TXT 미리보기 완료:', preview);
+        }
+      } catch(e) {
+        console.log("⚠️ 미리보기 추출 실패:", e);
+        preview = "(미리보기를 불러올 수 없습니다)";
+      }
+
+      
+      // 백엔드에 보낼 파일 정보
+      const folderPath = targetFolder ?? currentFolder;
+      const fileType = displayName.endsWith('.epub') ? 'EPUB' : 'TXT'; // ★ 파일 타입 추가
+      const newFile = {
+        title: title,
+        type: fileType, // ★ 백엔드 필수 필드
+        preview,
+        date: new Date().toISOString(),
+        rating: 0,
+        uri: newPath,
+        path: folderPath,
+        deviceId: deviceId,
+      };
+      
+      console.log('💾 서버에 파일 저장 중:', { title, path: folderPath, type: fileType });
+
+      // 1) 서버에 저장 요청
+      const saved = await saveFileToServer(newFile);
+      
+      if (!saved) {
+        console.error('❌ 서버 저장 실패:', saved);
+        setIsUploading(false);
+        return null;
+      }
+      
+      console.log('✅ 서버 저장 완료:', saved.id);
+
+      // 2) Optimistic update: 캐시에 즉시 추가 → 기존 파일 유지하면서 새 파일 표시
+      if (saved) {
+        queryClient.setQueryData(filesQueryKey, (old: any) => ({
+          content: [saved, ...(old?.content ?? [])],
+          hasMore: old?.hasMore ?? false,
+        }));
+        // 백그라운드에서 서버와 동기화
+        refetchFiles();
+      }
+
+      setIsUploading(false);
+      return saved;
+    } catch (e) {
+      console.error('❌ addFileToSystem 오류:', e);
+      setIsUploading(false);
+      Alert.alert('파일 추가 실패', String(e));
+      return null;
     }
-
-    setIsUploading(false);
-    return saved;
   };
 
   const extractEpubPreview = async (newPath: any, progress: number = 0) => {
@@ -856,7 +942,7 @@ export default function Home() {
         'bookinfo', 'writer', 'reader', 'split_000',
       ];
 
-      // 본문 챕터 href 목록 수집
+      // ★ 본문 챕터 수집: 실제 텍스트가 있는 챕터만
       const bodyChapters: string[] = [];
       for (const idref of spineIdrefs) {
         const r1 = new RegExp(`<(?:\\w+:)?item\\b[^>]*\\bid="${idref}"[^>]*href="([^"]+)"`, "i");
@@ -865,10 +951,28 @@ export default function Home() {
         if (!m) continue;
         const href = m[1];
         if (skipPatterns.some(p => href.toLowerCase().includes(p))) continue;
+        
         const fullPath = baseDir + href;
         const file = zip.files[fullPath] ?? zip.files[href];
         if (!file) continue;
-        bodyChapters.push(href);
+        
+        // ★ 각 챕터의 텍스트 양 확인
+        try {
+          const chapterContent = await file.async("text");
+          const plain = htmlToText(chapterContent, {
+            wordwrap: false,
+            selectors: [{ selector: 'img', format: 'skip' }], // 이미지 건너뛰기
+          });
+          const cleanedText = plain.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+          
+          // 텍스트가 50글자 이상 있어야 본문으로 간주
+          if (cleanedText.length >= 50) {
+            bodyChapters.push(href);
+          }
+        } catch (e) {
+          // 읽기 실패한 챕터는 스킵
+          continue;
+        }
       }
 
       if (bodyChapters.length === 0) return "(본문을 찾을 수 없습니다)";
@@ -888,10 +992,15 @@ export default function Home() {
 
       const chapterText = await chapterFile.async("text");
 
-      // 5) HTML → 텍스트 변환
+      // 5) HTML → 텍스트 변환 (이미지/사진 건너뛰기)
       const plain = htmlToText(chapterText, {
         wordwrap: false,
-        selectors: [{ selector: 'img', format: 'skip' }],
+        selectors: [
+          { selector: 'img', format: 'skip' },     // 이미지 건너뛰기
+          { selector: 'figure', format: 'skip' },  // figure (캡션 포함) 건너뛰기
+          { selector: 'picture', format: 'skip' }, // picture 건너뛰기
+          { selector: 'svg', format: 'skip' },     // SVG 그래픽 건너뛰기
+        ],
       });
       const cleanedText = plain.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
 
@@ -922,7 +1031,7 @@ export default function Home() {
     if (!info.progress || info.progress === 0) {
       router.push({
         pathname: "/reader",
-        params: { fileId: file.id, uri: file.uri, name: file.title }
+        params: { fileId: file.id, uri: file.uri, name: file.title, type: file.type }
       });
       return;
     }
@@ -1809,6 +1918,78 @@ export default function Home() {
       }}
       onClose={() => setSortModalVisible(false)}
     />
+    
+    {/* ★ 파일명 입력 모달 (외부 파일용) */}
+    <Modal
+      transparent={true}
+      visible={!!pendingFile}
+      animationType="fade"
+      onRequestClose={() => setPendingFile(null)}
+    >
+      <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' }}>
+        <View style={{ backgroundColor: '#fff', borderRadius: 12, padding: 24, width: '85%', maxWidth: 320 }}>
+          <Text style={{ fontSize: 18, fontWeight: 'bold', marginBottom: 16, color: '#000' }}>
+            파일명을 입력하세요
+          </Text>
+          
+          <TextInput
+            style={{
+              borderWidth: 1,
+              borderColor: '#ddd',
+              borderRadius: 8,
+              padding: 12,
+              fontSize: 16,
+              marginBottom: 20,
+              color: '#000',
+            }}
+            placeholder="예: 해와달.epub"
+            placeholderTextColor="#999"
+            value={inputFileName}
+            onChangeText={setInputFileName}
+            autoFocus={true}
+          />
+          
+          <View style={{ flexDirection: 'row', gap: 12, justifyContent: 'flex-end' }}>
+            <TouchableOpacity
+              onPress={() => {
+                setPendingFile(null);
+                setInputFileName('');
+              }}
+              style={{ paddingVertical: 10, paddingHorizontal: 16 }}
+            >
+              <Text style={{ fontSize: 16, color: '#999' }}>취소</Text>
+            </TouchableOpacity>
+            
+            <TouchableOpacity
+              onPress={async () => {
+                if (!inputFileName.trim() || !pendingFile) return;
+                
+                // temp_ 파일명을 사용자 입력으로 교체
+                const file = { ...pendingFile, name: inputFileName };
+                setPendingFile(null);
+                setInputFileName('');
+                
+                const saved = await addFileToSystem(file, 'root');
+                if (saved) {
+                  router.push({
+                    pathname: '/reader',
+                    params: { fileId: saved.id, uri: saved.uri, name: saved.title, type: saved.type },
+                  });
+                }
+              }}
+              style={{ 
+                paddingVertical: 10, 
+                paddingHorizontal: 16,
+                backgroundColor: '#6C63FF',
+                borderRadius: 6,
+              }}
+            >
+              <Text style={{ fontSize: 16, color: '#fff', fontWeight: '600' }}>저장</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
   </SafeAreaView>
   );
 }

@@ -117,7 +117,7 @@ const FONT_PRESETS = [
 
 export default function ReaderScreen() {
   const router = useRouter();
-  const { fileId, uri, name, resetProgress } = useLocalSearchParams();
+  const { fileId, uri, name, type, resetProgress } = useLocalSearchParams();
   const insets = useSafeAreaInsets();
 
   const [isEpub, setIsEpub] = useState(false);
@@ -143,12 +143,15 @@ export default function ReaderScreen() {
   const viewHeightRef = useRef(1);
   const hasResumedRef = useRef(false); // TXT 이어읽기 한 번만 실행
   const contentRef = useRef<string[]>([]); // 현재 렌더링 중인 문단 배열 (저장 시 preview 생성용)
+  const rawTextRef = useRef<string>(""); // 전체 원문 (progress 비율로 preview 추출용)
+  const currentReadingPreviewRef = useRef<string>(""); // 현재 화면에 보이는 텍스트
 
   // epub 전용 base64 데이터
   const [epubBase64, setEpubBase64] = useState("");
   const webViewRef = useRef<WebView>(null);
   const [lastCfi, setLastCfi] = useState<string | null>(null);     // 마지막 위치
   const [initialCfi, setInitialCfi] = useState<string | null>(null); // 서버에서 받은 CFI
+  const [fileInfoLoaded, setFileInfoLoaded] = useState(false); // 서버 파일 정보 로딩 완료 여부
   const [epubReady, setEpubReady] = useState(false);               // WebView 준비 여부
   const [epubError, setEpubError] = useState<string | null>(null); // EPUB 로딩 에러
 
@@ -170,9 +173,6 @@ export default function ReaderScreen() {
     AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   }, [settings]);
 
-  // EPUB 시작 여부 추적 (display 시작 전에 theme 메시지 보내지 않기 위해)
-  const epubStartedRef = useRef(false);
-
   // 읽는 중 설정 변경 → "theme" 메시지 전송 (display 이후에만)
   useEffect(() => {
     if (!isEpub || !epubReady || !epubStartedRef.current || !webViewRef.current) return;
@@ -190,7 +190,14 @@ export default function ReaderScreen() {
 
   useEffect(() => {
     const fileName = String(name || "");
-    const isEpubFile = fileName.toLowerCase().endsWith(".epub");
+    const fileUri = decodeURI(String(uri || ""));
+    const uriFileName = fileUri.split('/').pop() || '';
+    const fileType = String(type || "").toUpperCase();
+    let isEpubFile =
+      fileType === 'EPUB' ||
+      fileName.toLowerCase().endsWith(".epub") ||
+      uriFileName.toLowerCase().endsWith('.epub');
+    
     setIsEpub(isEpubFile);
 
     const read = async () => {
@@ -216,27 +223,32 @@ export default function ReaderScreen() {
 
         if (isEpubFile) {
           // EPUB → base64로 읽기
-          const b64 = await readWithFallback(decoded, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
-          console.log("✅ EPUB base64 로드 완료, 길이:", b64.length);
-          
-          if (!b64 || b64.length === 0) {
-            console.error("❌ EPUB base64가 비어있습니다");
-            setEpubError("파일을 읽을 수 없습니다");
-            return;
+          try {
+            const b64 = await readWithFallback(decoded, {
+              encoding: FileSystem.EncodingType.Base64,
+            });
+            console.log("✅ EPUB base64 로드 완료, 길이:", b64.length);
+            
+            if (!b64 || b64.length === 0) {
+              console.error("❌ base64가 비어있습니다");
+              setEpubError("파일을 읽을 수 없습니다");
+              return;
+            }
+            setEpubBase64(b64);
+          } catch (epubError) {
+            console.log('❌ EPUB 읽기 실패:', epubError);
+            setEpubError("EPUB 파일을 읽을 수 없습니다");
           }
-          
-          setEpubBase64(b64);
         } else {
+          // TXT 파일
           console.log("text 파일 읽기");
           setTxtLoading(true);
-          // TXT → base64로 읽고 자동 인코딩 감지
           const base64 = await readWithFallback(decoded, {
             encoding: FileSystem.EncodingType.Base64,
           });
           const buffer = Buffer.from(base64, 'base64');
           const text = decodeTextSafe(buffer);
+          rawTextRef.current = text; // progress 비율로 preview 추출용
           // 빈 줄 기준 문단 분리 → FlatList 가상화로 빠른 렌더링
           const paragraphs = text
             .split(/\n{2,}/)
@@ -285,12 +297,17 @@ export default function ReaderScreen() {
         console.log("⚠️ 저장된 progress 없음");
       }
 
-      // ⭐ EPUB 이어 읽기: 저장된 CFI 있으면 기억
-      if (fileInfo.epubCfi) {
+      // ⭐ EPUB 이어 읽기: 저장된 CFI 있으면 기억 (문자열인지 반드시 확인)
+      if (fileInfo.epubCfi && typeof fileInfo.epubCfi === 'string') {
         setInitialCfi(fileInfo.epubCfi);
+        console.log("✅ CFI 로드:", fileInfo.epubCfi);
+      } else if (fileInfo.epubCfi) {
+        console.log("⚠️ CFI가 문자열이 아님, 무시:", typeof fileInfo.epubCfi);
       }
+      setFileInfoLoaded(true); // 서버 응답 완료
     } catch (e) {
       console.log("진행도 불러오기 실패:", e);
+      setFileInfoLoaded(true); // 실패해도 EPUB 시작은 해야 함
     }
   };
 
@@ -330,6 +347,19 @@ useEffect(() => {
       offset: scrollY,
       animated: false,
     });
+    // scrollToOffset 후 onScroll이 발사 안 될 수 있으므로 preview 강제 갱신
+    // rawText에서 progress 비율 위치의 텍스트 직접 추출
+    const raw = rawTextRef.current;
+    if (raw.length > 0) {
+      const pos = Math.floor(savedProgress * raw.length);
+      const start = Math.max(0, pos - 50);
+      const end = Math.min(raw.length, pos + 200);
+      const snippet = raw.slice(start, end).replace(/\s+/g, ' ').trim();
+      if (snippet) {
+        currentReadingPreviewRef.current = snippet;
+        console.log("📖 이어읽기 preview 갱신:", snippet.slice(0, 50));
+      }
+    }
   }, 600);
 }, [contentHeight, viewHeight, isEpub, resetProgress, initialProgress]);
 
@@ -356,9 +386,14 @@ useEffect(() => {
     }
   }, [showUI]);
 
-  // EPUB ready → 테마 + display 한번에 시작 (테마가 display 전에 적용되어야 챕터 이동 정상 동작)
+  // EPUB ready + 서버 파일 정보 모두 준비된 후 한 번만 themeAndStart 발사
+  const epubStartedRef = useRef(false);
   useEffect(() => {
-    if (!isEpub || !epubReady || !webViewRef.current) return;
+    if (!isEpub || !epubReady || !fileInfoLoaded || !webViewRef.current) return;
+    if (epubStartedRef.current) return; // 이미 발사했으면 스킵
+    epubStartedRef.current = true;
+    const cfiToUse = resetProgress === "true" ? null : (initialCfi || null);
+    console.log("📤 themeAndStart 전송 - CFI:", cfiToUse, "/ initialCfi:", initialCfi, "/ resetProgress:", resetProgress);
     webViewRef.current.postMessage(JSON.stringify({
       type: "themeAndStart",
       bgColor: settings.bgColor,
@@ -369,14 +404,15 @@ useEffect(() => {
       sidePadding: settings.sidePadding,
       cfi: resetProgress === "true" ? null : (initialCfi || null),
     }));
-    epubStartedRef.current = true;
-  }, [isEpub, epubReady, initialCfi]);
+  }, [isEpub, epubReady, fileInfoLoaded]);
 
 
   // ===================== TXT 쪽 진행도 계산 =====================
   const handleScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
     const offsetY = e.nativeEvent.contentOffset.y;
     const maxScroll = Math.max(contentHeight - viewHeight, 1);
+    // offsetY=0이고 아직 이어읽기 복원 전이면 preview 갱신 스킵 (초기 렌더 onScroll 방지)
+    const skipPreview = offsetY < 5 && !hasResumedRef.current;
 
     const ratio = offsetY / maxScroll;
     const clamped = Math.min(1, Math.max(0, ratio));
@@ -386,6 +422,18 @@ useEffect(() => {
     const pages = Math.max(1, Math.round(contentHeight / viewHeight));
     setTotalPages(pages);
     setCurrentPage(Math.max(1, Math.round(clamped * pages)));
+
+    // readingPreview: rawText에서 progress 비율 위치의 텍스트 직접 추출
+    if (!skipPreview) {
+      const raw = rawTextRef.current;
+      if (raw.length > 0) {
+        const pos = Math.floor(clamped * raw.length);
+        const start = Math.max(0, pos - 50);
+        const end = Math.min(raw.length, pos + 200);
+        const snippet = raw.slice(start, end).replace(/\s+/g, ' ').trim();
+        if (snippet) currentReadingPreviewRef.current = snippet;
+      }
+    }
   };
 
   // txt 슬라이더로 위치 이동
@@ -423,13 +471,16 @@ useEffect(() => {
         // WebView 내부 console.log 출력
         console.log("📱 WebView:", data.message);
       } else if (data.type === "progress") {
-        const { current, total, percent, cfi } = data;
+        const { current, total, percent, cfi, visibleText } = data;
         setCurrentPage(current || 1);
         setTotalPages(total || 1);
         setProgress((percent || 0) / 100);
 
         if (cfi) {
-          setLastCfi(cfi);     // 마지막 CFI 기억
+          setLastCfi(cfi);
+        }
+        if (visibleText) {
+          currentReadingPreviewRef.current = visibleText;
         }
       } else if (data.type === "ready") {
         // EPUB 쪽 준비 완료
@@ -679,18 +730,81 @@ useEffect(() => {
             var locationsReady = false;
             var totalLocations = 1;
 
+            // 화면 중앙 텍스트를 스크롤할 때마다 로컬에 저장 (API 호출 없음)
+            var lastVisibleText = "";
+            function updateCenterText() {
+              try {
+                var outerViewH = window.innerHeight;
+                var centerY = outerViewH * 0.5;
+                var iframes = document.querySelectorAll('iframe');
+                var allNodes = [];
+                for (var fi = 0; fi < iframes.length; fi++) {
+                  var iframe = iframes[fi];
+                  var iframeTop = iframe.getBoundingClientRect().top;
+                  try {
+                    var iDoc = iframe.contentDocument || iframe.contentWindow.document;
+                    if (!iDoc || !iDoc.body) continue;
+                    var walker = iDoc.createTreeWalker(iDoc.body, NodeFilter.SHOW_TEXT, null, false);
+                    while (walker.nextNode()) {
+                      var node = walker.currentNode;
+                      var text = (node.textContent || "").trim();
+                      if (!text) continue;
+                      var parent = node.parentElement;
+                      if (!parent) continue;
+                      var rect = parent.getBoundingClientRect();
+                      var top = iframeTop + rect.top;
+                      var bottom = iframeTop + rect.bottom;
+                      if (bottom > 0 && top < outerViewH) {
+                        allNodes.push({ top: top, bottom: bottom, text: text });
+                      }
+                    }
+                  } catch(ie) {}
+                }
+                if (allNodes.length === 0) return;
+                // 화면 중앙에 가장 가까운 노드
+                var centerIdx = 0, minDist = Infinity;
+                for (var ni = 0; ni < allNodes.length; ni++) {
+                  var mid = (allNodes[ni].top + allNodes[ni].bottom) / 2;
+                  var dist = Math.abs(mid - centerY);
+                  if (dist < minDist) { minDist = dist; centerIdx = ni; }
+                }
+                // 중앙 노드 기준 앞뒤 2개씩 수집
+                var s = Math.max(0, centerIdx - 2);
+                var e = Math.min(allNodes.length - 1, centerIdx + 2);
+                var texts = [];
+                for (var ti = s; ti <= e; ti++) texts.push(allNodes[ti].text);
+                var result = texts.join(" ").replace(/\s+/g, " ").trim().slice(0, 200);
+                if (result) lastVisibleText = result;
+              } catch(ex) {}
+            }
+
+            // 스크롤할 때마다 중앙 텍스트 갱신 (debounce 200ms, API 호출 없음)
+            var centerTextTimer = null;
+            function onContainerScroll() {
+              clearTimeout(centerTextTimer);
+              centerTextTimer = setTimeout(updateCenterText, 200);
+            }
+
             function safeReport(location) {
               try {
                 var startCfi = location.start.cfi || location.start;
+                if (typeof startCfi !== 'string') {
+                  sendLog("❌ CFI가 문자열이 아님: " + typeof startCfi);
+                  return;
+                }
                 var current = book.locations.locationFromCfi(startCfi);
                 var percent = book.locations.percentageFromCfi(startCfi) * 100;
+
+                // 즉시 최신 중앙 텍스트로 갱신 후 사용
+                updateCenterText();
 
                 window.ReactNativeWebView.postMessage(JSON.stringify({
                   type: "progress",
                   current: current,
                   total: totalLocations,
                   percent: percent,
-                  cfi: startCfi
+                  cfi: startCfi,
+                  visibleText: lastVisibleText
                 }));
               } catch(e) {
                 sendLog("❌ safeReport error: " + e.message);
@@ -720,18 +834,42 @@ useEffect(() => {
               showError("EPUB 파일을 로드할 수 없습니다: " + err.message);
             });
 
-            // 페이지 이동될 때마다 진행도 전송 (scrolled 모드에서는 자동 스크롤됨)
+            // 페이지 이동될 때마다 진행도 전송
             rendition.on("relocated", function(location) {
               if (!locationsReady) return;
               safeReport(location);
             });
 
-            // 렌더링 완료 이벤트
+            // rendered 이벤트: container scroll 리스너 등록 + prepend 보정
+            var lastScrollHeight = 0;
+            var containerScrollBound = false;
             rendition.on("rendered", function(section) {
               loadingEl.style.display = 'none';
-              sendLog("✅ EPUB 렌더링 완료 - section: " + section.href);
+              try {
+                var container = rendition.manager && rendition.manager.container;
+                if (container) {
+                  // container scroll 리스너 최초 1회 등록 (중앙 텍스트 갱신용)
+                  if (!containerScrollBound) {
+                    container.addEventListener('scroll', onContainerScroll, { passive: true });
+                    containerScrollBound = true;
+                  }
+
+                  var prevHeight = lastScrollHeight;
+                  var prevScrollTop = container.scrollTop;
+                  requestAnimationFrame(function() {
+                    requestAnimationFrame(function() {
+                      var newHeight = container.scrollHeight;
+                      lastScrollHeight = newHeight;
+                      var diff = newHeight - prevHeight;
+                      if (prevHeight > 0 && diff > 0 && prevScrollTop > 10) {
+                        container.scrollTop = prevScrollTop + diff;
+                      }
+                    });
+                  });
+                }
+              } catch(e) {}
             });
-            
+
             // 렌더링 시작 이벤트
             rendition.on("started", function() {
               sendLog("🔵 EPUB 렌더링 시작됨");
@@ -748,7 +886,13 @@ useEffect(() => {
             window.addEventListener("message", function(e) {
               try {
                 var data = JSON.parse(e.data);
-                if (data.type === "seek" && locationsReady) {
+                // 저장 직전 최신 CFI 요청
+                if (data.type === "getCurrentLocation" && locationsReady) {
+                  try {
+                    var loc = rendition.currentLocation();
+                    if (loc) safeReport(loc);
+                  } catch(e) {}
+                } else if (data.type === "seek" && locationsReady) {
                   var p = data.percent;
                   if (typeof p !== "number") return;
 
@@ -777,9 +921,15 @@ useEffect(() => {
                   };
                   document.documentElement.style.background = currentTheme.bgColor;
                   document.body.style.background = currentTheme.bgColor;
-                  sendLog("📖 themeAndStart: " + (data.cfi ? 'CFI=' + data.cfi : '처음부터'));
+                  sendLog("📖 themeAndStart 수신 - CFI=" + (data.cfi || '없음(처음부터)'));
                   if (data.cfi) {
-                    rendition.display(data.cfi).catch(function(err) {
+                    sendLog("➡️ display(cfi) 호출: " + data.cfi);
+                    rendition.display(data.cfi).then(function() {
+                      sendLog("✅ display(cfi) 완료: " + data.cfi);
+                      // epub.js scrolled 모드: display()가 내부적으로 scrollTop을 설정함
+                      // 우리가 추가로 scrollTop을 건드리면 epub.js 계산과 충돌하므로 건드리지 않음
+                      // 단, 인접 섹션 로드 후 prepend로 인한 밀림은 rendered 이벤트에서 보정
+                    }).catch(function(err) {
                       sendLog("❌ display(cfi) 실패, 처음부터: " + err.message);
                       rendition.display();
                     });
@@ -812,6 +962,17 @@ useEffect(() => {
             // document.addEventListener도 추가 (일부 플랫폼 호환성)
             document.addEventListener("message", function(e) {
               window.dispatchEvent(new MessageEvent('message', { data: e.data }));
+            });
+
+            // 뒤로가기 시 현재 CFI + 중앙 텍스트 즉시 전송
+            document.addEventListener('visibilitychange', function() {
+              if (document.hidden && locationsReady) {
+                try {
+                  updateCenterText(); // 숨겨지기 직전 마지막으로 갱신
+                  var loc = rendition.currentLocation();
+                  if (loc) safeReport(loc);
+                } catch(e) {}
+              }
             });
 
           } catch(err) {
@@ -847,6 +1008,10 @@ useEffect(() => {
     const currentProgress = progressRef.current;
     
     // 0으로 덮어쓰기 방지
+    if (currentProgress === 0 && initialProgressRef.current === 0) {
+      console.log("progress와 initialProgress 모두 0. 초기화 전 저장 거부.");
+      return;
+    }
     if (currentProgress === 0 && initialProgressRef.current > 0) {
       console.log("progress가 0으로 초기화됨. 저장 안 함.");
       return;
@@ -862,11 +1027,9 @@ useEffect(() => {
       recordReadLog: forceLog || currentProgress > 0
     };
 
-    // TXT: 현재 스크롤 위치의 문단을 readingPreview로 저장
-    if (!isEpub && contentRef.current.length > 0) {
-      const paragraphs = contentRef.current;
-      const paraIndex = Math.max(0, Math.floor(currentProgress * paragraphs.length) - 1);
-      body.readingPreview = paragraphs.slice(paraIndex, paraIndex + 3).join('\n').slice(0, 200);
+    // 현재 화면에 보이는 텍스트를 readingPreview로 저장
+    if (currentReadingPreviewRef.current) {
+      body.readingPreview = currentReadingPreviewRef.current;
     }
 
     if (isEpub && lastCfiRef.current) {
@@ -891,26 +1054,46 @@ useEffect(() => {
     }
   };
 
+  // 함수를 ref로 감싸서 unmount/AppState에서 항상 최신 버전 호출 보장
+  const saveProgressRef = useRef(saveProgressToServer);
+  useEffect(() => {
+    saveProgressRef.current = saveProgressToServer;
+  });
+
   // unmount 시 저장 (백업)
   useEffect(() => {
     return () => {
       if (saveTimerRef.current) {
         clearTimeout(saveTimerRef.current);
       }
-      // unmount 시에는 로그 기록
-      saveProgressToServer(true);
+      // 홈 화면에서 즉시 refetch하도록 플래그 저장
+      AsyncStorage.setItem('reader_exited', '1').catch(() => {});
+      if (isEpub && webViewRef.current) {
+        webViewRef.current.postMessage(JSON.stringify({ type: 'getCurrentLocation' }));
+        // WebView 메시지 처리 후 저장되도록 짧은 딜레이
+        setTimeout(() => saveProgressRef.current(true), 300);
+      } else {
+        saveProgressRef.current(true);
+      }
     };
-  }, [fileId, isEpub, BASE_URL]);
+  }, [isEpub]);
 
   // 앱이 백그라운드로 전환될 때 저장 (강제종료 대비)
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (nextState) => {
       if (nextState === 'background' || nextState === 'inactive') {
-        saveProgressToServer(true);
+        if (isEpub && webViewRef.current) {
+          webViewRef.current.postMessage(JSON.stringify({ type: 'getCurrentLocation' }));
+          setTimeout(() => saveProgressRef.current(true), 300);
+        } else {
+          saveProgressRef.current(true);
+        }
       }
     });
     return () => subscription.remove();
-  }, [fileId, isEpub, BASE_URL]);
+  }, [isEpub]);
+
+
 
   return (
     <View style={styles.root}>
