@@ -2,13 +2,13 @@ import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useState } from "react";
 import {
-  Alert,
-  Modal,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View
+    Alert,
+    Modal,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View
 } from "react-native";
 import { useUser } from "../contexts/UserContext";
 import { BASE_URL } from "../utils/api";
@@ -71,6 +71,8 @@ export default function LoginModal({ visible, onClose, onLoginSuccess }: LoginMo
       if (refreshToken) {
         await AsyncStorage.setItem('refreshToken', refreshToken);
         console.log('✅ refreshToken 저장');
+      } else {
+        console.log('⚠️ 로그인 응답에 refreshToken 없음 (자동 재발급 불가 가능성)');
       }
       
       onLoginSuccess(data.userId, data.username, accessToken);

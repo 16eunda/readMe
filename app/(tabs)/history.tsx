@@ -14,11 +14,13 @@ import {
 } from 'react-native';
 import HistoryCard from '../../components/HistoryCard';
 import { API_BASE_URL } from '../../constants/config';
+import { useUser } from '../../contexts/UserContext';
 import { HistoryFile, SortOrder } from '../../types/file';
 
 const HistoryCardMemo = React.memo(HistoryCard);
 
 export default function HistoryScreen() {
+  const { isLoading: isUserLoading } = useUser();
   const [rawFiles, setRawFiles] = useState<HistoryFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -37,6 +39,7 @@ export default function HistoryScreen() {
   }, [rawFiles, sortOrder]);
   
   const fetchRecentFiles = useCallback(async () => {
+    if (isUserLoading) return;
 
     try {
       const token = await AsyncStorage.getItem("accessToken");
@@ -66,7 +69,7 @@ export default function HistoryScreen() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [isUserLoading]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);

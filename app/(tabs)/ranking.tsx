@@ -22,7 +22,7 @@ import { useUser } from '../../contexts/UserContext';
 const ITEMS_PER_PAGE = 10;
 
 export default function RankingScreen() {
-  const { isPremium } = useUser();
+  const { isPremium, isLoading: isUserLoading } = useUser();
   const [period, setPeriod] = useState<"한달" | "올해">("한달");
   const [rankings, setRankings] = useState<FileRankingDto[]>([]);
   const [displayedItems, setDisplayedItems] = useState(ITEMS_PER_PAGE);
@@ -48,6 +48,7 @@ export default function RankingScreen() {
 
 
   const fetchRankings = async (showLoading = true) => {
+    if (isUserLoading) return;
     if (showLoading) setLoading(true);
     setError(null);
     try {
@@ -83,13 +84,13 @@ export default function RankingScreen() {
       }
       console.log('🎯 랜킹 페이지: 화면 포커스됨, period:', period);
       fetchRankings();
-    }, [period, isPremium])
+    }, [period, isPremium, isUserLoading])
   );
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
     fetchRankings(false);
-  }, [period]);
+  }, [period, isUserLoading]);
 
   const handleScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
     const { layoutMeasurement, contentOffset, contentSize } = event.nativeEvent;

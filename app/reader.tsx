@@ -145,15 +145,20 @@ export default function ReaderScreen() {
   const contentRef = useRef<string[]>([]); // 현재 렌더링 중인 문단 배열 (저장 시 preview 생성용)
   const rawTextRef = useRef<string>(""); // 전체 원문 (progress 비율로 preview 추출용)
   const currentReadingPreviewRef = useRef<string>(""); // 현재 화면에 보이는 텍스트
+  const lastProgressUpdateAtRef = useRef<number>(0); // 마지막 progress 메시지 수신 시간 (최신 preview 타이밍 추적용)
 
   // epub 전용 base64 데이터
   const [epubBase64, setEpubBase64] = useState("");
   const webViewRef = useRef<WebView>(null);
   const [lastCfi, setLastCfi] = useState<string | null>(null);     // 마지막 위치
+  const lastAnchorRatioRef = useRef<number>(0.5); // 저장 당시 CFI의 화면 내 위치 비율 (re-render 불필요)
   const [initialCfi, setInitialCfi] = useState<string | null>(null); // 서버에서 받은 CFI
   const [fileInfoLoaded, setFileInfoLoaded] = useState(false); // 서버 파일 정보 로딩 완료 여부
   const [epubReady, setEpubReady] = useState(false);               // WebView 준비 여부
+  const [epubRestoring, setEpubRestoring] = useState(false);       // CFI 복원 스크롤 계산 중 (로딩 오버레이)
   const [epubError, setEpubError] = useState<string | null>(null); // EPUB 로딩 에러
+  const lastWebPercentRef = useRef<number | null>(null);
+  const lastWebLogAtRef = useRef<number>(0);
 
   // ===== 리더 설정 =====
   const [settings, setSettings] = useState<ReaderSettings>(DEFAULT_SETTINGS);
@@ -300,9 +305,17 @@ export default function ReaderScreen() {
       // ⭐ EPUB 이어 읽기: 저장된 CFI 있으면 기억 (문자열인지 반드시 확인)
       if (fileInfo.epubCfi && typeof fileInfo.epubCfi === 'string') {
         setInitialCfi(fileInfo.epubCfi);
-        console.log("✅ CFI 로드:", fileInfo.epubCfi);
+        console.log("✅ [복원] 서버 CFI 로드:", fileInfo.epubCfi.slice(0, 80), "| progress:", fileInfo.progress);
       } else if (fileInfo.epubCfi) {
         console.log("⚠️ CFI가 문자열이 아님, 무시:", typeof fileInfo.epubCfi);
+      } else {
+        console.log("⚠️ [복원] 서버에 저장된 CFI 없음 - 처음부터 시작");
+      }
+
+      // ⭐ anchorRatio 복원: 저장 당시 CFI의 화면 내 위치 비율
+      if (typeof fileInfo.anchorRatio === 'number' && fileInfo.anchorRatio > 0) {
+        lastAnchorRatioRef.current = fileInfo.anchorRatio;
+        console.log("✅ [복원] 서버 anchorRatio 로드:", fileInfo.anchorRatio);
       }
       setFileInfoLoaded(true); // 서버 응답 완료
     } catch (e) {
@@ -388,12 +401,27 @@ useEffect(() => {
 
   // EPUB ready + 서버 파일 정보 모두 준비된 후 한 번만 themeAndStart 발사
   const epubStartedRef = useRef(false);
+  const epubStartedCfiRef = useRef<string | null>(null);
+  useEffect(() => {
+    epubStartedRef.current = false;
+    epubStartedCfiRef.current = null;
+  }, [uri]);
+
   useEffect(() => {
     if (!isEpub || !epubReady || !fileInfoLoaded || !webViewRef.current) return;
-    if (epubStartedRef.current) return; // 이미 발사했으면 스킵
-    epubStartedRef.current = true;
     const cfiToUse = resetProgress === "true" ? null : (initialCfi || null);
-    console.log("📤 themeAndStart 전송 - CFI:", cfiToUse, "/ initialCfi:", initialCfi, "/ resetProgress:", resetProgress);
+
+    // 이미 시작했고 같은 CFI로 시작했다면 스킵
+    if (epubStartedRef.current && epubStartedCfiRef.current === cfiToUse) return;
+
+    // 이미 CFI로 시작한 상태면 재전송 불필요
+    if (epubStartedRef.current && epubStartedCfiRef.current && cfiToUse) return;
+
+    epubStartedRef.current = true;
+    epubStartedCfiRef.current = cfiToUse;
+    // CFI가 있으면 복원 중 오버레이 표시
+    if (cfiToUse) setEpubRestoring(true);
+    console.log("📤 themeAndStart 전송 - CFI:", cfiToUse, "/ initialCfi:", initialCfi, "/ resetProgress:", resetProgress, "/ anchorRatio:", lastAnchorRatioRef.current);
     webViewRef.current.postMessage(JSON.stringify({
       type: "themeAndStart",
       bgColor: settings.bgColor,
@@ -403,8 +431,9 @@ useEffect(() => {
       lineSpacing: settings.lineSpacing,
       sidePadding: settings.sidePadding,
       cfi: resetProgress === "true" ? null : (initialCfi || null),
+      anchorRatio: resetProgress === "true" ? 0.5 : (lastAnchorRatioRef.current || 0.5),
     }));
-  }, [isEpub, epubReady, fileInfoLoaded]);
+  }, [isEpub, epubReady, fileInfoLoaded, initialCfi, resetProgress]);
 
 
   // ===================== TXT 쪽 진행도 계산 =====================
@@ -471,17 +500,41 @@ useEffect(() => {
         // WebView 내부 console.log 출력
         console.log("📱 WebView:", data.message);
       } else if (data.type === "progress") {
-        const { current, total, percent, cfi, visibleText } = data;
+        const { current, total, percent, cfi, anchorRatio, visibleText } = data;
+        const nextPercent = (percent || 0);
+        const prevPercent = lastWebPercentRef.current;
+        if (prevPercent != null) {
+          const diff = nextPercent - prevPercent;
+          const now = Date.now();
+          if (Math.abs(diff) > 1.2 && now - lastWebLogAtRef.current > 120) {
+            lastWebLogAtRef.current = now;
+            console.log("🧭RN jump", {
+              from: prevPercent.toFixed(2),
+              to: nextPercent.toFixed(2),
+              diff: diff.toFixed(2),
+              cfi,
+            });
+          }
+        }
+        lastWebPercentRef.current = nextPercent;
+
         setCurrentPage(current || 1);
         setTotalPages(total || 1);
-        setProgress((percent || 0) / 100);
+        setProgress(nextPercent / 100);
 
         if (cfi) {
+          console.log("💾 [RN] CFI 저장:", cfi.slice(0, 80), "| pct:", nextPercent.toFixed(1), "| anchor:", anchorRatio);
           setLastCfi(cfi);
+          if (typeof anchorRatio === 'number') lastAnchorRatioRef.current = anchorRatio;
         }
         if (visibleText) {
           currentReadingPreviewRef.current = visibleText;
+          lastProgressUpdateAtRef.current = Date.now(); // 최신 preview 도착 시간 기록
         }
+      } else if (data.type === "restored") {
+        // 복원 스크롤 완료 → 로딩 오버레이 제거
+        console.log("✅ EPUB 복원 완료 - 오버레이 제거");
+        setEpubRestoring(false);
       } else if (data.type === "ready") {
         // EPUB 쪽 준비 완료
         console.log("✅ EPUB 준비 완료");
@@ -563,6 +616,86 @@ useEffect(() => {
           font-size: 14px;
           padding: 20px;
         }
+        #chapter-indicator {
+          position: fixed;
+          left: 50%;
+          bottom: 24px;
+          transform: translateX(-50%);
+          background: rgba(0,0,0,0.62);
+          color: #fff;
+          font-size: 13px;
+          padding: 8px 12px;
+          border-radius: 999px;
+          z-index: 9999;
+          opacity: 0;
+          transition: opacity 140ms ease;
+          pointer-events: none;
+          max-width: 88vw;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        #chapter-indicator.show {
+          opacity: 1;
+        }
+        /* Pull-to-chapter indicators */
+        .pull-indicator {
+          position: fixed;
+          left: 0; right: 0;
+          z-index: 9998;
+          pointer-events: none;
+          overflow: hidden;
+          transition: height 60ms linear;
+          height: 0;
+        }
+        #pull-indicator-top {
+          top: 0;
+          background: linear-gradient(to bottom, rgba(80,120,200,0.18) 0%, transparent 100%);
+        }
+        #pull-indicator-bottom {
+          bottom: 0;
+          background: linear-gradient(to top, rgba(80,120,200,0.18) 0%, transparent 100%);
+        }
+        .pull-indicator-inner {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: flex-end;
+          padding-bottom: 8px;
+          height: 100%;
+          gap: 4px;
+        }
+        #pull-indicator-bottom .pull-indicator-inner {
+          justify-content: flex-start;
+          padding-bottom: 0;
+          padding-top: 8px;
+        }
+        .pull-indicator-arrow {
+          font-size: 18px;
+          line-height: 1;
+          color: rgba(60,100,200,0.85);
+          transition: transform 100ms ease;
+        }
+        .pull-indicator-label {
+          font-size: 12px;
+          color: rgba(40,80,180,0.9);
+          font-weight: 600;
+          letter-spacing: 0.3px;
+        }
+        .pull-indicator-bar-wrap {
+          width: 80px;
+          height: 3px;
+          border-radius: 2px;
+          background: rgba(60,100,200,0.15);
+          overflow: hidden;
+        }
+        .pull-indicator-bar {
+          height: 100%;
+          border-radius: 2px;
+          background: rgba(60,100,200,0.7);
+          width: 0%;
+          transition: width 60ms linear;
+        }
         .spinner {
           border: 3px solid #f3f3f3;
           border-top: 3px solid #b84a8c;
@@ -585,6 +718,21 @@ useEffect(() => {
       </div>
       <div id="error"></div>
       <div id="viewer"></div>
+      <div id="chapter-indicator">챕터 이동 중...</div>
+      <div id="pull-indicator-top" class="pull-indicator">
+        <div class="pull-indicator-inner">
+          <div class="pull-indicator-arrow" id="pull-arrow-top">↑</div>
+          <div class="pull-indicator-label" id="pull-label-top">이전 챕터로</div>
+          <div class="pull-indicator-bar-wrap"><div class="pull-indicator-bar" id="pull-bar-top"></div></div>
+        </div>
+      </div>
+      <div id="pull-indicator-bottom" class="pull-indicator">
+        <div class="pull-indicator-inner">
+          <div class="pull-indicator-bar-wrap"><div class="pull-indicator-bar" id="pull-bar-bottom"></div></div>
+          <div class="pull-indicator-label" id="pull-label-bottom">다음 챕터로</div>
+          <div class="pull-indicator-arrow" id="pull-arrow-bottom">↓</div>
+        </div>
+      </div>
       <!-- 좌우 클릭 영역 -->
       <div class="nav-area nav-left" id="nav-left"></div>
       <div class="nav-area nav-right" id="nav-right"></div>
@@ -605,6 +753,22 @@ useEffect(() => {
           var loadingEl = document.getElementById('loading');
           var errorEl = document.getElementById('error');
           var viewerEl = document.getElementById('viewer');
+          var chapterIndicatorEl = document.getElementById('chapter-indicator');
+
+          function showChapterIndicator(text) {
+            try {
+              if (!chapterIndicatorEl) return;
+              chapterIndicatorEl.textContent = text || '챕터 이동 중...';
+              chapterIndicatorEl.classList.add('show');
+            } catch(e) {}
+          }
+
+          function hideChapterIndicator() {
+            try {
+              if (!chapterIndicatorEl) return;
+              chapterIndicatorEl.classList.remove('show');
+            } catch(e) {}
+          }
 
           function showError(msg) {
             loadingEl.style.display = 'none';
@@ -649,8 +813,10 @@ useEffect(() => {
             // ArrayBuffer로 EPUB 초기화
             var book = ePub(bytes.buffer);
             var rendition = book.renderTo("viewer", { 
-              flow: "scrolled",
-              manager: "continuous",
+              // 안정 우선 모드: continuous에서 발생하는 상향 스크롤 점프를 방지
+              // (챕터 단위 렌더링으로 위치 계산 일관성 확보)
+              flow: "scrolled-doc",
+              manager: "default",
               method: "default",
               width: "100%",
               height: "100%",
@@ -702,12 +868,139 @@ useEffect(() => {
               try {
                 var doc = contents.document;
                 if (!doc) return;
+
+                // outer window의 sendLog를 참조 (iframe 안에서 직접 호출 가능)
+                var log = function(msg) { try { window.parent.sendLog(msg); } catch(_) {} };
+
+                // ── 탭(toggleUI) 감지 ──
                 var tapStartX = 0, tapStartY = 0, tapStartTime = 0;
+
+                // ── Pull-to-chapter 상태 ──
+                var pullDir = null;
+                var pullStartY = 0;
+                var pullDist = 0;
+                var pullTriggered = false;
+                var PULL_TH = 200; // px ← 이 값을 크게 할수록 더 많이 당겨야 챕터 전환됨
+
+                // 실제로 스크롤되는 엘리먼트를 찾는 함수
+                // scrolled-doc 모드에서는 iframe 내부 body/html이 스크롤되지 않고
+                // outer container가 스크롤될 수도 있으니 양쪽 모두 확인
+                function findScrollInfo() {
+                  var result = { scrollTop: 0, clientH: 0, scrollH: 0, src: 'none' };
+                  try {
+                    // 1순위: outer rendition manager container
+                    var c = window.parent.rendition && window.parent.rendition.manager && window.parent.rendition.manager.container;
+                    if (c && c.scrollHeight > c.clientHeight + 2) {
+                      result = { scrollTop: c.scrollTop, clientH: c.clientHeight, scrollH: c.scrollHeight, src: 'outer-container' };
+                      return result;
+                    }
+                    // 2순위: iframe 내부 scrollingElement
+                    var se = doc.scrollingElement || doc.documentElement;
+                    if (se && se.scrollHeight > se.clientHeight + 2) {
+                      result = { scrollTop: se.scrollTop, clientH: se.clientHeight, scrollH: se.scrollHeight, src: 'inner-scrollingEl' };
+                      return result;
+                    }
+                    // 3순위: iframe 내부 body
+                    if (doc.body && doc.body.scrollHeight > doc.body.clientHeight + 2) {
+                      result = { scrollTop: doc.body.scrollTop, clientH: doc.body.clientHeight, scrollH: doc.body.scrollHeight, src: 'inner-body' };
+                      return result;
+                    }
+                    // 4순위: outer window 자체
+                    if (window.parent.document && window.parent.document.scrollingElement) {
+                      var pe = window.parent.document.scrollingElement;
+                      if (pe.scrollHeight > pe.clientHeight + 2) {
+                        result = { scrollTop: pe.scrollTop, clientH: pe.clientHeight, scrollH: pe.scrollHeight, src: 'outer-scrollingEl' };
+                        return result;
+                      }
+                    }
+                    // 5순위: 정보가 없어도 outer container 값 그대로 사용
+                    if (c) {
+                      result = { scrollTop: c.scrollTop, clientH: c.clientHeight, scrollH: c.scrollHeight, src: 'outer-container-fallback' };
+                    }
+                  } catch(e) {}
+                  return result;
+                }
+
                 doc.addEventListener("touchstart", function(e) {
                   tapStartX = e.touches[0].clientX;
                   tapStartY = e.touches[0].clientY;
                   tapStartTime = Date.now();
+                  pullDir = null;
+                  pullDist = 0;
+                  pullTriggered = false;
+                  pullStartY = e.touches[0].clientY;
+                  try { window.parent.hidePullIndicator(); } catch(_) {}
+
+                  // touchstart 시 스크롤 상태 진단 로그
+                  var si = findScrollInfo();
+                  log('🔍TOUCH_START src=' + si.src + ' scrollTop=' + Math.round(si.scrollTop) + ' scrollH=' + Math.round(si.scrollH) + ' clientH=' + Math.round(si.clientH));
                 }, { passive: true });
+
+                doc.addEventListener("touchmove", function(e) {
+                  if (pullTriggered) return;
+                  try {
+                    if (window.parent.isAutoTransition || window.parent.isSeeking || window.parent.isChapterLoading) return;
+                  } catch(_) { return; }
+
+                  var currentY = e.touches[0].clientY;
+                  var dy = currentY - pullStartY;
+
+                  var si = findScrollInfo();
+                  var atTop    = si.scrollTop <= 6;
+                  var atBottom = (si.scrollTop + si.clientH) >= (si.scrollH - 10);
+
+                  log('🔍PULL src=' + si.src
+                    + ' sT=' + Math.round(si.scrollTop)
+                    + ' sH=' + Math.round(si.scrollH)
+                    + ' cH=' + Math.round(si.clientH)
+                    + ' atTop=' + atTop + ' atBot=' + atBottom
+                    + ' dy=' + Math.round(dy)
+                    + ' dir=' + pullDir
+                    + ' dist=' + Math.round(pullDist));
+
+                  // pull 방향 결정 (최초)
+                  if (!pullDir) {
+                    if (atTop && dy > 12) {
+                      pullDir = 'prev';
+                      pullStartY = currentY;
+                      pullDist = 0;
+                      log('🔍PULL ▶ START PREV');
+                    } else if (atBottom && dy < -12) {
+                      pullDir = 'next';
+                      pullStartY = currentY;
+                      pullDist = 0;
+                      log('🔍PULL ▶ START NEXT');
+                    }
+                    return;
+                  }
+
+                  // 경계를 벗어나면 취소
+                  if ((pullDir === 'prev' && !atTop) || (pullDir === 'next' && !atBottom)) {
+                    log('🔍PULL ▶ CANCEL (left boundary)');
+                    pullDir = null; pullDist = 0;
+                    try { window.parent.hidePullIndicator(); } catch(_) {}
+                    return;
+                  }
+
+                  // 거리 누적 (절대 거리 기반)
+                  if (pullDir === 'prev') {
+                    pullDist = Math.max(0, currentY - pullStartY);
+                  } else {
+                    pullDist = Math.max(0, pullStartY - currentY);
+                  }
+
+                  try { window.parent.showPullIndicator(pullDir, pullDist / PULL_TH); } catch(_) {}
+
+                  // pull 중 native 스크롤/bounce 방지
+                  try { e.preventDefault(); } catch(_) {}
+
+                  if (pullDist >= PULL_TH) {
+                    pullTriggered = true;
+                    log('🔍PULL ▶ TRIGGER ' + pullDir + ' dist=' + Math.round(pullDist));
+                    try { window.parent.triggerAutoTransition(pullDir === 'prev'); } catch(_) {}
+                  }
+                }, { passive: false }); // passive:false 필수 (preventDefault 사용)
+
                 doc.addEventListener("touchend", function(e) {
                   var dx = Math.abs(e.changedTouches[0].clientX - tapStartX);
                   var dy = Math.abs(e.changedTouches[0].clientY - tapStartY);
@@ -715,8 +1008,15 @@ useEffect(() => {
                   if (dx < 10 && dy < 10 && dt < 300) {
                     window.ReactNativeWebView.postMessage(JSON.stringify({ type: "toggleUI" }));
                   }
+                  if (!pullTriggered) {
+                    try { window.parent.hidePullIndicator(); } catch(_) {}
+                  }
+                  pullDir = null; pullDist = 0; pullTriggered = false;
                 }, { passive: true });
-              } catch(e) { sendLog("❌ attachTap error: " + e.message); }
+
+              } catch(e) {
+                try { window.parent.sendLog("❌ attachTap error: " + e.message); } catch(_) {}
+              }
             }
 
             // 각 챕터 렌더링 시 훅으로 CSS 주입 + 탭 이벤트 등록
@@ -732,78 +1032,333 @@ useEffect(() => {
 
             // 화면 중앙 텍스트를 스크롤할 때마다 로컬에 저장 (API 호출 없음)
             var lastVisibleText = "";
+            var lastCenterCfi = ""; // 화면 중앙 노드의 CFI (저장/복원 기준)
+            var lastAnchorRatio = 0.5; // CFI가 화면 어느 위치에 있었는지 (0~1, 기본 중앙)
             function updateCenterText() {
               try {
-                var outerViewH = window.innerHeight;
-                var centerY = outerViewH * 0.5;
+                var centerX = window.innerWidth * 0.5;
+                var centerY = window.innerHeight * 0.5;
                 var iframes = document.querySelectorAll('iframe');
-                var allNodes = [];
+
+                function findViewByIframe(iframeEl) {
+                  var views = rendition.manager && rendition.manager.visible && rendition.manager.visible();
+                  if (!views) return null;
+                  for (var vi = 0; vi < views.length; vi++) {
+                    if (views[vi].element && views[vi].element.querySelector('iframe') === iframeEl) {
+                      return views[vi];
+                    }
+                  }
+                  return null;
+                }
+
+                function getCaretRangeAt(iDoc, x, y) {
+                  try {
+                    if (iDoc.caretPositionFromPoint) {
+                      var pos = iDoc.caretPositionFromPoint(x, y);
+                      if (pos && pos.offsetNode) {
+                        var r1 = iDoc.createRange();
+                        r1.setStart(pos.offsetNode, pos.offset || 0);
+                        r1.collapse(true);
+                        return r1;
+                      }
+                    }
+                  } catch(_) {}
+                  try {
+                    if (iDoc.caretRangeFromPoint) {
+                      return iDoc.caretRangeFromPoint(x, y);
+                    }
+                  } catch(_) {}
+                  return null;
+                }
+
+                function getRangeRectSafe(iDoc, range) {
+                  if (!range) return null;
+                  try {
+                    var rect = range.getBoundingClientRect();
+                    if (rect && (rect.height > 0 || rect.width > 0)) return rect;
+                  } catch(_) {}
+                  try {
+                    var probe = range.cloneRange();
+                    var node = probe.startContainer;
+                    var off = probe.startOffset || 0;
+                    if (node && node.nodeType === 3 && node.textContent && node.textContent.length > 0) {
+                      var end = Math.min(node.textContent.length, off + 1);
+                      probe.setEnd(node, end);
+                      var rect2 = probe.getBoundingClientRect();
+                      if (rect2 && (rect2.height > 0 || rect2.width > 0)) return rect2;
+                    }
+                  } catch(_) {}
+                  return null;
+                }
+
+                var pickedIframe = null;
+                var pickedDoc = null;
+                var pickedRange = null;
+                var pickedRect = null;
+
+                // 1) 중앙 점이 들어있는 iframe에서 caret 기반으로 정확한 문자 오프셋 획득
                 for (var fi = 0; fi < iframes.length; fi++) {
                   var iframe = iframes[fi];
-                  var iframeTop = iframe.getBoundingClientRect().top;
+                  var iframeRect = iframe.getBoundingClientRect();
+                  if (centerY < iframeRect.top || centerY > iframeRect.bottom) continue;
+                  if (centerX < iframeRect.left || centerX > iframeRect.right) continue;
                   try {
                     var iDoc = iframe.contentDocument || iframe.contentWindow.document;
                     if (!iDoc || !iDoc.body) continue;
-                    var walker = iDoc.createTreeWalker(iDoc.body, NodeFilter.SHOW_TEXT, null, false);
-                    while (walker.nextNode()) {
-                      var node = walker.currentNode;
-                      var text = (node.textContent || "").trim();
-                      if (!text) continue;
-                      var parent = node.parentElement;
-                      if (!parent) continue;
-                      var rect = parent.getBoundingClientRect();
-                      var top = iframeTop + rect.top;
-                      var bottom = iframeTop + rect.bottom;
-                      if (bottom > 0 && top < outerViewH) {
-                        allNodes.push({ top: top, bottom: bottom, text: text });
+                    var localX = Math.max(1, Math.min((iframeRect.width || 1) - 1, centerX - iframeRect.left));
+                    var localY = Math.max(1, Math.min((iframeRect.height || 1) - 1, centerY - iframeRect.top));
+                    var r = getCaretRangeAt(iDoc, localX, localY);
+                    if (!r) continue;
+                    var rr = getRangeRectSafe(iDoc, r);
+                    pickedIframe = iframe;
+                    pickedDoc = iDoc;
+                    pickedRange = r;
+                    pickedRect = rr;
+                    break;
+                  } catch(_) {}
+                }
+
+                // 2) 중앙 점에서 실패하면, 화면과 겹치는 iframe들 중 중앙에 가장 가까운 iframe에서 재시도
+                if (!pickedRange) {
+                  var bestIframe = null;
+                  var bestDist = Infinity;
+                  for (var fi2 = 0; fi2 < iframes.length; fi2++) {
+                    var iframe2 = iframes[fi2];
+                    var r2 = iframe2.getBoundingClientRect();
+                    if (r2.bottom <= 0 || r2.top >= window.innerHeight) continue;
+                    var midY = (r2.top + r2.bottom) * 0.5;
+                    var dist = Math.abs(midY - centerY);
+                    if (dist < bestDist) { bestDist = dist; bestIframe = iframe2; }
+                  }
+                  if (bestIframe) {
+                    try {
+                      var bestRect = bestIframe.getBoundingClientRect();
+                      var bestDoc = bestIframe.contentDocument || bestIframe.contentWindow.document;
+                      if (bestDoc && bestDoc.body) {
+                        var lx = Math.max(1, Math.min((bestRect.width || 1) - 1, centerX - bestRect.left));
+                        var ly = Math.max(1, Math.min((bestRect.height || 1) - 1, centerY - bestRect.top));
+                        var rrng = getCaretRangeAt(bestDoc, lx, ly);
+                        if (rrng) {
+                          pickedIframe = bestIframe;
+                          pickedDoc = bestDoc;
+                          pickedRange = rrng;
+                          pickedRect = getRangeRectSafe(bestDoc, rrng);
+                        }
                       }
+                    } catch(_) {}
+                  }
+                }
+
+                if (!pickedRange || !pickedIframe || !pickedDoc) return;
+
+                // 중앙 좌표의 정확한 문자 주변 미리보기 생성
+                try {
+                  var sc = pickedRange.startContainer;
+                  var so = pickedRange.startOffset || 0;
+                  var snippet = '';
+                  if (sc && sc.nodeType === 3 && sc.textContent) {
+                    var txt = sc.textContent;
+                    var s = Math.max(0, so - 70);
+                    var e = Math.min(txt.length, so + 130);
+                    snippet = txt.slice(s, e);
+                  } else if (sc && sc.parentElement) {
+                    snippet = (sc.parentElement.textContent || '').slice(0, 200);
+                  }
+                  snippet = String(snippet || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+                  if (snippet) lastVisibleText = snippet;
+                } catch(_) {}
+
+                // caret 실제 좌표 기준 anchorRatio 계산
+                try {
+                  var container = rendition.manager && rendition.manager.container;
+                  if (container && pickedRect) {
+                    var iframeRectPicked = pickedIframe.getBoundingClientRect();
+                    var containerRect = container.getBoundingClientRect();
+                    var caretMidY = iframeRectPicked.top + pickedRect.top + (pickedRect.height > 0 ? (pickedRect.height * 0.5) : 0);
+                    var nodeRelY = caretMidY - containerRect.top;
+                    lastAnchorRatio = Math.max(0.05, Math.min(0.95, nodeRelY / container.clientHeight));
+                  }
+                } catch(_) { lastAnchorRatio = 0.5; }
+
+                // caret Range 기준으로 정확한 CFI 생성
+                try {
+                  var pickedView = findViewByIframe(pickedIframe);
+                  var generatedCfi = '';
+                  if (pickedView && pickedView.contents && typeof pickedView.contents.cfiFromRange === 'function') {
+                    generatedCfi = pickedView.contents.cfiFromRange(pickedRange) || '';
+                  }
+
+                  // cfiFromRange 미지원 환경 폴백
+                  if (!generatedCfi) {
+                    var sectionCfi = pickedView && pickedView.section && pickedView.section.cfiBase || '';
+                    var startNode = pickedRange.startContainer;
+                    if (sectionCfi && startNode) {
+                      var cfiGen = new ePub.CFI();
+                      generatedCfi = cfiGen.generate(startNode, pickedDoc.body, sectionCfi) || '';
                     }
-                  } catch(ie) {}
-                }
-                if (allNodes.length === 0) return;
-                // 화면 중앙에 가장 가까운 노드
-                var centerIdx = 0, minDist = Infinity;
-                for (var ni = 0; ni < allNodes.length; ni++) {
-                  var mid = (allNodes[ni].top + allNodes[ni].bottom) / 2;
-                  var dist = Math.abs(mid - centerY);
-                  if (dist < minDist) { minDist = dist; centerIdx = ni; }
-                }
-                // 중앙 노드 기준 앞뒤 2개씩 수집
-                var s = Math.max(0, centerIdx - 2);
-                var e = Math.min(allNodes.length - 1, centerIdx + 2);
-                var texts = [];
-                for (var ti = s; ti <= e; ti++) texts.push(allNodes[ti].text);
-                var result = texts.join(" ").replace(/\s+/g, " ").trim().slice(0, 200);
-                if (result) lastVisibleText = result;
+                  }
+
+                  if (generatedCfi && typeof generatedCfi === 'string') {
+                    lastCenterCfi = generatedCfi;
+                  }
+                } catch(cfiErr) { /* CFI 생성 실패시 기존 loc.start.cfi 사용 */ }
               } catch(ex) {}
             }
 
-            // 스크롤할 때마다 중앙 텍스트 갱신 (debounce 200ms, API 호출 없음)
+            // 챕터 전환 상태
             var centerTextTimer = null;
-            function onContainerScroll() {
-              clearTimeout(centerTextTimer);
-              centerTextTimer = setTimeout(updateCenterText, 200);
+            var isSeeking = false;
+            var isChapterLoading = false;
+            var isAutoTransition = false;
+            var lastAutoTransitionAt = 0;
+
+            // Pull indicator elements (outer window)
+            var pullIndicatorTop = document.getElementById('pull-indicator-top');
+            var pullIndicatorBottom = document.getElementById('pull-indicator-bottom');
+            var pullBarTop = document.getElementById('pull-bar-top');
+            var pullBarBottom = document.getElementById('pull-bar-bottom');
+            var pullArrowTop = document.getElementById('pull-arrow-top');
+            var pullArrowBottom = document.getElementById('pull-arrow-bottom');
+            var PULL_THRESHOLD = 80;
+
+            function showPullIndicator(dir, progress) {
+              try {
+                var clampedP = Math.min(1, Math.max(0, progress));
+                var pct = Math.round(clampedP * 100) + '%';
+                var maxH = 72; // max height of indicator band in px
+                var h = Math.round(clampedP * maxH);
+                if (dir === 'prev') {
+                  if (pullIndicatorBottom) pullIndicatorBottom.style.height = '0px';
+                  if (pullIndicatorTop) pullIndicatorTop.style.height = h + 'px';
+                  if (pullBarTop) pullBarTop.style.width = pct;
+                  if (pullArrowTop) pullArrowTop.style.transform = clampedP >= 1 ? 'scale(1.3)' : 'scale(1)';
+                } else {
+                  if (pullIndicatorTop) pullIndicatorTop.style.height = '0px';
+                  if (pullIndicatorBottom) pullIndicatorBottom.style.height = h + 'px';
+                  if (pullBarBottom) pullBarBottom.style.width = pct;
+                  if (pullArrowBottom) pullArrowBottom.style.transform = clampedP >= 1 ? 'scale(1.3)' : 'scale(1)';
+                }
+              } catch(e) {}
             }
 
-            function safeReport(location) {
+            function hidePullIndicator() {
               try {
-                var startCfi = location.start.cfi || location.start;
-                if (typeof startCfi !== 'string') {
-                  sendLog("❌ CFI가 문자열이 아님: " + typeof startCfi);
+                if (pullIndicatorTop) pullIndicatorTop.style.height = '0px';
+                if (pullIndicatorBottom) pullIndicatorBottom.style.height = '0px';
+              } catch(e) {}
+            }
+
+            function playSoftTransition(goPrev) {
+              try {
+                viewerEl.style.transition = 'transform 180ms ease, opacity 180ms ease';
+                viewerEl.style.opacity = '0.92';
+                viewerEl.style.transform = goPrev ? 'translateY(20px)' : 'translateY(-20px)';
+              } catch(e) {}
+            }
+
+            function clearSoftTransition() {
+              try {
+                viewerEl.style.opacity = '1';
+                viewerEl.style.transform = 'translateY(0px)';
+              } catch(e) {}
+            }
+
+            function triggerAutoTransition(goPrev) {
+              if (isAutoTransition || isSeeking) return;
+              var now = Date.now();
+              if (now - lastAutoTransitionAt < 400) return;
+
+              isAutoTransition = true;
+              isSeeking = true;
+              isChapterLoading = true;
+              hidePullIndicator();
+              showChapterIndicator(goPrev ? '이전 챕터 불러오는 중…' : '다음 챕터 불러오는 중…');
+              playSoftTransition(goPrev);
+
+              setTimeout(function() {
+                var p = goPrev ? rendition.prev() : rendition.next();
+                Promise.resolve(p).then(function() {
+                  setTimeout(function() {
+                    clearSoftTransition();
+                    hideChapterIndicator();
+                    isChapterLoading = false;
+                    isSeeking = false;
+                    isAutoTransition = false;
+                    lastAutoTransitionAt = Date.now();
+                    try {
+                      var loc = rendition.currentLocation();
+                      if (loc) safeReport(loc, false);
+                    } catch(e) {}
+                  }, 220);
+                }).catch(function() {
+                  clearSoftTransition();
+                  hideChapterIndicator();
+                  isChapterLoading = false;
+                  isSeeking = false;
+                  isAutoTransition = false;
+                });
+              }, 120);
+            }
+
+            var scrollReportTimer = null;
+            function onContainerScroll() {
+              if (isSeeking || isChapterLoading) return;
+              clearTimeout(centerTextTimer);
+              clearTimeout(scrollReportTimer);
+              centerTextTimer = setTimeout(function() {
+                if (isSeeking) return;
+                updateCenterText();
+              }, 180);
+              // 스크롤 멈춘 뒤 600ms 후 CFI 보고 (이어읽기 저장용)
+              scrollReportTimer = setTimeout(function() {
+                if (isSeeking || isChapterLoading) return;
+                try {
+                  updateCenterText();
+                  var loc = rendition.currentLocation();
+                  if (loc) safeReport(loc, true);
+                } catch(e) {}
+              }, 600);
+            }
+
+            function safeReport(location, fromScroll) {
+              try {
+                var loc = location || rendition.currentLocation();
+                if (!loc || !loc.start) return;
+
+                var startCfi = loc.start.cfi || loc.start;
+                if (typeof startCfi !== 'string') return;
+
+                // toc cfi는 무시
+                var cfiLower = String(startCfi || '').toLowerCase();
+                if (cfiLower.indexOf('[calibre_toc_') >= 0 || cfiLower.indexOf('[toc]') >= 0 || cfiLower.indexOf('/toc') >= 0) {
+                  sendLog('⚠️ safeReport: TOC CFI 무시');
                   return;
                 }
-                var current = book.locations.locationFromCfi(startCfi);
-                var percent = book.locations.percentageFromCfi(startCfi) * 100;
 
-                // 즉시 최신 중앙 텍스트로 갱신 후 사용
                 updateCenterText();
+
+                // 화면 중앙 CFI가 있으면 우선 사용 (정확한 복원 위치)
+                // 없으면 loc.start.cfi(븷포트 상단) 폴백
+                var saveCfi = (lastCenterCfi && lastCenterCfi.length > 10) ? lastCenterCfi : startCfi;
+
+                var current = book.locations.locationFromCfi(saveCfi);
+                var percent = book.locations.percentageFromCfi(saveCfi) * 100;
+
+                sendLog('💾 safeReport'
+                  + ' saveCfi=' + saveCfi.slice(0, 80)
+                  + ' startCfi=' + startCfi.slice(0, 40)
+                  + ' pct=' + percent.toFixed(1)
+                  + ' anchorRatio=' + lastAnchorRatio.toFixed(3)
+                  + ' centerTxt=' + lastVisibleText.slice(0, 40)
+                  + (fromScroll ? ' [scroll]' : ' [nav]'));
 
                 window.ReactNativeWebView.postMessage(JSON.stringify({
                   type: "progress",
                   current: current,
                   total: totalLocations,
                   percent: percent,
-                  cfi: startCfi,
+                  cfi: saveCfi,
+                  anchorRatio: lastAnchorRatio,
                   visibleText: lastVisibleText
                 }));
               } catch(e) {
@@ -811,40 +1366,59 @@ useEffect(() => {
               }
             }
 
-            // 위치 정보 생성
+            // 빠른 시작: 우선 렌더링 준비를 알리고, locations는 백그라운드에서 생성
             book.ready.then(function () {
               sendLog("📚 book.ready 완료");
-              loadingEl.querySelector('div:last-child').textContent = '페이지 정보 생성 중...';
-              return book.locations.generate(400);
-            }).then(function () {
-              sendLog("📚 locations.generate 완료");
-              locationsReady = true;
-              totalLocations = book.locations.length();
-              loadingEl.style.display = 'none';
 
-              // 준비 완료 알림
+              // 준비 완료 알림(빠른 시작)
               window.ReactNativeWebView.postMessage(JSON.stringify({
                 type: "ready"
               }));
-              
-              // ⭐ display()는 themeAndStart 메시지에서 호출됨 (테마 적용 후 display 보장)
-              sendLog("📚 locations 준비 완료, themeAndStart 대기 중...");
+              sendLog("📚 빠른 시작 준비 완료, themeAndStart 대기 중...");
 
+              // locations는 백그라운드 생성 (초기 체감 속도 개선)
+              loadingEl.querySelector('div:last-child').textContent = '페이지 정보 생성 중...';
+              return book.locations.generate(180).then(function() {
+                sendLog("📚 locations.generate 완료");
+                locationsReady = true;
+                totalLocations = book.locations.length();
+                loadingEl.style.display = 'none';
+              });
             }).catch(function(err) {
               showError("EPUB 파일을 로드할 수 없습니다: " + err.message);
             });
 
-            // 페이지 이동될 때마다 진행도 전송
+            // relocated 이벤트: seek(슬라이더) 완료 후에만 사용 (scroll 중에는 onContainerScroll이 담당)
+            // continuous 모드에서 scroll 중 relocated는 챕터 로드 타이밍에 발화되어 offsetTop이 미정착 상태임
+            // → scroll 중 호출 시 getViewportCenterCfi()가 엉뚱한 위치를 반환하는 문제 발생
             rendition.on("relocated", function(location) {
               if (!locationsReady) return;
-              safeReport(location);
+              if (isSeeking) return;
+              // 챕터 prepend/append 과도기 relocated는 위치가 크게 튈 수 있어 무시
+              if (isChapterLoading) {
+                return;
+              }
+              safeReport(location, false);
             });
 
-            // rendered 이벤트: container scroll 리스너 등록 + prepend 보정
-            var lastScrollHeight = 0;
+            // iframe에서 window.parent.XXX로 접근할 수 있도록 노출
+            window.sendLog = sendLog;
+            window.showPullIndicator = showPullIndicator;
+            window.hidePullIndicator = hidePullIndicator;
+            window.triggerAutoTransition = triggerAutoTransition;
+
+            // rendered 이벤트: container scroll 리스너 등록
             var containerScrollBound = false;
+            var chapterLoadTimer = null;
             rendition.on("rendered", function(section) {
               loadingEl.style.display = 'none';
+              // 챕터 로드/전환 중 scroll 이벤트로 인한 잘못된 CFI 보고 방지
+              // epub.js가 prepend 후 scrollTop을 내부 조정하는 동안 차단
+              isChapterLoading = true;
+              clearTimeout(chapterLoadTimer);
+              chapterLoadTimer = setTimeout(function() {
+                isChapterLoading = false;
+              }, 600);
               try {
                 var container = rendition.manager && rendition.manager.container;
                 if (container) {
@@ -853,19 +1427,6 @@ useEffect(() => {
                     container.addEventListener('scroll', onContainerScroll, { passive: true });
                     containerScrollBound = true;
                   }
-
-                  var prevHeight = lastScrollHeight;
-                  var prevScrollTop = container.scrollTop;
-                  requestAnimationFrame(function() {
-                    requestAnimationFrame(function() {
-                      var newHeight = container.scrollHeight;
-                      lastScrollHeight = newHeight;
-                      var diff = newHeight - prevHeight;
-                      if (prevHeight > 0 && diff > 0 && prevScrollTop > 10) {
-                        container.scrollTop = prevScrollTop + diff;
-                      }
-                    });
-                  });
                 }
               } catch(e) {}
             });
@@ -907,7 +1468,18 @@ useEffect(() => {
                   var cfi = book.locations.cfiFromLocation(targetIndex);
                   if (cfi) {
                     sendLog("🔍 슬라이더 이동: " + Math.round(p * 100) + "% (index: " + targetIndex + ")");
-                    rendition.display(cfi);
+                    isSeeking = true;
+                    rendition.display(cfi).then(function() {
+                      setTimeout(function() {
+                        isSeeking = false;
+                        try {
+                          var loc = rendition.currentLocation();
+                          if (loc) safeReport(loc);
+                        } catch(e) {}
+                      }, 500);
+                    }).catch(function() {
+                      isSeeking = false;
+                    });
                   }
                 } else if (data.type === "themeAndStart") {
                   // 테마 설정 후 display 시작 (훅이 각 챕터에 CSS 주입 → 챕터 이동 정상화)
@@ -921,14 +1493,112 @@ useEffect(() => {
                   };
                   document.documentElement.style.background = currentTheme.bgColor;
                   document.body.style.background = currentTheme.bgColor;
-                  sendLog("📖 themeAndStart 수신 - CFI=" + (data.cfi || '없음(처음부터)'));
+                  sendLog("📖 themeAndStart 수신 - CFI=" + (data.cfi || '없음(처음부터)') + " anchorRatio=" + (data.anchorRatio || 0.5));
+                  var savedAnchorRatio = (typeof data.anchorRatio === 'number') ? data.anchorRatio : 0.5;
                   if (data.cfi) {
-                    sendLog("➡️ display(cfi) 호출: " + data.cfi);
-                    rendition.display(data.cfi).then(function() {
-                      sendLog("✅ display(cfi) 완료: " + data.cfi);
-                      // epub.js scrolled 모드: display()가 내부적으로 scrollTop을 설정함
-                      // 우리가 추가로 scrollTop을 건드리면 epub.js 계산과 충돌하므로 건드리지 않음
-                      // 단, 인접 섹션 로드 후 prepend로 인한 밀림은 rendered 이벤트에서 보정
+                    var targetCfi = data.cfi;
+                    sendLog("➡️ [복원] display(cfi) 호출: " + targetCfi);
+                    rendition.display(targetCfi).then(function() {
+
+                      // CFI를 저장 당시의 화면 내 상대 위치(anchorRatio)에 정렬하는 함수
+                      // getBoundingClientRect() 기반 → 레이아웃 완료 후에만 정확
+                      function scrollCfiToCenter(onDone) {
+                        try {
+                          var container = rendition.manager && rendition.manager.container;
+                          var views = rendition.manager && rendition.manager.visible && rendition.manager.visible();
+                          var view = views && views[0];
+                          if (!container || !view) { if (onDone) onDone(); return; }
+
+                          // iframe 엘리먼트 찾기
+                          var iframeEl = view.element && view.element.querySelector('iframe');
+                          if (!iframeEl) { if (onDone) onDone(); return; }
+                          var iframeDoc = iframeEl.contentDocument || (iframeEl.contentWindow && iframeEl.contentWindow.document);
+                          if (!iframeDoc) { if (onDone) onDone(); return; }
+
+                          // CFI → DOM Range: view.contents.range() 사용 (epub.js 공식 API)
+                          var range;
+                          try {
+                            range = view.contents.range(targetCfi);
+                          } catch(rangeErr) {
+                            range = null;
+                          }
+                          if (!range) {
+                            sendLog('⚠️ [복원] toRange 반환 null, locationOf 폴백 시도');
+                            // 폴백: locationOf 방식
+                            var pos = view.contents.locationOf(targetCfi, 'px');
+                            var viewOffsetTop = view.element ? view.element.offsetTop : 0;
+                            var rawTarget = viewOffsetTop + (pos && pos.top > 0 ? pos.top : 0);
+                            var targetScrollTop = Math.max(0, rawTarget - container.clientHeight * savedAnchorRatio);
+                            container.scrollTop = targetScrollTop;
+                            if (onDone) onDone();
+                            return;
+                          }
+
+                          // getBoundingClientRect: iframe viewport 기준 좌표
+                          var rect = range.getBoundingClientRect();
+                          var iframeRect = iframeEl.getBoundingClientRect();
+                          var containerRect = container.getBoundingClientRect();
+
+                          // CFI 요소의 outer container 스크롤 공간 기준 절대 y
+                          // = 현재 scrollTop + (iframe 뷰포트 내 y) + (iframe가 outer container 내에서의 y)
+                          var elementAbsTop = container.scrollTop
+                            + (iframeRect.top - containerRect.top)
+                            + rect.top;
+
+                          // 저장 당시 anchorRatio 위치에 오도록: scrollTop = elementAbsTop - clientHeight*anchorRatio + rect.height/2
+                          // anchorRatio=0.5 → 정중앙, 0.3 → 화면 위쪽 30% 위치
+                          var desiredY = container.clientHeight * savedAnchorRatio;
+                          var desiredScrollTop = elementAbsTop
+                            - desiredY
+                            + rect.height / 2;
+
+                          desiredScrollTop = Math.max(0, desiredScrollTop);
+
+                          sendLog('📍 [복원스크롤]'
+                            + ' anchor=' + savedAnchorRatio.toFixed(3)
+                            + ' desiredY=' + Math.round(desiredY)
+                            + ' iframeTop=' + Math.round(iframeRect.top)
+                            + ' rect.top=' + Math.round(rect.top)
+                            + ' rect.h=' + Math.round(rect.height)
+                            + ' scrollBefore=' + Math.round(container.scrollTop)
+                            + ' elemAbsTop=' + Math.round(elementAbsTop)
+                            + ' → target=' + Math.round(desiredScrollTop));
+
+                          container.scrollTop = desiredScrollTop;
+
+                          if (onDone) onDone();
+                        } catch(e) {
+                          sendLog('⚠️ [복원스크롤 오류] ' + e.message);
+                          if (onDone) onDone();
+                        }
+                      }
+
+                      // 1차 보정: 2 RAF + 200ms (iframe 레이아웃 + 테마 CSS 안정화)
+                      requestAnimationFrame(function() {
+                        requestAnimationFrame(function() {
+                          setTimeout(function() {
+                            scrollCfiToCenter(function() {
+                              // 2차 보정: 폰트/이미지 로딩 후 재보정 (300ms 후)
+                              setTimeout(function() {
+                                scrollCfiToCenter(function() {
+                                  // 최종 확인 로그
+                                  var container = rendition.manager && rendition.manager.container;
+                                  updateCenterText();
+                                  var loc2 = rendition.currentLocation();
+                                  sendLog('✅ [복원완료]'
+                                    + ' scrollTop=' + (container ? Math.round(container.scrollTop) : 'n/a')
+                                    + ' cfi=' + (loc2 && loc2.start ? (loc2.start.cfi||'').slice(0,50) : 'n/a')
+                                    + ' centerTxt=' + lastVisibleText.slice(0, 50));
+                                  if (loc2) safeReport(loc2, false);
+                                  // 복원 완료 → RN 로딩 오버레이 제거
+                                  window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'restored' }));
+                                });
+                              }, 300);
+                            });
+                          }, 200);
+                        });
+                      });
+
                     }).catch(function(err) {
                       sendLog("❌ display(cfi) 실패, 처음부터: " + err.message);
                       rendition.display();
@@ -1006,6 +1676,7 @@ useEffect(() => {
     if (!fileId) return;
 
     const currentProgress = progressRef.current;
+    const currentCfi = lastCfiRef.current;
     
     // 0으로 덮어쓰기 방지
     if (currentProgress === 0 && initialProgressRef.current === 0) {
@@ -1022,9 +1693,16 @@ useEffect(() => {
       return;
     }
 
+    // EPUB은 CFI가 있어야 정확 복원이 가능함.
+    // CFI 없이 progress만 저장하면 이전 CFI와 어긋나서 다른 위치로 이동할 수 있음.
+    if (isEpub && !currentCfi) {
+      console.log("📚 EPUB CFI 미수신 상태 - progress 저장 보류");
+      return;
+    }
+
     const body: any = { 
       progress: currentProgress,
-      recordReadLog: forceLog || currentProgress > 0
+      recordReadLog: forceLog || currentProgress > 0,
     };
 
     // 현재 화면에 보이는 텍스트를 readingPreview로 저장
@@ -1032,12 +1710,18 @@ useEffect(() => {
       body.readingPreview = currentReadingPreviewRef.current;
     }
 
-    if (isEpub && lastCfiRef.current) {
-      body.epubCfi = lastCfiRef.current;
+    if (isEpub && currentCfi) {
+      body.epubCfi = currentCfi;
+      body.anchorRatio = lastAnchorRatioRef.current;
     }
 
     try {
-      console.log("📤 서버로 전송하는 데이터:", body);
+      console.log("📤 [저장 시작]"
+        + "\n  progress=" + currentProgress.toFixed(3)
+        + "\n  cfi=" + (currentCfi ? currentCfi.slice(0, 80) : '❌없음')
+        + "\n  anchorRatio=" + lastAnchorRatioRef.current.toFixed(3)
+        + "\n  preview=" + (currentReadingPreviewRef.current || '').slice(0, 40)
+        + "\n  body=" + JSON.stringify(body).slice(0, 200));
       
       const response = await fetch(`${BASE_URL}/files/${fileId}/progress`, {
         method: "PATCH",
@@ -1047,7 +1731,12 @@ useEffect(() => {
 
       if (response.ok) {
         lastSavedProgressRef.current = currentProgress;
-        console.log("🔵 진행도 저장됨:", currentProgress);
+        console.log("✅ [저장 성공] progress=" + currentProgress.toFixed(3)
+          + " anchorRatio=" + lastAnchorRatioRef.current.toFixed(3)
+          + " cfi=" + (currentCfi ? currentCfi.slice(0, 60) : '없음'));
+      } else {
+        const errText = await response.text().catch(() => '');
+        console.log("❌ [저장 실패] status=" + response.status + " body=" + errText.slice(0, 100));
       }
     } catch (e) {
       console.log("❌ 진행도 저장 실패:", e);
@@ -1070,8 +1759,13 @@ useEffect(() => {
       AsyncStorage.setItem('reader_exited', '1').catch(() => {});
       if (isEpub && webViewRef.current) {
         webViewRef.current.postMessage(JSON.stringify({ type: 'getCurrentLocation' }));
-        // WebView 메시지 처리 후 저장되도록 짧은 딜레이
-        setTimeout(() => saveProgressRef.current(true), 300);
+        // 최신 preview가 도착했는지 확인하고 동적 대기
+        const now = Date.now();
+        const timeSinceLastUpdate = now - lastProgressUpdateAtRef.current;
+        // 최근 100ms 내 업데이트면 바로 저장, 아니면 최대 700ms 대기
+        const waitTime = timeSinceLastUpdate < 100 ? 50 : Math.min(700, 800 - timeSinceLastUpdate);
+        console.log("💾 [unmount] timeSinceUpdate=" + timeSinceLastUpdate + "ms, waiting " + waitTime + "ms");
+        setTimeout(() => saveProgressRef.current(true), waitTime);
       } else {
         saveProgressRef.current(true);
       }
@@ -1084,7 +1778,13 @@ useEffect(() => {
       if (nextState === 'background' || nextState === 'inactive') {
         if (isEpub && webViewRef.current) {
           webViewRef.current.postMessage(JSON.stringify({ type: 'getCurrentLocation' }));
-          setTimeout(() => saveProgressRef.current(true), 300);
+          // 최신 preview가 도착했는지 확인하고 동적 대기
+          const now = Date.now();
+          const timeSinceLastUpdate = now - lastProgressUpdateAtRef.current;
+          // 최근 100ms 내 업데이트면 바로 저장, 아니면 최대 700ms 대기
+          const waitTime = timeSinceLastUpdate < 100 ? 50 : Math.min(700, 800 - timeSinceLastUpdate);
+          console.log("💾 [background] timeSinceUpdate=" + timeSinceLastUpdate + "ms, waiting " + waitTime + "ms");
+          setTimeout(() => saveProgressRef.current(true), waitTime);
         } else {
           saveProgressRef.current(true);
         }
@@ -1092,8 +1792,6 @@ useEffect(() => {
     });
     return () => subscription.remove();
   }, [isEpub]);
-
-
 
   return (
     <View style={styles.root}>
@@ -1139,6 +1837,7 @@ useEffect(() => {
         <>
           <View style={styles.readerArea}>
             {epubBase64 && epubBase64.length > 0 ? (
+              <>
               <WebView
                 ref={webViewRef}
                 originWhitelist={["*"]}
@@ -1161,6 +1860,14 @@ useEffect(() => {
                   setEpubError("WebView 로딩 실패");
                 }}
               />
+              {/* CFI 복원 중 로딩 오버레이: 스크롤 계산이 끝날 때까지 WebView를 가림 */}
+              {epubRestoring && (
+                <View style={styles.restoreOverlay}>
+                  <ActivityIndicator size="large" color="#b84a8c" />
+                  <Text style={styles.restoreOverlayText}>이어읽기 위치 불러오는 중...</Text>
+                </View>
+              )}
+              </>
             ) : (
               <View style={styles.loadingContainer}>
                 <Text style={styles.loadingText}>EPUB 파일을 읽는 중...</Text>
@@ -1665,5 +2372,18 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: "#999",
     fontWeight: "600",
+  },
+  restoreOverlay: {
+    position: "absolute",
+    top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: "#f5f0e6",
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 50,
+  },
+  restoreOverlayText: {
+    marginTop: 16,
+    fontSize: 15,
+    color: "#888",
   },
 });

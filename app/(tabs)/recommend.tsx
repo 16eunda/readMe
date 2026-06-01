@@ -50,7 +50,7 @@ function getFileIcon(title: string) {
 }
 
 export default function Recommend() {
-  const { user, isPremium } = useUser();
+  const { user, isPremium, isLoading: isUserLoading } = useUser();
   const [recommendations, setRecommendations] = useState<RecommendedFile[]>([]);
   const [loading, setLoading] = useState(false);
   const [hasRecommendations, setHasRecommendations] = useState(false);
@@ -73,6 +73,7 @@ export default function Recommend() {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
   const fetchRecommendations = async () => {
+    if (isUserLoading) return;
     if (!user) {
       Alert.alert("로그인 필요", "AI 추천은 로그인 후 이용할 수 있어요.", [{ text: "확인" }]);
       return;

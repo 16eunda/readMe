@@ -24,7 +24,7 @@ const PURPLE = "#7C3AED";
 const ITEMS_PER_PAGE = 10;
 
 export default function RankingPremiumScreen() {
-  const { isPremium } = useUser();
+  const { isPremium, isLoading: isUserLoading } = useUser();
   const now = new Date();
 
   const [period, setPeriod] = useState<"한달" | "올해">("한달");
@@ -63,6 +63,7 @@ export default function RankingPremiumScreen() {
   }, [rankings]);
 
   const fetchRankings = async (showLoading = true) => {
+    if (isUserLoading) return;
     if (showLoading) setLoading(true);
     setError(null);
     try {
@@ -95,13 +96,13 @@ export default function RankingPremiumScreen() {
   useFocusEffect(
     useCallback(() => {
       fetchRankings(); // TODO: 테스트 끝나면 → if (isPremium) fetchRankings();
-    }, [period, selectedYear, selectedMonth, isPremium])
+    }, [period, selectedYear, selectedMonth, isPremium, isUserLoading])
   );
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
     fetchRankings(false);
-  }, [period, selectedYear, selectedMonth]);
+  }, [period, selectedYear, selectedMonth, isUserLoading]);
 
   const handleScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
     const { layoutMeasurement, contentOffset, contentSize } = event.nativeEvent;

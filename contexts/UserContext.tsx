@@ -160,6 +160,9 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
 
       // 2. refreshToken으로 accessToken 재발급 시도
       const refreshToken = await AsyncStorage.getItem('refreshToken');
+      console.log('🔐 앱 시작 인증 상태:', {
+        hasRefreshToken: !!refreshToken,
+      });
       if (refreshToken) {
         console.log('🔄 refreshToken 발견, accessToken 재발급 시도');
         const newAccessToken = await refreshAccessToken(refreshToken);
@@ -185,6 +188,10 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
       // 3. refreshToken 없으면 기존 accessToken 체크
       const userData = await AsyncStorage.getItem(USER_KEY);
       const accessToken = await AsyncStorage.getItem('accessToken');
+      console.log('🔐 저장 토큰/유저 존재 여부:', {
+        hasUserData: !!userData,
+        hasAccessToken: !!accessToken,
+      });
       
       if (userData && accessToken) {
         // accessToken 유효성 검증

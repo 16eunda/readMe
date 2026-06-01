@@ -170,7 +170,7 @@ export default function Home() {
   const [isDeleting, setIsDeleting] = useState(false);
 
   // 전역 상태에서 사용자 정보 가져오기
-  const { user, deviceId, incomingFile, setIncomingFile } = useUser();
+  const { user, deviceId, incomingFile, setIncomingFile, isLoading: isUserLoading } = useUser();
   const queryClient = useQueryClient();
 
   // 🔍 어떤 값이 계속 바뀌는지 추적
@@ -225,7 +225,7 @@ export default function Home() {
       }
       return { content: [], hasMore: false };
     },
-    enabled: !!deviceId && !isSearching,
+    enabled: !!deviceId && !isSearching && !isUserLoading,
     staleTime: 30 * 1000,
     refetchOnWindowFocus: false,
   });
@@ -250,7 +250,7 @@ export default function Home() {
 
       return Array.isArray(data) ? data : [];
     },
-    enabled: !!deviceId,
+    enabled: !!deviceId && !isUserLoading,
     staleTime: 30 * 1000,
     refetchOnWindowFocus: false,
   });
@@ -270,7 +270,7 @@ export default function Home() {
       const data = await response.json();
       return Array.isArray(data) ? data : [];
     },
-    enabled: !!deviceId,
+    enabled: !!deviceId && !isUserLoading,
     staleTime: 30 * 1000,
     refetchOnWindowFocus: false,
   });
