@@ -43,6 +43,7 @@ export default function HistoryScreen() {
 
     try {
       const token = await AsyncStorage.getItem("accessToken");
+      console.log('🔍 히스토리 가져오기: 토큰 존재 여부:', !!token);
       const deviceId = await getDeviceId();
       
       setError(null);
