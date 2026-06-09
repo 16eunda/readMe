@@ -9,7 +9,44 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "CFBundleDocumentTypes": [
+          {
+            "CFBundleTypeName": "EPUB Document",
+            "CFBundleTypeIconFiles": [],
+            "LSItemContentTypes": [
+              "org.idpf.epub-container"
+            ],
+            "CFBundleTypeRole": "Viewer",
+            "LSHandlerRank": "Alternate"
+          },
+          {
+            "CFBundleTypeName": "Plain Text",
+            "CFBundleTypeIconFiles": [],
+            "LSItemContentTypes": [
+              "public.plain-text"
+            ],
+            "CFBundleTypeRole": "Viewer",
+            "LSHandlerRank": "Alternate"
+          }
+        ],
+        "UTImportedTypeDeclarations": [
+          {
+            "UTTypeIdentifier": "org.idpf.epub-container",
+            "UTTypeDescription": "EPUB Document",
+            "UTTypeConformsTo": [
+              "public.data"
+            ],
+            "UTTypeTagSpecification": {
+              "public.filename-extension": [
+                "epub"
+              ],
+              "public.mime-type": "application/epub+zip"
+            }
+          }
+        ]
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -19,7 +56,34 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "category": [
+            "DEFAULT",
+            "BROWSABLE"
+          ],
+          "data": [
+            {
+              "mimeType": "text/plain"
+            }
+          ]
+        },
+        {
+          "action": "VIEW",
+          "category": [
+            "DEFAULT",
+            "BROWSABLE"
+          ],
+          "data": [
+            {
+              "mimeType": "application/epub+zip"
+            }
+          ]
+        }
+      ],
+      "package": "com.readme.app"
     },
     "web": {
       "output": "static",
@@ -27,6 +91,7 @@
     },
     "plugins": [
       "expo-router",
+      "react-native-iap",
       [
         "expo-splash-screen",
         {
@@ -43,6 +108,13 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "a0aaae35-0251-4c16-9639-29bf6bcfc2ff"
+      }
+    },
+    "owner": "16jung"
   }
 }

@@ -4,6 +4,7 @@ type FileOptionsModalProps = {
   visible: boolean;
   onDelete: () => void;
   onMove: () => void;
+  onOpenLocation: () => void;
   onClose: () => void;
 };
 
@@ -11,6 +12,7 @@ export default function FileOptionsModal({
   visible,
   onDelete,
   onMove,
+  onOpenLocation,
   onClose,
 }: FileOptionsModalProps) {
   return (
@@ -55,7 +57,19 @@ export default function FileOptionsModal({
                 textAlign: "center",
               }}
             >
-              폴더로 이동
+              이동
+            </Text>
+          </TouchableOpacity>
+
+          {/* 파일 위치 열기 */}
+          <TouchableOpacity style={{ padding: 15 }} onPress={onOpenLocation}>
+            <Text
+              style={{
+                fontSize: 16,
+                textAlign: "center",
+              }}
+            >
+              파일 위치 열기
             </Text>
           </TouchableOpacity>
 

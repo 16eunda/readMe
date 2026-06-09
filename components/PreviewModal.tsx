@@ -1,5 +1,6 @@
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import { Modal, Pressable, Text, View } from "react-native";
+import { Modal, Pressable, ScrollView, Text, TouchableOpacity, View } from "react-native";
 
 export default function PreviewModal({
   visible,
@@ -25,12 +26,34 @@ export default function PreviewModal({
         <View
           style={{
             width: "85%",
+            maxHeight: "80%",
             backgroundColor: "#fff",
             padding: 20,
             borderRadius: 12,
+            position: "relative",
           }}
         >
-          <Text style={{ fontSize: 20, fontWeight: "bold" }}>
+          {/* X 닫기 버튼 */}
+          <TouchableOpacity
+            onPress={onClose}
+            style={{
+              position: "absolute",
+              top: 15,
+              right: 15,
+              zIndex: 10,
+              padding: 4,
+              backgroundColor: "#f0f0f0",
+              borderRadius: 15,
+              width: 30,
+              height: 30,
+              justifyContent: "center",
+              alignItems: "center",
+            }}
+          >
+            <MaterialCommunityIcons name="close" size={20} color="#333" />
+          </TouchableOpacity>
+
+          <Text style={{ fontSize: 20, fontWeight: "bold", paddingRight: 40 }}>
             {file.title}
           </Text>
 
@@ -38,16 +61,20 @@ export default function PreviewModal({
             마지막 위치에서 이어 읽기 ({Math.round(lastProgress * 100)}%)
           </Text>
 
-          <Text
-            style={{
-              marginTop: 14,
-              fontSize: 16,
-              color: "#333",
-              lineHeight: 24,
-            }}
+          <ScrollView
+            style={{ marginTop: 14, maxHeight: 200 }}
+            showsVerticalScrollIndicator={false}
           >
-            {previewText}
-          </Text>
+            <Text
+              style={{
+                fontSize: 16,
+                color: "#333",
+                lineHeight: 24,
+              }}
+            >
+              {previewText}
+            </Text>
+          </ScrollView>
 
           <View
             style={{
@@ -64,6 +91,7 @@ export default function PreviewModal({
                     fileId: file.id,
                     uri: file.uri,
                     name: file.title,
+                    resetProgress: "true",
                   },
                 });
                 onClose();

@@ -1,0 +1,1006 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ReadMe - Home 화면 사용 시뮬레이션</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+        
+        header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            align-items: start;
+        }
+        
+        .phone-mockup {
+            background: white;
+            border-radius: 30px;
+            padding: 15px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            position: sticky;
+            top: 20px;
+        }
+        
+        .screen {
+            background: #f8f9fa;
+            border-radius: 20px;
+            overflow: hidden;
+            height: 700px;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .status-bar {
+            background: white;
+            padding: 10px 20px;
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            color: #666;
+        }
+        
+        .screen-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        
+        .screen-title {
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 15px;
+        }
+        
+        .search-bar {
+            background: white;
+            padding: 12px 20px;
+            border-radius: 25px;
+            margin-bottom: 15px;
+            color: #999;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        
+        .folder-scroll {
+            display: flex;
+            gap: 10px;
+            overflow-x: auto;
+            padding: 10px 0;
+            margin-bottom: 15px;
+        }
+        
+        .folder-item {
+            background: #eaeaea;
+            padding: 12px 20px;
+            border-radius: 10px;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .folder-item:hover {
+            background: #667eea;
+            color: white;
+            transform: scale(1.05);
+        }
+        
+        .folder-menu {
+            display: flex;
+            justify-content: flex-end;
+            gap: 15px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        
+        .folder-menu span {
+            cursor: pointer;
+            color: #667eea;
+        }
+        
+        .file-card {
+            background: white;
+            padding: 15px;
+            border-radius: 12px;
+            margin-bottom: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            cursor: pointer;
+            transition: all 0.3s;
+            position: relative;
+        }
+        
+        .file-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+        
+        .file-card h3 {
+            font-size: 16px;
+            margin-bottom: 8px;
+            color: #333;
+        }
+        
+        .file-card p {
+            font-size: 13px;
+            color: #666;
+            margin-bottom: 8px;
+        }
+        
+        .file-card .meta {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            color: #999;
+        }
+        
+        .file-card .options {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            font-size: 20px;
+            color: #999;
+        }
+        
+        .fab {
+            position: absolute;
+            bottom: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 60px;
+            height: 60px;
+            border-radius: 30px;
+            background: #667eea;
+            color: white;
+            font-size: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .fab:hover {
+            transform: translateX(-50%) scale(1.1);
+            background: #764ba2;
+        }
+        
+        .bottom-nav {
+            background: white;
+            display: flex;
+            justify-content: space-around;
+            padding: 12px 0;
+            border-top: 1px solid #eee;
+        }
+        
+        .bottom-nav-item {
+            text-align: center;
+            font-size: 11px;
+            color: #999;
+            cursor: pointer;
+        }
+        
+        .bottom-nav-item.active {
+            color: #667eea;
+        }
+        
+        .bottom-nav-item .icon {
+            font-size: 24px;
+            margin-bottom: 3px;
+        }
+        
+        .modal-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+        
+        .modal-overlay.show {
+            display: flex;
+        }
+        
+        .modal {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            width: 85%;
+            max-width: 350px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+        
+        .modal h3 {
+            margin-bottom: 15px;
+            color: #333;
+        }
+        
+        .modal input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        
+        .modal-buttons {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .modal-button {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        
+        .modal-button.primary {
+            background: #667eea;
+            color: white;
+        }
+        
+        .modal-button.primary:hover {
+            background: #764ba2;
+        }
+        
+        .modal-button.secondary {
+            background: #eee;
+            color: #666;
+        }
+        
+        .modal-button.secondary:hover {
+            background: #ddd;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 80px 20px;
+            color: #999;
+        }
+        
+        .empty-state .icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }
+        
+        .scenario-panel {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        
+        .scenario-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .scenario-item {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s;
+            position: relative;
+        }
+        
+        .scenario-item:hover {
+            transform: translateX(10px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+        }
+        
+        .scenario-item.active {
+            background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
+            box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4);
+        }
+        
+        .scenario-item h3 {
+            font-size: 18px;
+            margin-bottom: 8px;
+        }
+        
+        .scenario-item p {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+        
+        .scenario-item .step-number {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            width: 35px;
+            height: 35px;
+            background: rgba(255,255,255,0.3);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 18px;
+        }
+        
+        .flow-diagram {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            margin-top: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        
+        .flow-diagram h2 {
+            margin-bottom: 20px;
+            color: #667eea;
+        }
+        
+        .flow-step {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 10px;
+            border-left: 4px solid #667eea;
+            position: relative;
+        }
+        
+        .flow-step.current {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-left: 4px solid #ffc107;
+        }
+        
+        .flow-step::after {
+            content: '↓';
+            position: absolute;
+            bottom: -20px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 20px;
+            color: #667eea;
+        }
+        
+        .flow-step:last-child::after {
+            content: '';
+        }
+        
+        .progress-indicator {
+            background: rgba(255,255,255,0.2);
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        
+        .progress-bar {
+            background: rgba(255,255,255,0.3);
+            height: 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+        
+        .progress-fill {
+            background: white;
+            height: 100%;
+            transition: width 0.3s;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📱 ReadMe Home 화면 사용 시뮬레이션</h1>
+            <p>시나리오를 클릭하여 화면 동작을 확인하세요</p>
+        </header>
+        
+        <div class="main-content">
+            <!-- 왼쪽: 시나리오 선택 -->
+            <div>
+                <div class="scenario-panel">
+                    <div class="progress-indicator">
+                        <div style="color: white; font-weight: 600; margin-bottom: 5px;">
+                            시나리오 진행도
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+                        </div>
+                        <div style="color: white; font-size: 14px; margin-top: 8px;">
+                            <span id="currentStep">0</span> / <span id="totalSteps">9</span>
+                        </div>
+                    </div>
+                    
+                    <h2 style="margin-bottom: 20px; color: #667eea;">📋 시나리오 목록</h2>
+                    <div class="scenario-list">
+                        <div class="scenario-item" onclick="showScenario('initial')">
+                            <div class="step-number">1</div>
+                            <h3>🏠 첫 실행 화면</h3>
+                            <p>파일이 없는 초기 상태</p>
+                        </div>
+                        
+                        <div class="scenario-item" onclick="showScenario('addFile')">
+                            <div class="step-number">2</div>
+                            <h3>➕ 파일 추가하기</h3>
+                            <p>플로팅 버튼으로 새 파일 추가</p>
+                        </div>
+                        
+                        <div class="scenario-item" onclick="showScenario('fileAdded')">
+                            <div class="step-number">3</div>
+                            <h3>✅ 파일 추가 완료</h3>
+                            <p>파일 목록에 새 파일 표시</p>
+                        </div>
+                        
+                        <div class="scenario-item" onclick="showScenario('fileClick')">
+                            <div class="step-number">4</div>
+                            <h3>📖 파일 클릭 (처음 읽기)</h3>
+                            <p>진행도 0 → Reader로 바로 이동</p>
+                        </div>
+                        
+                        <div class="scenario-item" onclick="showScenario('continueReading')">
+                            <div class="step-number">5</div>
+                            <h3>📚 이어읽기 모달</h3>
+                            <p>진행도 있을 때 미리보기 표시</p>
+                        </div>
+                        
+                        <div class="scenario-item" onclick="showScenario('fileLongPress')">
+                            <div class="step-number">6</div>
+                            <h3>✏️ 파일 편집 (롱프레스)</h3>
+                            <p>제목, 평점, 리뷰 수정</p>
+                        </div>
+                        
+                        <div class="scenario-item" onclick="showScenario('createFolder')">
+                            <div class="step-number">7</div>
+                            <h3>📁 폴더 생성</h3>
+                            <p>새 폴더 만들기</p>
+                        </div>
+                        
+                        <div class="scenario-item" onclick="showScenario('fileOptions')">
+                            <div class="step-number">8</div>
+                            <h3>⚙️ 파일 옵션</h3>
+                            <p>파일 이동 또는 삭제</p>
+                        </div>
+                        
+                        <div class="scenario-item" onclick="showScenario('search')">
+                            <div class="step-number">9</div>
+                            <h3>🔍 파일 검색</h3>
+                            <p>검색어로 파일 필터링</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 플로우 다이어그램 -->
+                <div class="flow-diagram" id="flowDiagram">
+                    <h2>📊 현재 시나리오 흐름</h2>
+                    <div id="flowSteps"></div>
+                </div>
+            </div>
+            
+            <!-- 오른쪽: 폰 목업 -->
+            <div class="phone-mockup">
+                <div class="screen" id="screen">
+                    <!-- 상단 상태바 -->
+                    <div class="status-bar">
+                        <span>9:41</span>
+                        <span>📶 📡 🔋</span>
+                    </div>
+                    
+                    <!-- 화면 컨텐츠 -->
+                    <div class="screen-content" id="screenContent">
+                        <!-- 동적으로 변경됨 -->
+                    </div>
+                    
+                    <!-- 하단 네비게이션 -->
+                    <div class="bottom-nav">
+                        <div class="bottom-nav-item">
+                            <div class="icon">❤️</div>
+                            <div>추천</div>
+                        </div>
+                        <div class="bottom-nav-item">
+                            <div class="icon">📊</div>
+                            <div>랭킹</div>
+                        </div>
+                        <div class="bottom-nav-item active">
+                            <div class="icon">🏠</div>
+                            <div>홈</div>
+                        </div>
+                        <div class="bottom-nav-item">
+                            <div class="icon">🕐</div>
+                            <div>히스토리</div>
+                        </div>
+                        <div class="bottom-nav-item">
+                            <div class="icon">⚙️</div>
+                            <div>설정</div>
+                        </div>
+                    </div>
+                    
+                    <!-- 모달 오버레이 -->
+                    <div class="modal-overlay" id="modalOverlay"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const scenarios = {
+            initial: {
+                title: '첫 실행 화면',
+                step: 1,
+                flow: [
+                    '앱 실행',
+                    '서버에서 파일 목록 조회 (GET /files)',
+                    '서버에서 폴더 목록 조회 (GET /folders)',
+                    'files.length === 0 확인',
+                    '빈 화면 메시지 표시'
+                ],
+                content: `
+                    <div class="screen-title">Home</div>
+                    <div class="search-bar">🔍 검색</div>
+                    <div class="folder-scroll"></div>
+                    <div class="folder-menu">
+                        <span>폴더생성</span>
+                        <span>정렬</span>
+                        <span>편집</span>
+                    </div>
+                    <div class="empty-state">
+                        <div class="icon">📚</div>
+                        <p>파일이 없습니다.<br>+ 버튼으로 파일을 추가하세요!</p>
+                    </div>
+                    <div class="fab" onclick="showScenario('addFile')">+</div>
+                `
+            },
+            
+            addFile: {
+                title: '파일 추가하기',
+                step: 2,
+                flow: [
+                    '플로팅 버튼(+) 클릭',
+                    'DocumentPicker 실행',
+                    'TXT 또는 EPUB 파일 선택',
+                    '서버 API로 중복 체크 (GET /files/check)',
+                    '중복 없음 확인',
+                    'addFileToSystem() 실행'
+                ],
+                content: `
+                    <div class="screen-title">Home</div>
+                    <div class="search-bar">🔍 검색</div>
+                    <div class="folder-scroll"></div>
+                    <div class="folder-menu">
+                        <span>폴더생성</span>
+                        <span>정렬</span>
+                        <span>편집</span>
+                    </div>
+                    <div class="empty-state">
+                        <div class="icon">📂</div>
+                        <p style="color: #667eea; font-weight: 600;">파일 선택 중...</p>
+                    </div>
+                    <div class="fab" style="background: #764ba2;">+</div>
+                `,
+                modal: `
+                    <div class="modal">
+                        <h3>📄 파일 선택</h3>
+                        <div style="padding: 20px; text-align: center; color: #666;">
+                            <p style="margin-bottom: 15px;">지원 형식: TXT, EPUB</p>
+                            <div style="display: flex; flex-direction: column; gap: 10px;">
+                                <div style="padding: 15px; background: #f8f9fa; border-radius: 8px; cursor: pointer;" onclick="showScenario('fileAdded')">
+                                    📘 sample-book.txt
+                                </div>
+                                <div style="padding: 15px; background: #f8f9fa; border-radius: 8px; cursor: pointer;">
+                                    📗 novel.epub
+                                </div>
+                            </div>
+                        </div>
+                        <div class="modal-buttons">
+                            <button class="modal-button secondary" onclick="hideModal()">취소</button>
+                        </div>
+                    </div>
+                `
+            },
+            
+            fileAdded: {
+                title: '파일 추가 완료',
+                step: 3,
+                flow: [
+                    '파일을 앱 폴더로 복사',
+                    '인코딩 자동 감지 (decodeTextSafe)',
+                    '미리보기 텍스트 추출 (100자)',
+                    '서버에 파일 정보 저장 (POST /files)',
+                    '로컬 상태 업데이트 (setFiles)',
+                    '화면에 파일 카드 표시'
+                ],
+                content: `
+                    <div class="screen-title">Home</div>
+                    <div class="search-bar">🔍 검색</div>
+                    <div class="folder-scroll"></div>
+                    <div class="folder-menu">
+                        <span>폴더생성</span>
+                        <span>정렬</span>
+                        <span>편집</span>
+                    </div>
+                    <div class="file-card" onclick="showScenario('fileClick')">
+                        <span class="options">⋮</span>
+                        <h3>📘 sample-book.txt</h3>
+                        <p>옛날 옛적에 한 마을에 착한 소년이 살았습니다. 그는 매일 책을 읽으며 지혜를 쌓았고...</p>
+                        <div class="meta">
+                            <span>⭐ 0.0</span>
+                            <span>2026-01-29</span>
+                            <span>0%</span>
+                        </div>
+                    </div>
+                    <div class="fab">+</div>
+                `
+            },
+            
+            fileClick: {
+                title: '파일 클릭 (처음 읽기)',
+                step: 4,
+                flow: [
+                    'FileCard 클릭',
+                    'handleFilePress() 실행',
+                    '서버에서 파일 정보 조회 (GET /files/{id})',
+                    'progress === 0 확인',
+                    'router.push("/reader") 실행',
+                    'Reader 화면으로 이동'
+                ],
+                content: `
+                    <div class="screen-title">Home</div>
+                    <div class="search-bar">🔍 검색</div>
+                    <div class="folder-scroll"></div>
+                    <div class="folder-menu">
+                        <span>폴더생성</span>
+                        <span>정렬</span>
+                        <span>편집</span>
+                    </div>
+                    <div class="file-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;">
+                        <span class="options" style="color: white;">⋮</span>
+                        <h3 style="color: white;">📘 sample-book.txt</h3>
+                        <p style="color: rgba(255,255,255,0.9);">옛날 옛적에 한 마을에 착한 소년이 살았습니다. 그는 매일 책을 읽으며 지혜를 쌓았고...</p>
+                        <div class="meta" style="color: rgba(255,255,255,0.8);">
+                            <span>⭐ 0.0</span>
+                            <span>2026-01-29</span>
+                            <span>0%</span>
+                        </div>
+                    </div>
+                    <div style="text-align: center; padding: 40px 20px; color: #667eea; font-weight: 600;">
+                        → Reader 화면으로 이동 중...
+                    </div>
+                    <div class="fab">+</div>
+                `
+            },
+            
+            continueReading: {
+                title: '이어읽기 모달',
+                step: 5,
+                flow: [
+                    'FileCard 클릭 (이미 읽은 파일)',
+                    'handleFilePress() 실행',
+                    '서버에서 파일 정보 조회 (GET /files/{id})',
+                    'progress > 0 확인',
+                    '파일 내용 읽기 및 현재 위치 추출',
+                    'PreviewModal 표시'
+                ],
+                content: `
+                    <div class="screen-title">Home</div>
+                    <div class="search-bar">🔍 검색</div>
+                    <div class="folder-scroll"></div>
+                    <div class="folder-menu">
+                        <span>폴더생성</span>
+                        <span>정렬</span>
+                        <span>편집</span>
+                    </div>
+                    <div class="file-card">
+                        <span class="options">⋮</span>
+                        <h3>📘 sample-book.txt</h3>
+                        <p>옛날 옛적에 한 마을에 착한 소년이 살았습니다. 그는 매일 책을 읽으며 지혜를 쌓았고...</p>
+                        <div class="meta">
+                            <span>⭐ 4.5</span>
+                            <span>2026-01-29</span>
+                            <span style="color: #667eea; font-weight: 600;">35%</span>
+                        </div>
+                    </div>
+                    <div class="fab">+</div>
+                `,
+                modal: `
+                    <div class="modal">
+                        <h3>📖 이어읽기</h3>
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                            <div style="font-size: 12px; color: #999; margin-bottom: 8px;">마지막 읽은 위치 (35%)</div>
+                            <p style="font-size: 13px; color: #666; line-height: 1.6;">
+                                ...소년은 마을 사람들을 도우며 행복한 나날을 보냈습니다. 어느 날 마을에 큰 문제가 생겼는데...
+                            </p>
+                        </div>
+                        <div class="modal-buttons">
+                            <button class="modal-button secondary" onclick="hideModal()">처음부터</button>
+                            <button class="modal-button primary" onclick="hideModal()">이어서</button>
+                        </div>
+                    </div>
+                `
+            },
+            
+            fileLongPress: {
+                title: '파일 편집 (롱프레스)',
+                step: 6,
+                flow: [
+                    'FileCard 롱프레스',
+                    'handleLongPress() 실행',
+                    'selectedFile 설정',
+                    'EditModal 표시',
+                    '제목/평점/리뷰 수정',
+                    '서버에 변경사항 저장 (PATCH /files/{id})'
+                ],
+                content: `
+                    <div class="screen-title">Home</div>
+                    <div class="search-bar">🔍 검색</div>
+                    <div class="folder-scroll"></div>
+                    <div class="folder-menu">
+                        <span>폴더생성</span>
+                        <span>정렬</span>
+                        <span>편집</span>
+                    </div>
+                    <div class="file-card" style="border: 2px solid #667eea;">
+                        <span class="options">⋮</span>
+                        <h3>📘 sample-book.txt</h3>
+                        <p>옛날 옛적에 한 마을에 착한 소년이 살았습니다. 그는 매일 책을 읽으며 지혜를 쌓았고...</p>
+                        <div class="meta">
+                            <span>⭐ 4.5</span>
+                            <span>2026-01-29</span>
+                            <span>35%</span>
+                        </div>
+                    </div>
+                    <div class="fab">+</div>
+                `,
+                modal: `
+                    <div class="modal">
+                        <h3>✏️ 파일 편집</h3>
+                        <input type="text" placeholder="제목" value="sample-book.txt">
+                        <div style="margin-bottom: 15px;">
+                            <div style="font-size: 14px; color: #666; margin-bottom: 8px;">평점</div>
+                            <div style="font-size: 24px; color: #ffc107;">⭐⭐⭐⭐☆ (4.5)</div>
+                        </div>
+                        <textarea style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; resize: vertical; font-family: inherit; font-size: 14px; min-height: 80px;" placeholder="리뷰를 입력하세요">재미있게 읽고 있습니다!</textarea>
+                        <div class="modal-buttons" style="margin-top: 15px;">
+                            <button class="modal-button secondary" onclick="hideModal()">취소</button>
+                            <button class="modal-button primary" onclick="hideModal()">저장</button>
+                        </div>
+                    </div>
+                `
+            },
+            
+            createFolder: {
+                title: '폴더 생성',
+                step: 7,
+                flow: [
+                    '"폴더생성" 버튼 클릭',
+                    'setFolderModal(true)',
+                    'CreateFolderModal 표시',
+                    '폴더 이름 입력',
+                    '서버에 폴더 저장 (POST /folders)',
+                    '로컬 상태 업데이트 (setFolders)',
+                    '폴더 스크롤에 새 폴더 표시'
+                ],
+                content: `
+                    <div class="screen-title">Home</div>
+                    <div class="search-bar">🔍 검색</div>
+                    <div class="folder-scroll">
+                        <div class="folder-item">📁 소설</div>
+                        <div class="folder-item">📁 에세이</div>
+                    </div>
+                    <div class="folder-menu">
+                        <span style="color: #764ba2; font-weight: 600;">폴더생성</span>
+                        <span>정렬</span>
+                        <span>편집</span>
+                    </div>
+                    <div class="file-card">
+                        <span class="options">⋮</span>
+                        <h3>📘 sample-book.txt</h3>
+                        <p>옛날 옛적에 한 마을에 착한 소년이 살았습니다...</p>
+                        <div class="meta">
+                            <span>⭐ 4.5</span>
+                            <span>2026-01-29</span>
+                            <span>35%</span>
+                        </div>
+                    </div>
+                    <div class="fab">+</div>
+                `,
+                modal: `
+                    <div class="modal">
+                        <h3>📁 새 폴더</h3>
+                        <input type="text" placeholder="폴더 이름을 입력하세요" value="시">
+                        <div class="modal-buttons">
+                            <button class="modal-button secondary" onclick="hideModal()">취소</button>
+                            <button class="modal-button primary" onclick="hideModal()">생성</button>
+                        </div>
+                    </div>
+                `
+            },
+            
+            fileOptions: {
+                title: '파일 옵션',
+                step: 8,
+                flow: [
+                    'FileCard 옵션 버튼(⋮) 클릭',
+                    'setFileOptionsVisible(true)',
+                    'FileOptionsModal 표시',
+                    '이동 또는 삭제 선택',
+                    '이동: FileMoveModal 표시',
+                    '삭제: 로컬 상태에서 제거'
+                ],
+                content: `
+                    <div class="screen-title">Home</div>
+                    <div class="search-bar">🔍 검색</div>
+                    <div class="folder-scroll">
+                        <div class="folder-item">📁 소설</div>
+                        <div class="folder-item">📁 에세이</div>
+                        <div class="folder-item">📁 시</div>
+                    </div>
+                    <div class="folder-menu">
+                        <span>폴더생성</span>
+                        <span>정렬</span>
+                        <span>편집</span>
+                    </div>
+                    <div class="file-card" style="border: 2px solid #667eea;">
+                        <span class="options" style="color: #667eea; font-weight: 600;">⋮</span>
+                        <h3>📘 sample-book.txt</h3>
+                        <p>옛날 옛적에 한 마을에 착한 소년이 살았습니다...</p>
+                        <div class="meta">
+                            <span>⭐ 4.5</span>
+                            <span>2026-01-29</span>
+                            <span>35%</span>
+                        </div>
+                    </div>
+                    <div class="fab">+</div>
+                `,
+                modal: `
+                    <div class="modal">
+                        <h3>⚙️ 파일 옵션</h3>
+                        <div style="display: flex; flex-direction: column; gap: 12px;">
+                            <button class="modal-button primary" style="width: 100%;" onclick="hideModal()">
+                                📁 다른 폴더로 이동
+                            </button>
+                            <button class="modal-button" style="width: 100%; background: #dc3545; color: white;" onclick="hideModal()">
+                                🗑️ 삭제
+                            </button>
+                            <button class="modal-button secondary" style="width: 100%;" onclick="hideModal()">
+                                취소
+                            </button>
+                        </div>
+                    </div>
+                `
+            },
+            
+            search: {
+                title: '파일 검색',
+                step: 9,
+                flow: [
+                    '검색창에 텍스트 입력',
+                    'setSearch(value) 실행',
+                    'useMemo로 filteredFiles 재계산',
+                    '제목에 검색어 포함된 파일만 필터링',
+                    'displayCount 초기화 (10개)',
+                    '필터링된 파일 목록 표시'
+                ],
+                content: `
+                    <div class="screen-title">Home</div>
+                    <div class="search-bar" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; font-weight: 600;">
+                        🔍 소년
+                    </div>
+                    <div class="folder-scroll">
+                        <div class="folder-item">📁 소설</div>
+                        <div class="folder-item">📁 에세이</div>
+                        <div class="folder-item">📁 시</div>
+                    </div>
+                    <div class="folder-menu">
+                        <span>폴더생성</span>
+                        <span>정렬</span>
+                        <span>편집</span>
+                    </div>
+                    <div style="padding: 10px 0; color: #667eea; font-size: 14px; font-weight: 600;">
+                        검색 결과: 1개
+                    </div>
+                    <div class="file-card">
+                        <span class="options">⋮</span>
+                        <h3>📘 sample-book.txt</h3>
+                        <p style="background: #fff3cd; padding: 2px 4px; border-radius: 3px; display: inline;">
+                            옛날 옛적에 한 마을에 착한 <strong style="color: #667eea;">소년</strong>이 살았습니다...
+                        </p>
+                        <div class="meta">
+                            <span>⭐ 4.5</span>
+                            <span>2026-01-29</span>
+                            <span>35%</span>
+                        </div>
+                    </div>
+                    <div class="fab">+</div>
+                `
+            }
+        };
+        
+        let currentScenario = 'initial';
+        const totalSteps = Object.keys(scenarios).length;
+        
+        function showScenario(scenarioKey) {
+            currentScenario = scenarioKey;
+            const scenario = scenarios[scenarioKey];
+            
+            // 화면 컨텐츠 업데이트
+            document.getElementById('screenContent').innerHTML = scenario.content;
+            
+            // 모달이 있으면 표시
+            const modalOverlay = document.getElementById('modalOverlay');
+            if (scenario.modal) {
+                modalOverlay.innerHTML = scenario.modal;
+                modalOverlay.classList.add('show');
+            } else {
+                modalOverlay.classList.remove('show');
+            }
+            
+            // 플로우 다이어그램 업데이트
+            const flowSteps = document.getElementById('flowSteps');
+            flowSteps.innerHTML = scenario.flow.map((step, index) => 
+                `<div class="flow-step ${index === scenario.flow.length - 1 ? 'current' : ''}">${index + 1}. ${step}</div>`
+            ).join('');
+            
+            // 시나리오 아이템 활성화
+            document.querySelectorAll('.scenario-item').forEach((item, index) => {
+                if (index + 1 === scenario.step) {
+                    item.classList.add('active');
+                } else {
+                    item.classList.remove('active');
+                }
+            });
+            
+            // 진행도 업데이트
+            const progress = (scenario.step / totalSteps) * 100;
+            document.getElementById('progressFill').style.width = progress + '%';
+            document.getElementById('currentStep').textContent = scenario.step;
+            document.getElementById('totalSteps').textContent = totalSteps;
+            
+            // 스크롤을 화면 상단으로
+            document.getElementById('screenContent').scrollTop = 0;
+        }
+        
+        function hideModal() {
+            document.getElementById('modalOverlay').classList.remove('show');
+        }
+        
+        // 초기 시나리오 표시
+        showScenario('initial');
+    </script>
+</body>
+</html>

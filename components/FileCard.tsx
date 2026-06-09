@@ -1,6 +1,9 @@
 import { FontAwesome5, Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { GestureResponderEvent, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+// 아이콘
+import { MaterialCommunityIcons } from "@expo/vector-icons";
+import { formatDisplayDate } from "@/utils/date";
 
 export type FileItem = {
   id: string;
@@ -11,16 +14,20 @@ export type FileItem = {
   uri: string;
   path: string;
   review: string;
+  aiSummary?: string | null;
 };
 
 type FileCardProps = {
   item: FileItem;
+  isSelectMode?: boolean;
+  isSelected?: boolean;
   onPress?: (file: FileItem) => void;
   onLongPress?: (event: GestureResponderEvent) => void;
   onOptionsPress?: (file: FileItem) => void;
+  onAiPress?: (file: FileItem) => void;
 };
 
-export default function FileCard({ item, onPress, onLongPress, onOptionsPress }: FileCardProps ) {
+export default function FileCard({ item, isSelectMode, isSelected, onPress, onLongPress, onOptionsPress, onAiPress }: FileCardProps ) {
   if (!item) return null;
   if (!item.title) return null;
 
@@ -35,25 +42,44 @@ export default function FileCard({ item, onPress, onLongPress, onOptionsPress }:
 
   return (
     <TouchableOpacity
-      style={styles.card}
+      style={[
+        styles.card,
+        isSelectMode && isSelected && styles.cardSelected,
+      ]}
       
       onPress={() => onPress?.(item)}
       onLongPress={onLongPress}
     >
+      {isSelectMode && (
+        <View style={{
+          position: "absolute",
+          top: 8,
+          right: 8,
+          zIndex: 10
+        }}>
+          <MaterialCommunityIcons
+            name={isSelected ? "checkbox-marked" : "checkbox-blank-outline"}
+            size={24}
+            color="#4A90E2"
+          />
+        </View>
+      )}
       {/* 제목 + 메뉴 */}
       <View style={styles.row}>
-        <Text style={styles.title} numberOfLines={1}>
+        <Text style={[styles.title, isSelectMode && styles.titleWithCheck]} numberOfLines={1}>
           {item.title}
         </Text>
 
-        <TouchableOpacity onPress={() => onOptionsPress?.(item)}>
-          <Ionicons name="ellipsis-vertical" size={18} color="#555" />
-        </TouchableOpacity>
+        {!isSelectMode && (
+          <TouchableOpacity onPress={() => onOptionsPress?.(item)}>
+            <Ionicons name="ellipsis-vertical" size={18} color="#555" />
+          </TouchableOpacity>
+        )}
       </View>
       
 
       {/* 날짜 */}
-      <Text style={styles.date}>{item.date}</Text>
+      <Text style={styles.date}>{formatDisplayDate(item.date)}</Text>
 
       {/* 경로 표시 (root가 아닐 때만) */}
       {item.path !== "root" && (
@@ -65,17 +91,39 @@ export default function FileCard({ item, onPress, onLongPress, onOptionsPress }:
         {item.preview}
       </Text>
 
-      {/* 별점 */}
-      <View style={styles.starRow}>
-        {[1, 2, 3, 4, 5].map((n) => (
-          <FontAwesome5
-            key={n}
-            name="star"
-            size={18}
-            solid={n <= item.rating}
-            color={n <= item.rating ? "#FFD84E" : "#D1D1D1"}
-          />
-        ))}
+      {/* 별점 + AI 뱃지 */}
+      <View style={[styles.starRow, { justifyContent: "space-between", alignItems: "center" }]}>
+        <View style={{ flexDirection: "row" }}>
+          {[1, 2, 3, 4, 5].map((n) => (
+            <FontAwesome5
+              key={n}
+              name="star"
+              size={18}
+              solid={n <= item.rating}
+              color={n <= item.rating ? "#FFD84E" : "#D1D1D1"}
+              style={{ marginRight: 2 }}
+            />
+          ))}
+        </View>
+
+        {!isSelectMode && (
+          <TouchableOpacity
+            onPress={() => onAiPress?.(item)}
+            style={[
+              styles.aiBadge,
+              item.aiSummary ? styles.aiBadgeActive : styles.aiBadgeInactive,
+            ]}
+          >
+            <Text
+              style={[
+                styles.aiBadgeText,
+                { color: item.aiSummary ? "#7C3AED" : "#9CA3AF" },
+              ]}
+            >
+              ✨ AI 분석{item.aiSummary ? " 보기" : ""}
+            </Text>
+          </TouchableOpacity>
+        )}
       </View>
     </TouchableOpacity>
   );
@@ -84,10 +132,18 @@ export default function FileCard({ item, onPress, onLongPress, onOptionsPress }:
 const styles = StyleSheet.create({
   card: {
     backgroundColor: "#f7f7f7",
-    borderRadius: 12,
+    borderRadius: 16,
     padding: 16,
     marginBottom: 14,
     elevation: 2,
+    borderWidth: 2,
+    borderColor: "transparent",
+  },
+
+  cardSelected: {
+    backgroundColor: "#e8f4f8",
+    borderWidth: 2,
+    borderColor: "#4A90E2",
   },
 
   row: {
@@ -101,6 +157,10 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     flex: 1,
     marginRight: 10,
+  },
+
+  titleWithCheck: {
+    marginRight: 36,
   },
 
   date: {
@@ -125,5 +185,28 @@ const styles = StyleSheet.create({
   starRow: {
     flexDirection: "row",
     marginTop: 5,
+  },
+
+  aiBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 20,
+  },
+
+  aiBadgeActive: {
+    backgroundColor: "#F5F0FF",
+    borderWidth: 1,
+    borderColor: "#C4B5FD",
+  },
+
+  aiBadgeInactive: {
+    backgroundColor: "#F3F4F6",
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+  },
+
+  aiBadgeText: {
+    fontSize: 11,
+    fontWeight: "600",
   },
 });

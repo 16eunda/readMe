@@ -15,6 +15,15 @@ export default StyleSheet.create({
     paddingRight: 8, // 오른쪽에서 약간 떨어지게
   },
 
+  folderGridContainer: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    paddingHorizontal: 20,
+    marginTop: 10,
+    marginBottom: 15,
+    justifyContent: "flex-start",
+  },
+
   centerBox: {
     flex: 1,
     justifyContent: "center",
@@ -37,13 +46,48 @@ export default StyleSheet.create({
   fabText: {
     color: "#fff",
     fontSize: 32,
-    fontWeight: "bold",
+    fontWeight: "300", // bold에서 light로 변경하여 둥글둥글하게
+    lineHeight: 60, // 버튼 높이와 동일하게 설정하여 수직 중앙 정렬
+    textAlign: "center", // 수평 중앙 정렬
+    includeFontPadding: false, // 안드로이드에서 폰트 패딩 제거
   },
 
   topArea: {
     paddingHorizontal: 20,
     paddingTop: 40,
     paddingBottom: 10
+  },
+
+  folderGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 12,
+    marginTop: 15,
+    marginBottom: 15,
+  },
+
+  folderGridItem: {
+    backgroundColor: "transparent",
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+    borderRadius: 8,
+    width: "23%",
+    marginRight: "2.66%",
+    marginBottom: 4,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  folderIcon: {
+    fontSize: 40,
+  },
+
+  folderGridText: {
+    fontSize: 12,
+    fontWeight: "600",
+    textAlign: "center",
+    marginTop: 4,
+    color: "#333",
   },
 
   folderScroll: {
@@ -67,7 +111,8 @@ export default StyleSheet.create({
   },
 
   listContent: {
-    paddingBottom: 120,        // 바텀 메뉴 가리는 것 방지
+    paddingHorizontal: 20,
+    paddingBottom: 20,
   },
 
   homeTitle: {
@@ -76,15 +121,27 @@ export default StyleSheet.create({
     marginBottom: 12,
   },
 
-  bottomMenu: {
-    position: "absolute",
-    bottom: 0,
-    width: "100%",
-    height: 60,
-    backgroundColor: "#eee",
-    flexDirection: "row",
-    justifyContent: "space-around",
-    alignItems: "center",
+  breadcrumbScroll: {
+    marginBottom: 12,
+    maxHeight: 40,
+  },
+
+  breadcrumbItem: {
+    fontSize: 14,
+    color: "#666",
+    paddingVertical: 6,
+    paddingHorizontal: 0,
+  },
+
+  breadcrumbActive: {
+    color: "#4A90E2",
+    fontWeight: "bold",
+  },
+
+  breadcrumbSeparator: {
+    fontSize: 16,
+    color: "#999",
+    marginHorizontal: 4,
   },
 
   modalBackground: {

@@ -39,11 +39,15 @@ export default function FolderRenameModal({
               borderColor: "#aaa",
               borderRadius: 6,
               padding: 8,
-              marginBottom: 12,
+              marginBottom: 4,
             }}
             value={name}
             onChangeText={onChangeName}
+            maxLength={15}
           />
+          <Text style={{ fontSize: 12, color: "#666", marginBottom: 12 }}>
+            {name.length}/15자
+          </Text>
 
           <Button title="저장" onPress={onSave} />
           <Button title="취소" onPress={onClose} />

@@ -2,9 +2,16 @@ import { Tabs } from 'expo-router';
 import React from 'react';
 
 import { HapticTab } from '@/components/haptic-tab';
-import { IconSymbol } from '@/components/ui/icon-symbol';
 import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
+
+import {
+  BarChart3,
+  Clock,
+  Heart,
+  Home,
+  Settings,
+} from "lucide-react-native";
 
 export default function TabLayout() {
   const colorScheme = useColorScheme();
@@ -20,14 +27,47 @@ export default function TabLayout() {
         name="index"
         options={{
           title: 'Home',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="house.fill" color={color} />,
+          tabBarIcon: ({ color }) => <Home size={28} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="history"
+        options={{
+          title: 'History',
+          tabBarIcon: ({ color }) => <Clock size={28} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="ranking"
+        options={{
+          title: 'Ranking',
+          tabBarIcon: ({ color }) => <BarChart3 size={28} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="recommend"
+        options={{
+          title: 'Recommend',
+          tabBarIcon: ({ color }) => <Heart size={28} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="settings"
+        options={{
+          title: 'Settings',
+          tabBarIcon: ({ color }) => <Settings size={28} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="ranking-premium"
+        options={{
+          href: null, // 탭 메뉴에서 숨김
         }}
       />
       <Tabs.Screen
         name="explore"
         options={{
-          title: 'Explore',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="paperplane.fill" color={color} />,
+          href: null, // 탭 메뉴에서 숨김
         }}
       />
     </Tabs>

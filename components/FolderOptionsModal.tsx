@@ -4,11 +4,13 @@ export default function FolderOptionsModal({
   visible,
   onClose,
   onRename,
+  onMove,
   onDelete,
 }: {
   visible: boolean;
   onClose: () => void;
   onRename: () => void;
+  onMove: () => void;
   onDelete: () => void;
 }) {
   return (
@@ -31,6 +33,10 @@ export default function FolderOptionsModal({
         >
           <TouchableOpacity onPress={onRename} style={{ padding: 14 }}>
             <Text style={{ fontSize: 16 }}>이름 변경</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity onPress={onMove} style={{ padding: 14 }}>
+            <Text style={{ fontSize: 16 }}>이동</Text>
           </TouchableOpacity>
 
           <TouchableOpacity onPress={onDelete} style={{ padding: 14 }}>

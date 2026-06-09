@@ -1,12 +1,19 @@
 // app/(tabs)/settings.tsx
-import { useEffect, useState } from "react";
+import { useFocusEffect, useRouter } from "expo-router";
+import { useCallback, useState } from "react";
 import {
-    Dimensions,
-    ScrollView,
-    StyleSheet,
-    Text,
-    View
+  Alert,
+  Dimensions,
+  SafeAreaView,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View
 } from "react-native";
+import LoginModal from "../../components/LoginModal";
+import { useUser } from "../../contexts/UserContext";
+import { BASE_URL } from "../../utils/api";
 
 type FileStats = {
   totalCount: number;
@@ -14,36 +21,141 @@ type FileStats = {
   fiveStarCount: number;
 };
 
-const [stats, setStats] = useState<FileStats | null>(null);
-const [loading, setLoading] = useState(true);
-
-useEffect(() => {
-  fetch("http://localhost:8080/files/stats")
-    .then((res) => res.json())
-    .then((data) => {
-      setStats(data);
-    })
-    .catch((err) => {
-      console.error("stats fetch error", err);
-    })
-    .finally(() => {
-      setLoading(false);
-    });
-}, []);
-
 const SCREEN_HEIGHT = Dimensions.get("window").height;
 
 export default function SettingsScreen() {
+  // 전역 상태 사용
+  const { user, deviceId, login, logout, isPremium, isLoading: userLoading } = useUser();
+  const router = useRouter();
+
+  // ========== Hooks는 컴포넌트 안에서만! ==========
+  const [stats, setStats] = useState<FileStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loginModalVisible, setLoginModalVisible] = useState(false);
+
+  const fetchStats = async () => {
+    try {
+      setLoading(true);
+      const token = user?.token;
+
+      const response = await fetch(`${BASE_URL}/files/stats`, {
+        headers: {
+          "X-Device-Id": deviceId ?? "",
+          ...(token && { Authorization: `Bearer ${token}` })
+        },
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        console.log("📊 통계 데이터:", data);
+        setStats(data);
+      } else {
+        console.error("통계 조회 실패:", response.status);
+      }
+    } catch (err) {
+      console.error("stats fetch error", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // UserContext 로딩 완료 후, user 상태가 확정되면 통계 조회
+  // (토큰 재발급 완료 전에 fetchStats가 실행되는 race condition 방지)
+  useFocusEffect(
+    useCallback(() => {
+      if (!userLoading) {
+        fetchStats();
+      }
+    }, [userLoading, user])
+  );
+
+  const handleLoginSuccess = async (userId: string, username: string, token: string) => {
+    await login(userId, username, token);
+    setLoginModalVisible(false);
+    fetchStats(); // 로그인 후 통계 새로고침
+  };
+
+  const handleLogout = async () => {
+    await logout();
+  };
+
+  const handleWithdraw = () => {
+    // 1단계: 탈퇴 의사 확인
+    Alert.alert(
+      "회원 탈퇴",
+      "정말로 탈퇴하시겠어요?\n\n탈퇴 시 모든 데이터가 삭제되며\n복구가 불가능합니다.",
+      [
+        { text: "취소", style: "cancel" },
+        {
+          text: "탈퇴하기",
+          style: "destructive",
+          onPress: () => {
+            // 2단계: 최종 확인
+            Alert.alert(
+              "마지막 확인",
+              "정말 탈퇴하시겠어요?\n모든 책 기록, 별점, 읽기 기록이\n영구적으로 삭제됩니다.",
+              [
+                { text: "취소", style: "cancel" },
+                {
+                  text: "네, 탈퇴합니다",
+                  style: "destructive",
+                  onPress: withdrawAccount,
+                },
+              ]
+            );
+          },
+        },
+      ]
+    );
+  };
+
+  // 실제 탈퇴 처리 함수
+  const withdrawAccount = async () => {
+    try {
+      const token = user?.token;
+
+      const res = await fetch(`${BASE_URL}/auth/user/me`, {
+        method: "DELETE",
+        headers: {
+          "X-Device-Id": deviceId ?? "",
+          ...(token && { Authorization: `Bearer ${token}` }),
+        },
+      });
+
+      if (res.ok) {
+        await logout();
+        Alert.alert("탈퇴 완료", "그동안 이용해 주셔서 감사합니다.");
+      } else {
+        const err = await res.text();
+        Alert.alert("탈퇴 실패", "오류가 발생했습니다. 잠시 후 다시 시도해주세요.");
+        console.error("탈퇴 실패:", res.status, err);
+      }
+    } catch (e) {
+      Alert.alert("탈퇴 실패", "네트워크 오류가 발생했습니다.");
+      console.error("탈퇴 오류:", e);
+    }
+  };
   return (
-    <ScrollView
-      style={styles.container}
-      contentContainerStyle={styles.content}
-      showsVerticalScrollIndicator={false}
-    >
+    <SafeAreaView style={styles.container}>
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.content}
+        showsVerticalScrollIndicator={false}
+      >
       {/* 프로필 */}
       <View style={styles.profileSection}>
         <View style={styles.avatar} />
-        <Text style={styles.nickname}>나는야 독서왕</Text>
+        <Text style={styles.nickname}>
+          {user ? user.username : "게스트"}
+        </Text>
+        {!user && (
+          <TouchableOpacity 
+            style={styles.loginButton}
+            onPress={() => setLoginModalVisible(true)}
+          >
+            <Text style={styles.loginButtonText}>로그인 / 회원가입</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       {/* 통계 */}
@@ -63,6 +175,28 @@ export default function SettingsScreen() {
         />
       </View>
 
+      {/* 구독 배너 */}
+      <TouchableOpacity
+        style={isPremium ? styles.premiumBanner : styles.freeBanner}
+        onPress={() => router.push('/subscription')}
+        activeOpacity={0.8}
+      >
+        <View style={styles.bannerLeft}>
+          <Text style={styles.bannerEmoji}>{isPremium ? '👑' : '⭐'}</Text>
+          <View>
+            <Text style={[styles.bannerTitle, isPremium && styles.bannerTitlePremium]}>
+              {isPremium ? 'readMe 프리미엄' : 'readMe 무료 플랜'}
+            </Text>
+            <Text style={styles.bannerSub}>
+              {isPremium
+                ? '모든 기능을 이용 중이에요!'
+                : 'AI 추천 등 프리미엄 기능 이용하기'}
+            </Text>
+          </View>
+        </View>
+        <Text style={[styles.bannerChevron, isPremium && styles.bannerChevronPremium]}>›</Text>
+      </TouchableOpacity>
+
       {/* 오늘의 명언 */}
       <View style={styles.quoteSection}>
         <Text style={styles.quoteTitle}>오늘의 명언</Text>
@@ -77,7 +211,29 @@ export default function SettingsScreen() {
           </View>
         </View>
       </View>
-    </ScrollView>
+
+
+      {/* 로그아웃 + 회원탈퇴 가로 배치 - 로그인 상태일 때만 */}
+      {user && (
+        <View style={styles.accountActions}>
+          <TouchableOpacity style={styles.logoutButton} onPress={handleLogout}>
+            <Text style={styles.logoutText}>로그아웃</Text>
+          </TouchableOpacity>
+          <View style={styles.accountDivider} />
+          <TouchableOpacity style={styles.withdrawButton} onPress={handleWithdraw}>
+            <Text style={styles.withdrawText}>회원탈퇴</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+      </ScrollView>
+
+      {/* 로그인 모달 */}
+      <LoginModal
+        visible={loginModalVisible}
+        onClose={() => setLoginModalVisible(false)}
+        onLoginSuccess={handleLoginSuccess}
+      />
+    </SafeAreaView>
   );
 }
 
@@ -98,9 +254,14 @@ const styles = StyleSheet.create({
     backgroundColor: "#fff",
   },
 
+  scroll: {
+    flex: 1,
+  },
+
   content: {
-    flexGrow: 1,
     padding: 20,
+    paddingTop: 30,
+    paddingBottom: 40,
   },
 
   profileSection: {
@@ -118,6 +279,21 @@ const styles = StyleSheet.create({
 
   nickname: {
     fontSize: 16,
+    fontWeight: "600",
+    marginBottom: 8,
+  },
+
+  loginButton: {
+    backgroundColor: "#4A90E2",
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 20,
+    marginTop: 8,
+  },
+
+  loginButtonText: {
+    color: "#fff",
+    fontSize: 14,
     fontWeight: "600",
   },
 
@@ -142,7 +318,6 @@ const styles = StyleSheet.create({
   },
 
   quoteSection: {
-    flexGrow: 1,
     marginTop: 16,
   },
 
@@ -153,16 +328,16 @@ const styles = StyleSheet.create({
   },
 
   quoteCard: {
-    minHeight: SCREEN_HEIGHT * 0.45,
     backgroundColor: "#e0e0e0",
     borderRadius: 12,
+    minHeight: 160,
   },
 
   quoteInner: {
-    flex: 1,
-    justifyContent: "center",   // 세로 중앙
-    alignItems: "center",       // 가로 중앙
-    padding: 20,
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 28,
+    minHeight: 160,
   },
 
   quoteAuthor: {
@@ -185,14 +360,74 @@ const styles = StyleSheet.create({
     color: "#333",
   },
 
-  logoutButton: {
+  // ── 구독 배너 ──
+  freeBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#F7F7F7',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#E5E5E5',
+  },
+  premiumBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#FAF5FF',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#E8DCFF',
+  },
+  bannerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    gap: 12,
+  },
+  bannerEmoji: { fontSize: 28 },
+  bannerTitle: { fontSize: 14, fontWeight: '700', color: '#333' },
+  bannerTitlePremium: { color: '#7C3AED' },
+  bannerSub: { fontSize: 12, color: '#888', marginTop: 2 },
+  bannerChevron: { fontSize: 26, color: '#bbb' },
+  bannerChevronPremium: { color: '#7C3AED' },
+
+  accountActions: {
+    flexDirection: "row",
+    justifyContent: "center",
     alignItems: "center",
     marginTop: 24,
-    paddingVertical: 12,
+    paddingVertical: 8,
+  },
+
+  accountDivider: {
+    width: 1,
+    height: 14,
+    backgroundColor: "#ddd",
+    marginHorizontal: 16,
+  },
+
+  logoutButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 4,
   },
 
   logoutText: {
     color: "#555",
     fontSize: 14,
+  },
+
+  withdrawButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+  },
+
+  withdrawText: {
+    color: "#bbb",   // 연하게 숨겨놀음
+    fontSize: 12,
   },
 });
