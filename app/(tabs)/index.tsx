@@ -18,7 +18,6 @@ import {
   SafeAreaView,
   ScrollView,
   Text,
-  TextInput,
   TouchableOpacity,
   View
 } from "react-native";
@@ -140,7 +139,6 @@ export default function Home() {
   const [duplicateModalVisible, setDuplicateModalVisible] = useState(false);
   const [duplicateFileName, setDuplicateFileName] = useState("");
   const [pendingFile, setPendingFile] = useState<any>(null);
-  const [inputFileName, setInputFileName] = useState(""); // 사용자 입력 파일명 (외부 파일용)
 
   // 페이지네이션 (추가 페이지 로딩용)
   const [currentPage, setCurrentPage] = useState(0);
@@ -200,7 +198,9 @@ export default function Home() {
     : "rating,asc";
 
   // 파일 목록 (page 0, 1페이지분)
-  const filesQueryKey = ['files', currentFolder, sortParam, deviceId, user?.userId];
+  // 앱 시작 중 user가 undefined → 로그인 사용자로 확정돼도 동일 목록 캐시를 유지한다.
+  // 로그인/로그아웃 시에는 아래 userId 변경 effect에서 명시적으로 캐시를 무효화한다.
+  const filesQueryKey = ['files', currentFolder, sortParam, deviceId];
   const { data: filesData, isLoading: isInitialLoading, refetch: refetchFiles } = useQuery({
     queryKey: filesQueryKey,
     queryFn: async () => {
@@ -231,7 +231,7 @@ export default function Home() {
   });
 
   // 현재 폴더 폴더 목록
-  const foldersQueryKey = ['folders', currentFolder, deviceId, user?.userId];
+  const foldersQueryKey = ['folders', currentFolder, deviceId];
   const { data: foldersData, refetch: refetchFolders } = useQuery({
     queryKey: foldersQueryKey,
     queryFn: async () => {
@@ -256,7 +256,7 @@ export default function Home() {
   });
 
   // 전체 폴더 목록 (breadcrumb용)
-  const allFoldersQueryKey = ['allFolders', deviceId, user?.userId];
+  const allFoldersQueryKey = ['allFolders', deviceId];
   const { data: allFoldersData, refetch: refetchAllFolders } = useQuery({
     queryKey: allFoldersQueryKey,
     queryFn: async () => {
@@ -341,39 +341,46 @@ export default function Home() {
   // 초기 로드 (deviceId 준비되면 실행) - React Query enabled로 자동 처리되므로 별도 호출 불필요
   // useQuery의 enabled: !!deviceId 가 있으므로 deviceId 생기면 자동 fetch 됨
 
-  // 로그인/로그아웃 감지 → 쿼리 키에 user?.userId 포함되어 자동 재조회됨
-  // (filesQueryKey, foldersQueryKey, allFoldersQueryKey 모두 user?.userId 포함)
-  const prevUserRef = useRef<typeof user>(undefined);
+  // 로그인/로그아웃 감지: user 객체 참조가 아니라 실제 ID 변경만 감지한다.
+  const prevUserIdRef = useRef<string | number | null | undefined>(undefined);
   useEffect(() => {
-    if (prevUserRef.current === undefined) {
-      prevUserRef.current = user;
+    if (isUserLoading) return;
+
+    const nextUserId = user?.userId ?? null;
+    if (prevUserIdRef.current === undefined) {
+      prevUserIdRef.current = nextUserId;
       return;
     }
-    if (prevUserRef.current !== user && deviceId) {
+    if (prevUserIdRef.current !== nextUserId && deviceId) {
       console.log(user ? "🔐 로그인 감지 → 캐시 무효화" : "🚪 로그아웃 감지 → 캐시 무효화");
-      prevUserRef.current = user;
-      // 쿼리 키에 user?.userId가 포함되어 있어 자동으로 새 데이터 fetch
+      prevUserIdRef.current = nextUserId;
       queryClient.invalidateQueries({ queryKey: ['files'] });
       queryClient.invalidateQueries({ queryKey: ['folders'] });
       queryClient.invalidateQueries({ queryKey: ['allFolders'] });
     }
-  }, [user, deviceId]);
+  }, [user?.userId, deviceId, isUserLoading, queryClient]);
 
   // 탭/화면에 포커스될 때 - stale된 경우에만 재조회
   const lastFocusTimeRef = useRef(0);
+  const hasFocusedOnceRef = useRef(false);
   useFocusEffect(
     useCallback(() => {
-      if (!deviceId) return;
+      if (!deviceId || isUserLoading) return;
       const now = Date.now();
 
       AsyncStorage.getItem('reader_exited').then((val) => {
         if (val === '1') {
           // reader에서 돌아온 경우 → 쿨다운 무시하고 즉시 refetch
           AsyncStorage.removeItem('reader_exited');
+          hasFocusedOnceRef.current = true;
           lastFocusTimeRef.current = now;
           refetchFiles();
           refetchFolders();
           refetchAllFolders();
+        } else if (!hasFocusedOnceRef.current) {
+          // 최초 포커스는 useQuery의 enabled 자동 조회가 담당한다.
+          hasFocusedOnceRef.current = true;
+          lastFocusTimeRef.current = now;
         } else if (now - lastFocusTimeRef.current > 30_000) {
           lastFocusTimeRef.current = now;
           refetchFiles();
@@ -381,7 +388,7 @@ export default function Home() {
           refetchAllFolders();
         }
       });
-    }, [deviceId, currentFolder])
+    }, [deviceId, isUserLoading, refetchFiles, refetchFolders, refetchAllFolders])
   );
 
   // -------------------------------------------------------
@@ -393,16 +400,8 @@ export default function Home() {
     setIncomingFile(null); // 중복 처리 방지
     
     const { uri, name } = incomingFile;
-    
-    // ★ temp_ 형식의 파일명: 사용자 입력 필요
-    if (name.startsWith('temp_')) {
-      const ext = name.endsWith('.epub') ? '.epub' : '.txt';
-      setPendingFile({ uri, name });
-      setInputFileName(`imported${ext}`); // 기본값
-      return;
-    }
-    
-    // DocumentPicker로 온 파일: 바로 처리
+
+    // 외부 파일 열기에서는 사용자가 이미 파일을 선택했으므로 원본/수신 파일명으로 자동 등록
     processExternalFile({ uri, name });
   }, [incomingFile]);
   
@@ -838,7 +837,7 @@ export default function Home() {
       let preview = "";
 
       try {
-        if (displayName.endsWith(".epub")) {
+        if (displayName.toLowerCase().endsWith(".epub")) {
           console.log('📖 EPUB 미리보기 추출 중...');
           preview = await extractEpubPreview(newPath);
           console.log('✅ EPUB 미리보기 완료:', preview.slice(0, 50));
@@ -868,7 +867,7 @@ export default function Home() {
       
       // 백엔드에 보낼 파일 정보
       const folderPath = targetFolder ?? currentFolder;
-      const fileType = displayName.endsWith('.epub') ? 'EPUB' : 'TXT'; // ★ 파일 타입 추가
+      const fileType = displayName.toLowerCase().endsWith('.epub') ? 'EPUB' : 'TXT'; // ★ 파일 타입 추가
       const newFile = {
         title: title,
         type: fileType, // ★ 백엔드 필수 필드
@@ -1297,6 +1296,10 @@ export default function Home() {
   // 검색어 변경 시 displayCount 리셋 (이미 위에 useEffect로 처리됨)
   const isInitial = files.length === 0 && !search && !isInitialLoading;
   const noSearchResult = filteredFiles.length === 0 && search && !isInitialLoading;
+  const showInitialLoading =
+    isInitialLoading &&
+    filteredFiles.length === 0 &&
+    visibleFolders.length === 0;
   return (
     <SafeAreaView style={styles.container}>
        {/* 🔹 상단 전체 묶음 */}
@@ -1428,7 +1431,7 @@ export default function Home() {
     )}
 
       {/* 목록 최초 로딩 중 */}
-      {isInitialLoading && (
+      {showInitialLoading && (
         <View style={styles.centerBox}>
           <ActivityIndicator size="large" color="#4A90E2" />
           <Text style={{ color: "#888", marginTop: 12, fontSize: 14 }}>목록을 불러오는 중...</Text>
@@ -1918,78 +1921,6 @@ export default function Home() {
       }}
       onClose={() => setSortModalVisible(false)}
     />
-    
-    {/* ★ 파일명 입력 모달 (외부 파일용) */}
-    <Modal
-      transparent={true}
-      visible={!!pendingFile}
-      animationType="fade"
-      onRequestClose={() => setPendingFile(null)}
-    >
-      <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' }}>
-        <View style={{ backgroundColor: '#fff', borderRadius: 12, padding: 24, width: '85%', maxWidth: 320 }}>
-          <Text style={{ fontSize: 18, fontWeight: 'bold', marginBottom: 16, color: '#000' }}>
-            파일명을 입력하세요
-          </Text>
-          
-          <TextInput
-            style={{
-              borderWidth: 1,
-              borderColor: '#ddd',
-              borderRadius: 8,
-              padding: 12,
-              fontSize: 16,
-              marginBottom: 20,
-              color: '#000',
-            }}
-            placeholder="예: 해와달.epub"
-            placeholderTextColor="#999"
-            value={inputFileName}
-            onChangeText={setInputFileName}
-            autoFocus={true}
-          />
-          
-          <View style={{ flexDirection: 'row', gap: 12, justifyContent: 'flex-end' }}>
-            <TouchableOpacity
-              onPress={() => {
-                setPendingFile(null);
-                setInputFileName('');
-              }}
-              style={{ paddingVertical: 10, paddingHorizontal: 16 }}
-            >
-              <Text style={{ fontSize: 16, color: '#999' }}>취소</Text>
-            </TouchableOpacity>
-            
-            <TouchableOpacity
-              onPress={async () => {
-                if (!inputFileName.trim() || !pendingFile) return;
-                
-                // temp_ 파일명을 사용자 입력으로 교체
-                const file = { ...pendingFile, name: inputFileName };
-                setPendingFile(null);
-                setInputFileName('');
-                
-                const saved = await addFileToSystem(file, 'root');
-                if (saved) {
-                  router.push({
-                    pathname: '/reader',
-                    params: { fileId: saved.id, uri: saved.uri, name: saved.title, type: saved.type },
-                  });
-                }
-              }}
-              style={{ 
-                paddingVertical: 10, 
-                paddingHorizontal: 16,
-                backgroundColor: '#6C63FF',
-                borderRadius: 6,
-              }}
-            >
-              <Text style={{ fontSize: 16, color: '#fff', fontWeight: '600' }}>저장</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </View>
-    </Modal>
   </SafeAreaView>
   );
 }

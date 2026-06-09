@@ -1,6 +1,7 @@
 import { router } from 'expo-router';
 import { StyleSheet, Text, TouchableOpacity } from 'react-native';
 import StarRating from './StarRating';
+import { formatDisplayDate } from '@/utils/date';
 
 type Props = {
   id: number;
@@ -19,7 +20,7 @@ export default function HistoryCard({ id, title, date, uri, rating }: Props) {
       })
     }}>
       <Text style={styles.title}>{title}</Text>
-      <Text style={styles.date}>{date}</Text>
+      <Text style={styles.date}>{formatDisplayDate(date)}</Text>
       <StarRating rating={rating} />
     </TouchableOpacity>
   );

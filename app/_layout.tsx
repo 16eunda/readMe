@@ -10,9 +10,51 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { UserProvider, useUser } from '../contexts/UserContext';
+import { getExternalFileDisplayName } from '../modules/external-file-info/src';
 
 export const unstable_settings = {
   anchor: '(tabs)',
+};
+
+const getSupportedFileNameFromUrl = (url: string) => {
+  const decoded = decodeURIComponent(url.split('?')[0]);
+  const lastSegment = decoded.split('/').pop() || '';
+  const cleanName = lastSegment.trim();
+  return /\.(txt|epub)$/i.test(cleanName) ? cleanName : null;
+};
+
+const getFileExtensionFromUri = async (uri: string) => {
+  try {
+    const base64Start = await FileSystem.readAsStringAsync(uri, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    return base64Start.startsWith('UEsD') || base64Start.startsWith('UEs') ? '.epub' : '.txt';
+  } catch (e) {
+    const info = await FileSystem.getInfoAsync(uri).catch(() => null);
+    const fileSize = info && 'size' in info ? ((info as any).size ?? 0) : 0;
+    return fileSize > 1024 * 100 ? '.epub' : '.txt';
+  }
+};
+
+const normalizeSupportedFileName = (name: string | null | undefined, ext: string) => {
+  const cleanName = (name || '').trim().replace(/[\\/]/g, '_');
+  if (!cleanName) return null;
+  if (/\.(txt|epub)$/i.test(cleanName)) return cleanName;
+  return `${cleanName}${ext}`;
+};
+
+const makeExternalFileName = (sourceUrl: string, ext: string, displayName?: string | null) => {
+  const nativeName = normalizeSupportedFileName(displayName, ext);
+  if (nativeName) return nativeName;
+
+  const urlName = normalizeSupportedFileName(getSupportedFileNameFromUrl(sourceUrl), ext);
+  if (urlName) return urlName;
+
+  const decoded = decodeURIComponent(sourceUrl.split('?')[0]);
+  const lastSegment = decoded.split('/').pop() || '';
+  const id = lastSegment.replace(/[^a-zA-Z0-9_-]/g, '');
+  const suffix = id ? `_${id}` : `_${Date.now()}`;
+  return `external${suffix}${ext}`;
 };
 
 // UserProvider 안에서 실행되는 컴포넌트 (useUser 사용 가능)
@@ -46,15 +88,14 @@ function AppContent() {
       const isFileUrl = normalizedUrl.startsWith('file://') || normalizedUrl.startsWith('content://');
       if (!isFileUrl) return;
 
-      const decoded = decodeURIComponent(normalizedUrl);
       let name = 'unknown';
       let finalUri = '';
 
       try {
         const cacheDir = FileSystem.cacheDirectory ?? '';
         
-        if (normalizedUrl.startsWith('content://media/')) {
-          // ★ content URI (숫자 ID): 파일을 캐시로 복사 후 매직 넘버로 확장자 판별
+        if (normalizedUrl.startsWith('content://')) {
+          // content URI는 제공자에 따라 원본 파일명이 없을 수 있으므로 먼저 복사 후 타입을 판별한다.
           const tempName = 'temp_' + Date.now();
           const tempUri = cacheDir + tempName;
           
@@ -62,46 +103,28 @@ function AppContent() {
           await FileSystem.copyAsync({ from: normalizedUrl, to: tempUri });
           console.log('✅ 임시 복사 완료:', tempUri);
 
-          // 파일 크기 확인 (휴리스틱: EPUB는 일반적으로 1MB 이상)
-          const info = await FileSystem.getInfoAsync(tempUri);
-          const fileSize = (info as any).size ?? 0;
-          
-          // 첫 4바이트 확인하여 ZIP 포맷 판별 (EPUB는 ZIP)
-          let isEpub = true; // 기본값: EPUB로 판단
-          try {
-            const base64Start = await FileSystem.readAsStringAsync(tempUri, {
-              encoding: FileSystem.EncodingType.Base64,
-            });
-            // EPUB/ZIP 매직 넘버: 0x50 0x4B 0x03 0x04 → Base64 "UEsD"
-            if (base64Start.startsWith('UEsD') || base64Start.startsWith('UEs')) {
-              isEpub = true;
-              console.log('✓ ZIP 포맷(EPUB) 감지');
-            } else {
-              // 텍스트 파일: 일반적으로 0x20-0x7E (ASCII 텍스트)
-              isEpub = false;
-              console.log('✓ 텍스트 포맷 감지');
-            }
-          } catch (e) {
-            // 읽기 실패 시 파일 크기로 판단
-            isEpub = fileSize > 1024 * 100; // 100KB 이상이면 EPUB로 판단
-            console.log('⚠️ 파일 타입 판별 실패, 파일 크기로 판단:', isEpub);
-          }
-          
-          name = tempName + (isEpub ? '.epub' : '.txt');
+          const ext = await getFileExtensionFromUri(tempUri);
+          const displayName = await getExternalFileDisplayName(normalizedUrl);
+          name = makeExternalFileName(normalizedUrl, ext, displayName);
           finalUri = cacheDir + name;
           
           // 임시 파일을 최종 이름으로 이동
+          const existingInfo = await FileSystem.getInfoAsync(finalUri);
+          if (existingInfo.exists) {
+            await FileSystem.deleteAsync(finalUri, { idempotent: true });
+          }
           await FileSystem.moveAsync({ from: tempUri, to: finalUri });
           console.log('✅ 파일명 판별 완료:', name);
         } else {
           // file:// URI: 파일명 직접 추출
-          name = decoded.split('/').pop() || 'unknown';
+          const urlName = getSupportedFileNameFromUrl(normalizedUrl);
           
           // 확장자가 없거나 지원되지 않으면 거절
-          if (!name.endsWith('.txt') && !name.endsWith('.epub')) {
-            console.log('⚠️ 지원되지 않는 파일:', name);
+          if (!urlName) {
+            console.log('⚠️ 지원되지 않는 파일:', normalizedUrl);
             return;
           }
+          name = urlName;
           
           finalUri = cacheDir + name;
           

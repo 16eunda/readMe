@@ -3,6 +3,7 @@ import { useRouter } from "expo-router";
 import { GestureResponderEvent, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 // 아이콘
 import { MaterialCommunityIcons } from "@expo/vector-icons";
+import { formatDisplayDate } from "@/utils/date";
 
 export type FileItem = {
   id: string;
@@ -78,7 +79,7 @@ export default function FileCard({ item, isSelectMode, isSelected, onPress, onLo
       
 
       {/* 날짜 */}
-      <Text style={styles.date}>{item.date}</Text>
+      <Text style={styles.date}>{formatDisplayDate(item.date)}</Text>
 
       {/* 경로 표시 (root가 아닐 때만) */}
       {item.path !== "root" && (
