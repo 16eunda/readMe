@@ -3,7 +3,6 @@ import { API_BASE_URL } from "@/constants/config";
 import { FileRankingDto } from "@/types/file";
 import { getDeviceId } from "@/utils/deviceId";
 import { FontAwesome5 } from "@expo/vector-icons";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { router, useFocusEffect } from "expo-router";
 import React, { useCallback, useMemo, useState } from "react";
 import {
@@ -19,12 +18,13 @@ import {
   View,
 } from "react-native";
 import { useUser } from "../../contexts/UserContext";
+import { authenticatedFetch } from "../../utils/api";
 
 const PURPLE = "#7C3AED";
 const ITEMS_PER_PAGE = 10;
 
 export default function RankingPremiumScreen() {
-  const { isPremium, isLoading: isUserLoading } = useUser();
+  const { isLoading: isUserLoading, checkSubscription, markPremiumRequired } = useUser();
   const now = new Date();
 
   const [period, setPeriod] = useState<"한달" | "올해">("한달");
@@ -35,15 +35,6 @@ export default function RankingPremiumScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // 비프리미엄 → /subscription 리다이렉트
-  useFocusEffect(
-    useCallback(() => {
-      if (!isPremium) {
-        router.replace("/subscription" as any);
-      }
-    }, [isPremium])
-  );
 
   // 클라이언트 통계 계산
   const stats = useMemo(() => {
@@ -67,18 +58,21 @@ export default function RankingPremiumScreen() {
     if (showLoading) setLoading(true);
     setError(null);
     try {
-      const token = await AsyncStorage.getItem("accessToken");
       const deviceId = await getDeviceId();
       const endpoint =
         period === "한달"
           ? `${API_BASE_URL}/ranking/month?year=${selectedYear}&month=${selectedMonth}`
           : `${API_BASE_URL}/ranking/year?year=${selectedYear}`;
-      const response = await fetch(endpoint, {
-        headers: {
-          "X-Device-Id": deviceId,
-          ...(token && { Authorization: `Bearer ${token}` }),
-        },
-      });
+      const response = await authenticatedFetch(endpoint, {}, deviceId);
+      if (response.status === 403) {
+        const text = await response.text().catch(() => "");
+        if (text.includes("PREMIUM_REQUIRED")) {
+          await markPremiumRequired();
+          setRankings([]);
+          router.replace("/(tabs)/ranking" as any);
+          return;
+        }
+      }
       if (!response.ok) throw new Error(`서버 오류: ${response.status}`);
       const data: FileRankingDto[] = await response.json();
       setRankings(data);
@@ -95,8 +89,23 @@ export default function RankingPremiumScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      fetchRankings(); // TODO: 테스트 끝나면 → if (isPremium) fetchRankings();
-    }, [period, selectedYear, selectedMonth, isPremium, isUserLoading])
+      if (isUserLoading) return;
+      let active = true;
+      setLoading(true);
+      checkSubscription().then((premium) => {
+        if (!active) return;
+        if (!premium) {
+          setRankings([]);
+          setLoading(false);
+          router.replace("/(tabs)/ranking" as any);
+          return;
+        }
+        fetchRankings();
+      });
+      return () => {
+        active = false;
+      };
+    }, [period, selectedYear, selectedMonth, isUserLoading, checkSubscription])
   );
 
   const onRefresh = useCallback(() => {
@@ -175,6 +184,8 @@ export default function RankingPremiumScreen() {
     period === "한달" ? `${selectedYear}년 ${selectedMonth}월` : `${selectedYear}년`;
 
   const visibleRankings = rankings.slice(0, displayedItems);
+  const hasRankings = rankings.length > 0;
+  const showInitialLoading = loading && !hasRankings;
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
@@ -252,7 +263,7 @@ export default function RankingPremiumScreen() {
         )}
 
         {/* 로딩 */}
-        {loading && rankings.length === 0 && (
+        {showInitialLoading && (
           <View style={styles.centerContainer}>
             <ActivityIndicator size="large" color={PURPLE} />
             <Text style={styles.loadingText}>랭킹을 불러오는 중...</Text>
@@ -283,8 +294,7 @@ export default function RankingPremiumScreen() {
         )}
 
         {/* 랭킹 카드 */}
-        {!loading &&
-          !error &&
+        {!error &&
           visibleRankings.map((item, index) => (
             <TouchableOpacity
               key={item.fileId}

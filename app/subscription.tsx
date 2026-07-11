@@ -13,7 +13,7 @@ import {
   View,
 } from 'react-native';
 import { useUser } from '../contexts/UserContext';
-import { BASE_URL } from '../utils/api';
+import { authenticatedFetch, BASE_URL } from '../utils/api';
 
 // ✅ Google Play Console에서 등록한 구독 상품 ID와 일치해야 함
 const PRODUCT_IDS = {
@@ -87,15 +87,11 @@ export default function SubscriptionScreen() {
           try {
             if (!purchase.purchaseToken) return;
 
-            const AsyncStorage = (await import('@react-native-async-storage/async-storage')).default;
-            const token = await AsyncStorage.getItem('accessToken');
-
             // 백엔드에 구독 요청
-            const res = await fetch(`${BASE_URL}/subscriptions/subscribe`, {
+            const res = await authenticatedFetch(`${BASE_URL}/subscriptions/subscribe`, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
-                ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
               },
               body: JSON.stringify({
                 purchaseToken: purchase.purchaseToken,

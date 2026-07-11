@@ -1,4 +1,3 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -11,7 +10,7 @@ import {
   View,
 } from "react-native";
 import { useUser } from "../contexts/UserContext";
-import { BASE_URL } from "../utils/api";
+import { authenticatedFetch, BASE_URL } from "../utils/api";
 
 type AiInfo = {
   genre: string;
@@ -34,12 +33,13 @@ export default function AiAnalysisModal({
   fileTitle,
   onClose,
 }: AiAnalysisModalProps) {
-  const { isPremium, deviceId } = useUser();
+  const { isPremium, deviceId, markPremiumRequired } = useUser();
   const router = useRouter();
 
   const [loading, setLoading] = useState(false);
   const [analysis, setAnalysis] = useState<AiInfo | null>(null);
   const [failed, setFailed] = useState(false);
+  const [premiumRequired, setPremiumRequired] = useState(false);
 
   // 전체 편집 모드
   const [editing, setEditing] = useState(false);
@@ -49,32 +49,42 @@ export default function AiAnalysisModal({
   const tagInputRef = useRef<TextInput>(null);
 
   useEffect(() => {
-    if (visible && isPremium && fileId) {
+    if (visible && isPremium && !premiumRequired && fileId) {
       fetchAnalysis();
     }
     if (!visible) {
       setAnalysis(null);
       setFailed(false);
+      setPremiumRequired(false);
       setEditing(false);
       setEditedData(null);
       setNewTag("");
     }
-  }, [visible, isPremium, fileId]);
+  }, [visible, isPremium, premiumRequired, fileId]);
+
+  const showPremiumLock = !isPremium || premiumRequired;
+
+  async function handlePremiumRequired() {
+    setAnalysis(null);
+    setEditing(false);
+    setEditedData(null);
+    setFailed(false);
+    setPremiumRequired(true);
+    await markPremiumRequired();
+  }
 
   async function fetchAnalysis() {
     setLoading(true);
     setFailed(false);
     try {
-      const token = await AsyncStorage.getItem("accessToken");
-      const res = await fetch(`${BASE_URL}/files/${fileId}/ai-info`, {
-        headers: {
-          ...(token && { Authorization: `Bearer ${token}` }),
-          ...(deviceId && { "X-Device-Id": deviceId }),
-        },
-      });
+      const res = await authenticatedFetch(`${BASE_URL}/files/${fileId}/ai-info`, {}, deviceId ?? undefined);
       if (res.ok) {
         const data = await res.json();
         console.log("📊 AI 분석 결과:", data);
+        if (data.analysisStatus === "PREMIUM_REQUIRED") {
+          await handlePremiumRequired();
+          return;
+        }
         // keywords가 문자열로 오면 파싱, 없으면 빈 배열
         if (typeof data.keywords === "string") {
           console.log("🔍 keywords 문자열 감지:", data.keywords);
@@ -98,6 +108,13 @@ export default function AiAnalysisModal({
         if (!Array.isArray(data.keywords)) data.keywords = [];
         setAnalysis(data);
       } else {
+        if (res.status === 403) {
+          const text = await res.text().catch(() => "");
+          if (text.includes("PREMIUM_REQUIRED")) {
+            await handlePremiumRequired();
+            return;
+          }
+        }
         setFailed(true);
       }
     } catch {
@@ -138,16 +155,13 @@ export default function AiAnalysisModal({
     if (!fileId || !analysis || !editedData) return;
     setSaving(true);
     try {
-      const token = await AsyncStorage.getItem("accessToken");
-      const res = await fetch(`${BASE_URL}/files/${fileId}/ai-info`, {
+      const res = await authenticatedFetch(`${BASE_URL}/files/${fileId}/ai-info`, {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
-          ...(token && { Authorization: `Bearer ${token}` }),
-          ...(deviceId && { "X-Device-Id": deviceId }),
         },
         body: JSON.stringify(editedData),
-      });
+      }, deviceId ?? undefined);
       if (res.ok) {
         setAnalysis({ ...editedData });
         setEditing(false);
@@ -222,7 +236,7 @@ export default function AiAnalysisModal({
           </Text>
 
           {/* ── 비프리미엄 ── */}
-          {!isPremium && (
+          {showPremiumLock && (
             <View style={{ alignItems: "center", paddingVertical: 32 }}>
               <Text style={{ fontSize: 44, marginBottom: 14 }}>🔒</Text>
               <Text
@@ -262,7 +276,7 @@ export default function AiAnalysisModal({
           )}
 
           {/* ── 로딩 중 ── */}
-          {isPremium && loading && (
+          {!showPremiumLock && loading && (
             <View style={{ paddingVertical: 48, alignItems: "center" }}>
               <ActivityIndicator size="large" color="#7C3AED" />
               <Text style={{ marginTop: 14, color: "#888", fontSize: 14 }}>
@@ -272,7 +286,7 @@ export default function AiAnalysisModal({
           )}
 
           {/* ── 실패 ── */}
-          {isPremium && !loading && failed && (
+          {!showPremiumLock && !loading && failed && (
             <View style={{ alignItems: "center", paddingVertical: 32 }}>
               <Text style={{ fontSize: 14, color: "#999" }}>
                 분석 정보를 불러올 수 없어요.
@@ -286,7 +300,7 @@ export default function AiAnalysisModal({
           )}
 
           {/* ── 분석 결과 ── */}
-          {isPremium && !loading && data && (
+          {!showPremiumLock && !loading && data && (
             <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
 
               {/* 편집 버튼 (보기 모드) */}

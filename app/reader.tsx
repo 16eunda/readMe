@@ -23,7 +23,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
-import { BASE_URL } from "../utils/api";
+import { authenticatedFetch, BASE_URL } from "../utils/api";
 
 // 여러 인코딩 시도 방식 (효율적인 순서)
 function decodeTextSafe(buffer: Buffer): string {
@@ -115,7 +115,7 @@ const DEFAULT_SETTINGS: ReaderSettings = {
 
 const BG_PRESETS = [
   { label: "종이", bg: "#f5f0e6", text: "#000000" },
-  { label: "흰색", bg: "#ffffff", text: "#000000" },
+  { label: "흰색", bg: "#e5e5e7", text: "#000000" },
   { label: "회색", bg: "#e8e8e8", text: "#000000" },
   { label: "다크", bg: "#1c1c1e", text: "#e5e5e7" },
   { label: "초록", bg: "#c3dda8", text: "#000000" }, // #dde9cc : 연한 아라그린, #c3dda8 : 아라그린
@@ -160,6 +160,7 @@ export default function ReaderScreen() {
   const lastProgressUpdateAtRef = useRef<number>(0); // 마지막 progress 메시지 수신 시간 (최신 preview 타이밍 추적용)
   const currentScrollYRef = useRef<number>(0);
   const txtItemLayoutsRef = useRef<Record<number, TxtItemLayout>>({});
+  const recordedReadFileIdRef = useRef("");
 
   // epub 전용 base64 데이터
   const [epubBase64, setEpubBase64] = useState("");
@@ -187,6 +188,28 @@ export default function ReaderScreen() {
   // ===== 리더 설정 =====
   const [settings, setSettings] = useState<ReaderSettings>(DEFAULT_SETTINGS);
   const [showSettings, setShowSettings] = useState(false);
+
+  // 리더 진입 기록: lastReadAt/읽기 횟수는 progress 저장과 분리해 세션당 한 번만 기록한다.
+  useEffect(() => {
+    const currentFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId ?? "");
+    if (!currentFileId || recordedReadFileIdRef.current === currentFileId) return;
+
+    recordedReadFileIdRef.current = currentFileId;
+    authenticatedFetch(`${BASE_URL}/files/${encodeURIComponent(currentFileId)}/read`, {
+      method: "POST",
+    }).then(async (response) => {
+      if (response.ok) {
+        console.log("✅ 읽기 진입 기록 완료:", currentFileId);
+        return;
+      }
+      const errorText = await response.text().catch(() => "");
+      console.log("⚠️ 읽기 진입 기록 실패:", response.status, errorText.slice(0, 100));
+      recordedReadFileIdRef.current = "";
+    }).catch((error) => {
+      console.log("⚠️ 읽기 진입 기록 요청 실패:", error);
+      recordedReadFileIdRef.current = "";
+    });
+  }, [fileId]);
 
   // 설정 불러오기
   useEffect(() => {
@@ -369,7 +392,7 @@ export default function ReaderScreen() {
   const load = async () => {
     try {
       console.log("🔍 서버에서 파일 정보 불러오는 중...", fileId);
-      const res = await fetch(`${BASE_URL}/files/${fileId}`);
+      const res = await authenticatedFetch(`${BASE_URL}/files/${fileId}`);
       const fileInfo = await res.json();
       if (!active) return;
       console.log("📚 서버에서 받은 데이터:", fileInfo);
@@ -3559,8 +3582,9 @@ useEffect(() => {
       updateTxtReadingPreview(currentScrollYRef.current, currentProgress);
     }
 
-    const body: any = { 
+    const body: any = {
       progress: currentProgress,
+      // 백엔드가 같은 날 한 번만 FileReadLog를 생성하므로 랭킹용 일별 읽기 기록은 유지한다.
       recordReadLog: forceLog || currentProgress > 0,
     };
 
@@ -3582,7 +3606,7 @@ useEffect(() => {
         + "\n  preview=" + (currentReadingPreviewRef.current || '').slice(0, 40)
         + "\n  body=" + JSON.stringify(body).slice(0, 200));
       
-      const response = await fetch(`${BASE_URL}/files/${fileId}/progress`, {
+      const response = await authenticatedFetch(`${BASE_URL}/files/${fileId}/progress`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),

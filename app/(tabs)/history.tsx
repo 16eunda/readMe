@@ -1,5 +1,4 @@
 import { getDeviceId } from '@/utils/deviceId';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from 'expo-router';
 import React, { useCallback, useMemo, useState } from 'react';
 import {
@@ -16,6 +15,7 @@ import HistoryCard from '../../components/HistoryCard';
 import { API_BASE_URL } from '../../constants/config';
 import { useUser } from '../../contexts/UserContext';
 import { HistoryFile, SortOrder } from '../../types/file';
+import { authenticatedFetch } from '../../utils/api';
 
 const HistoryCardMemo = React.memo(HistoryCard);
 
@@ -31,8 +31,8 @@ export default function HistoryScreen() {
   // 정렬된 파일 목록 (rawFiles + sortOrder로 파생)
   const files = useMemo(() => {
     return [...rawFiles].sort((a, b) => {
-      const timeA = new Date(a.date).getTime();
-      const timeB = new Date(b.date).getTime();
+      const timeA = new Date(a.lastReadAt ?? a.date).getTime();
+      const timeB = new Date(b.lastReadAt ?? b.date).getTime();
       if (isNaN(timeA) || isNaN(timeB)) return 0;
       return sortOrder === 'recent' ? timeB - timeA : timeA - timeB;
     });
@@ -42,17 +42,10 @@ export default function HistoryScreen() {
     if (isUserLoading) return;
 
     try {
-      const token = await AsyncStorage.getItem("accessToken");
-      console.log('🔍 히스토리 가져오기: 토큰 존재 여부:', !!token);
       const deviceId = await getDeviceId();
       
       setError(null);
-      const res = await fetch(`${API_BASE_URL}/files/history`, {
-        headers: {
-          "X-Device-Id": deviceId,
-          ...(token && { Authorization: `Bearer ${token}` })
-        },
-      });
+      const res = await authenticatedFetch(`${API_BASE_URL}/files/history`, {}, deviceId);
       
       console.log('📥 서버 응답 상태:', res.status, res.statusText);
       
@@ -101,7 +94,7 @@ export default function HistoryScreen() {
         <Text style={styles.header}>History</Text>
         <View style={styles.centerContainer}>
           <ActivityIndicator size="large" color="#007AFF" />
-          <Text style={styles.loadingText}>Loading...</Text>
+          <Text style={styles.loadingText}>히스토리를 불러오는 중...</Text>
         </View>
       </SafeAreaView>
     );
@@ -228,4 +221,3 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 });
-

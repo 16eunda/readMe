@@ -2,8 +2,8 @@ import { FontAwesome5, Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { GestureResponderEvent, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 // 아이콘
-import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { formatDisplayDate } from "@/utils/date";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 
 export type FileItem = {
   id: string;
@@ -21,13 +21,14 @@ type FileCardProps = {
   item: FileItem;
   isSelectMode?: boolean;
   isSelected?: boolean;
+  isLocated?: boolean;
   onPress?: (file: FileItem) => void;
   onLongPress?: (event: GestureResponderEvent) => void;
   onOptionsPress?: (file: FileItem) => void;
   onAiPress?: (file: FileItem) => void;
 };
 
-export default function FileCard({ item, isSelectMode, isSelected, onPress, onLongPress, onOptionsPress, onAiPress }: FileCardProps ) {
+export default function FileCard({ item, isSelectMode, isSelected, isLocated, onPress, onLongPress, onOptionsPress, onAiPress }: FileCardProps ) {
   if (!item) return null;
   if (!item.title) return null;
 
@@ -45,6 +46,7 @@ export default function FileCard({ item, isSelectMode, isSelected, onPress, onLo
       style={[
         styles.card,
         isSelectMode && isSelected && styles.cardSelected,
+        isLocated && styles.cardLocated,
       ]}
       
       onPress={() => onPress?.(item)}
@@ -144,6 +146,11 @@ const styles = StyleSheet.create({
     backgroundColor: "#e8f4f8",
     borderWidth: 2,
     borderColor: "#4A90E2",
+  },
+
+  cardLocated: {
+    backgroundColor: "#FFF8E1",
+    borderColor: "#F5A623",
   },
 
   row: {

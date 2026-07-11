@@ -13,7 +13,7 @@ import {
 } from "react-native";
 import LoginModal from "../../components/LoginModal";
 import { useUser } from "../../contexts/UserContext";
-import { BASE_URL } from "../../utils/api";
+import { authenticatedFetch, BASE_URL } from "../../utils/api";
 
 type FileStats = {
   totalCount: number;
@@ -36,14 +36,7 @@ export default function SettingsScreen() {
   const fetchStats = async () => {
     try {
       setLoading(true);
-      const token = user?.token;
-
-      const response = await fetch(`${BASE_URL}/files/stats`, {
-        headers: {
-          "X-Device-Id": deviceId ?? "",
-          ...(token && { Authorization: `Bearer ${token}` })
-        },
-      });
+      const response = await authenticatedFetch(`${BASE_URL}/files/stats`, {}, deviceId ?? undefined);
 
       if (response.ok) {
         const data = await response.json();
@@ -112,15 +105,9 @@ export default function SettingsScreen() {
   // 실제 탈퇴 처리 함수
   const withdrawAccount = async () => {
     try {
-      const token = user?.token;
-
-      const res = await fetch(`${BASE_URL}/auth/user/me`, {
+      const res = await authenticatedFetch(`${BASE_URL}/auth/user/me`, {
         method: "DELETE",
-        headers: {
-          "X-Device-Id": deviceId ?? "",
-          ...(token && { Authorization: `Bearer ${token}` }),
-        },
-      });
+      }, deviceId ?? undefined);
 
       if (res.ok) {
         await logout();

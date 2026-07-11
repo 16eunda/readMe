@@ -1,29 +1,10 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Platform } from 'react-native';
+import { API_BASE_URL } from '../constants/config';
+import { getDeviceId } from './deviceId';
 
-const getBaseURL = () => {
-  if (Platform.OS === "web") {
-    return "http://localhost:8080";
-  } else {
-    return "https://readme-backend-2.onrender.com";
-  }
-};
+export const BASE_URL = API_BASE_URL;
 
-export const BASE_URL = getBaseURL();
-
-let isRefreshing = false;
-let refreshSubscribers: ((token: string) => void)[] = [];
-
-// 토큰 재발급 대기자 추가
-function subscribeTokenRefresh(callback: (token: string) => void) {
-  refreshSubscribers.push(callback);
-}
-
-// 재발급 완료 시 모든 대기 요청 재개
-function onTokenRefreshed(token: string) {
-  refreshSubscribers.forEach(callback => callback(token));
-  refreshSubscribers = [];
-}
+let refreshPromise: Promise<string | null> | null = null;
 
 // refreshToken으로 accessToken 재발급
 async function refreshAccessToken(): Promise<string | null> {
@@ -63,20 +44,46 @@ async function refreshAccessToken(): Promise<string | null> {
   }
 }
 
+function getRefreshedAccessToken(): Promise<string | null> {
+  if (!refreshPromise) {
+    refreshPromise = refreshAccessToken().finally(() => {
+      refreshPromise = null;
+    });
+  }
+  return refreshPromise;
+}
+
 // 인증이 필요한 API 요청 헬퍼
 export async function authenticatedFetch(
   url: string,
   options: RequestInit = {},
   deviceId?: string
 ): Promise<Response> {
-  const accessToken = await AsyncStorage.getItem('accessToken');
+  const [storedAccessToken, storedUser, resolvedDeviceId] = await Promise.all([
+    AsyncStorage.getItem('accessToken'),
+    AsyncStorage.getItem('user'),
+    deviceId ? Promise.resolve(deviceId) : getDeviceId(),
+  ]);
+  // user 정보 없이 accessToken만 남아 있는 비정상 상태에서는 비회원 요청으로 처리한다.
+  const accessToken = storedUser ? storedAccessToken : null;
+  const normalizedDeviceId = String(resolvedDeviceId || '').trim();
+  if (!normalizedDeviceId) {
+    throw new Error(`deviceId 없이 API 요청을 보낼 수 없습니다: ${url}`);
+  }
   
-  // 헤더 구성
+  // deviceId는 로그인 여부와 관계없이 항상 전송한다.
+  // 로그인 사용자는 Authorization이 함께 전송되며, 비회원은 deviceId로 식별된다.
   const headers: HeadersInit = {
     ...options.headers,
-    ...(deviceId && { 'X-Device-Id': deviceId }),
-    ...(accessToken && { 'Authorization': `Bearer ${accessToken}` })
+    'X-Device-Id': normalizedDeviceId,
+    ...(accessToken && { 'Authorization': `Bearer ${accessToken}` }),
   };
+  console.log('🌐 API 요청 식별 정보:', {
+    method: options.method ?? 'GET',
+    url,
+    deviceId: normalizedDeviceId,
+    authenticated: !!accessToken,
+  });
 
   // 첫 요청
   let response = await fetch(url, {
@@ -91,30 +98,8 @@ export async function authenticatedFetch(
 
   console.log('🔄 401 감지, 토큰 재발급 시도');
 
-  // 이미 재발급 중이면 대기
-  if (isRefreshing) {
-    return new Promise((resolve) => {
-      subscribeTokenRefresh(async (newToken: string) => {
-        // 새 토큰으로 재요청
-        const retryHeaders: HeadersInit = {
-          ...options.headers,
-          ...(deviceId && { 'X-Device-Id': deviceId }),
-          'Authorization': `Bearer ${newToken}`
-        };
-        
-        const retryResponse = await fetch(url, {
-          ...options,
-          headers: retryHeaders,
-        });
-        resolve(retryResponse);
-      });
-    });
-  }
-
-  // 재발급 시작
-  isRefreshing = true;
-  const newToken = await refreshAccessToken();
-  isRefreshing = false;
+  // 동시에 여러 요청이 401을 받아도 하나의 재발급 결과를 함께 기다린다.
+  const newToken = await getRefreshedAccessToken();
 
   if (!newToken) {
     // 재발급 실패 - 로그아웃 처리 필요 (호출자가 처리)
@@ -122,13 +107,10 @@ export async function authenticatedFetch(
     return response; // 원래 401 응답 반환
   }
 
-  // 대기 중인 요청들에게 새 토큰 전달
-  onTokenRefreshed(newToken);
-
   // 원래 요청 재시도
   const retryHeaders: HeadersInit = {
     ...options.headers,
-    ...(deviceId && { 'X-Device-Id': deviceId }),
+    'X-Device-Id': normalizedDeviceId,
     'Authorization': `Bearer ${newToken}`
   };
 
