@@ -3,7 +3,6 @@ import { API_BASE_URL } from "@/constants/config";
 import { FileRankingDto } from "@/types/file";
 import { getDeviceId } from "@/utils/deviceId";
 import { FontAwesome5 } from "@expo/vector-icons";
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { router, useFocusEffect } from 'expo-router';
 import React, { useCallback, useMemo, useState } from "react";
 import {
@@ -18,15 +17,26 @@ import {
   View,
 } from "react-native";
 import { useUser } from '../../contexts/UserContext';
+import { authenticatedFetch } from '../../utils/api';
 
 const ITEMS_PER_PAGE = 10;
 
+const formatRankingDate = (value: string) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '날짜 정보 없음';
+
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}. ${month}. ${day}`;
+};
+
 export default function RankingScreen() {
-  const { isPremium, isLoading: isUserLoading } = useUser();
+  const { isPremium, isLoading: isUserLoading, checkSubscription, markPremiumRequired } = useUser();
   const [period, setPeriod] = useState<"한달" | "올해">("한달");
   const [rankings, setRankings] = useState<FileRankingDto[]>([]);
   const [displayedItems, setDisplayedItems] = useState(ITEMS_PER_PAGE);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -52,17 +62,20 @@ export default function RankingScreen() {
     if (showLoading) setLoading(true);
     setError(null);
     try {
-      const token = await AsyncStorage.getItem("accessToken");
       const deviceId = await getDeviceId();
       const endpoint = period === "한달"
         ? `${API_BASE_URL}/ranking/month`
         : `${API_BASE_URL}/ranking/year`;
-      const response = await fetch(endpoint, {
-        headers: {
-          "X-Device-Id": deviceId,
-          ...(token && { Authorization: `Bearer ${token}` }),
-        },
-      });
+      const response = await authenticatedFetch(endpoint, {}, deviceId);
+      if (response.status === 403) {
+        const text = await response.text().catch(() => "");
+        if (text.includes("PREMIUM_REQUIRED")) {
+          await markPremiumRequired();
+          setRankings([]);
+          setError(null);
+          return;
+        }
+      }
       if (!response.ok) throw new Error(`서버 오류: ${response.status}`);
       const data: FileRankingDto[] = await response.json();
       setRankings(data);
@@ -77,14 +90,23 @@ export default function RankingScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      // 프리미엄 유저는 프리미엄 랝킹 페이지로 이동
-      if (isPremium) {
-        router.replace('/(tabs)/ranking-premium' as any);
-        return;
-      }
-      console.log('🎯 랜킹 페이지: 화면 포커스됨, period:', period);
-      fetchRankings();
-    }, [period, isPremium, isUserLoading])
+      if (isUserLoading) return;
+      let active = true;
+      setLoading(true);
+      checkSubscription().then((premium) => {
+        if (!active) return;
+        // 프리미엄 유저는 프리미엄 랭킹 페이지로 이동
+        if (premium) {
+          router.replace('/(tabs)/ranking-premium' as any);
+          return;
+        }
+        console.log('🎯 랜킹 페이지: 화면 포커스됨, period:', period);
+        fetchRankings();
+      });
+      return () => {
+        active = false;
+      };
+    }, [period, isPremium, isUserLoading, checkSubscription])
   );
 
   const onRefresh = useCallback(() => {
@@ -125,6 +147,8 @@ export default function RankingScreen() {
   };
 
   const visibleRankings = rankings.slice(0, displayedItems);
+  const hasRankings = rankings.length > 0;
+  const showInitialLoading = loading && !hasRankings;
 
   return (
     <ScrollView 
@@ -162,8 +186,26 @@ export default function RankingScreen() {
       {/* 타이틀 */}
       <Text style={styles.sectionTitle}>{getPeriodTitle()}</Text>
 
+      {/* 프리미엄 유도 배너 */}
+      {!isPremium && rankings.length > 0 && (
+        <TouchableOpacity
+          style={styles.premiumTeaser}
+          onPress={() => router.push('/subscription' as any)}
+          activeOpacity={0.8}
+        >
+          <View style={styles.teaserLeft}>
+            <Text style={styles.teaserEmoji}>📅</Text>
+            <View>
+              <Text style={styles.teaserTitle}>지난 달 / 다른 년도 랭킹도 보고 싶다면?</Text>
+              <Text style={styles.teaserSub}>프리미엄으로 모든 기간 조회 + 상세 통계</Text>
+            </View>
+          </View>
+          <Text style={styles.teaserChevron}>›</Text>
+        </TouchableOpacity>
+      )}
+
       {/* 로딩 상태 */}
-      {loading && rankings.length === 0 && (
+      {showInitialLoading && (
         <View style={styles.centerContainer}>
           <ActivityIndicator size="large" color="#007AFF" />
           <Text style={styles.loadingText}>랭킹을 불러오는 중...</Text>
@@ -192,7 +234,7 @@ export default function RankingScreen() {
       )}
 
       {/* 랭킹 카드 목록 */}
-      {!loading && !error && visibleRankings.map((item, index) => (
+      {!error && visibleRankings.map((item, index) => (
         <TouchableOpacity key={item.fileId} style={styles.card} 
         onPress={() => {
           // 파일 상세 페이지로 이동
@@ -210,7 +252,7 @@ export default function RankingScreen() {
 
             <Text style={styles.date}>
               {item.lastReadAt
-                ? new Date(item.lastReadAt).toLocaleDateString("ko-KR")
+                ? formatRankingDate(item.lastReadAt)
                 : '날짜 정보 없음'}
             </Text>
             <Text style={styles.progress}>
@@ -235,25 +277,6 @@ export default function RankingScreen() {
           </Text>
         </View>
       )}
-
-      {/* 프리미엄 유도 배너 */}
-      {!isPremium && !loading && rankings.length > 0 && (
-        <TouchableOpacity
-          style={styles.premiumTeaser}
-          onPress={() => router.push('/subscription' as any)}
-          activeOpacity={0.8}
-        >
-          <View style={styles.teaserLeft}>
-            <Text style={styles.teaserEmoji}>📅</Text>
-            <View>
-              <Text style={styles.teaserTitle}>지난 달 / 다른 년도 랭킹도 보고 싶다면?</Text>
-              <Text style={styles.teaserSub}>프리미엄으로 모든 기간 조회 + 상세 통계</Text>
-            </View>
-          </View>
-          <Text style={styles.teaserChevron}>›</Text>
-        </TouchableOpacity>
-      )}
-
 
       {visibleRankings.length > 0 && (
         <View style={styles.bottomPadding} />
@@ -419,6 +442,7 @@ const styles = StyleSheet.create({
     marginTop: 8,
     borderWidth: 1,
     borderColor: '#E8DCFF',
+    marginBottom: 18,
   },
   teaserLeft: {
     flexDirection: 'row',

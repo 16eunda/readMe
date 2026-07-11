@@ -1,7 +1,8 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { createContext, useContext, useEffect, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { AppState, AppStateStatus } from 'react-native';
 import { API_BASE_URL } from '../constants/config';
+import { authenticatedFetch } from '../utils/api';
 import { getDeviceId } from '../utils/deviceId';
 
 type User = {
@@ -24,7 +25,8 @@ type UserContextType = {
   incomingFile: IncomingFile;
   setIncomingFile: (file: IncomingFile) => void;
   isPremium: boolean;
-  checkSubscription: () => Promise<void>;
+  checkSubscription: () => Promise<boolean>;
+  markPremiumRequired: () => Promise<void>;
 };
 
 const USER_KEY = 'user';
@@ -38,7 +40,8 @@ const UserContext = createContext<UserContextType>({
   incomingFile: null,
   setIncomingFile: () => {},
   isPremium: false,
-  checkSubscription: async () => {},
+  checkSubscription: async () => false,
+  markPremiumRequired: async () => {},
 });
 
 export function UserProvider({ children }: { children: React.ReactNode }) {
@@ -57,32 +60,30 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   const [isPremium, setIsPremium] = useState(false);
 
   // 구독 상태 확인 (서버에서 최신 상태 조회)
-  const checkSubscription = async () => {
+  const markPremiumRequired = useCallback(async () => {
+    setIsPremium(false);
+    await AsyncStorage.setItem('isPremium', 'false');
+  }, []);
+
+  const checkSubscription = useCallback(async (): Promise<boolean> => {
     try {
-      const token = await AsyncStorage.getItem('accessToken');
-      if (!token) {
-        setIsPremium(false);
-        return;
-      }
-      const response = await fetch(`${API_BASE_URL}/subscriptions/status`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await authenticatedFetch(`${API_BASE_URL}/subscriptions/status`);
       if (response.ok) {
         const data = await response.json();
         const premium = data.isPremium ?? false;
         setIsPremium(premium);
         await AsyncStorage.setItem('isPremium', String(premium));
+        return premium;
       } else {
-        // API 미구현 or 오류 시 캐시 사용
-        const cached = await AsyncStorage.getItem('isPremium');
-        setIsPremium(cached === 'true');
+        // 구독 상태를 확인하지 못하면 프리미엄 기능을 닫는 쪽이 안전하다.
+        await markPremiumRequired();
+        return false;
       }
     } catch {
-      // 네트워크 오류 시 캐시 사용
-      const cached = await AsyncStorage.getItem('isPremium');
-      setIsPremium(cached === 'true');
+      await markPremiumRequired();
+      return false;
     }
-  };
+  }, [markPremiumRequired]);
 
   // 앱 시작 시 저장된 로그인 정보와 디바이스 ID 로드
   useEffect(() => {
@@ -104,46 +105,52 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
       if (!isReturningFromBackground) return;
 
       console.log('📱 백그라운드에서 복귀 - 인증 상태 복구 시도');
-      const refreshToken = await AsyncStorage.getItem('refreshToken');
-      if (refreshToken) {
-        const newAccessToken = await refreshAccessToken(refreshToken);
-        if (newAccessToken) {
-          // user state 복원: 메모리에서 날아간 경우 AsyncStorage에서 다시 읽기
-          const userData = await AsyncStorage.getItem(USER_KEY);
-          if (userData) {
-            const parsedUser = JSON.parse(userData);
-            setUserSync({ ...parsedUser, token: newAccessToken });
-            console.log('✅ 백그라운드 복귀 - 토큰 재발급 + user 상태 복원 완료');
-          } else {
-            const cur = userRef.current;
-            if (cur) setUserSync({ ...cur, token: newAccessToken });
-            console.log('✅ 백그라운드 복귀 - 토큰 재발급 완료');
-          }
-        } else {
-          // 재발급 실패 - accessToken도 없으면 로그아웃
-          const accessToken = await AsyncStorage.getItem('accessToken');
-          if (!accessToken) {
-            console.log('❌ accessToken도 없음 → 로그아웃');
-            await logout();
-          } else {
-            // accessToken이 아직 살아있으면 user state만 복원 시도
+      setIsLoading(true);
+      try {
+        const refreshToken = await AsyncStorage.getItem('refreshToken');
+        if (refreshToken) {
+          const newAccessToken = await refreshAccessToken(refreshToken);
+          if (newAccessToken) {
+            // user state 복원: 메모리에서 날아간 경우 AsyncStorage에서 다시 읽기
             const userData = await AsyncStorage.getItem(USER_KEY);
-            if (userData && !userRef.current) {
-              setUserSync(JSON.parse(userData));
-              console.log('⚠️ refreshToken 재발급 실패, 기존 accessToken + user 복원');
+            if (userData) {
+              const parsedUser = JSON.parse(userData);
+              setUserSync({ ...parsedUser, token: newAccessToken });
+              console.log('✅ 백그라운드 복귀 - 토큰 재발급 + user 상태 복원 완료');
             } else {
-              console.log('⚠️ refreshToken 재발급 실패, 기존 accessToken 유지');
+              const cur = userRef.current;
+              if (cur) setUserSync({ ...cur, token: newAccessToken });
+              console.log('✅ 백그라운드 복귀 - 토큰 재발급 완료');
+            }
+          } else {
+            // 재발급 실패 - accessToken도 없으면 로그아웃
+            const accessToken = await AsyncStorage.getItem('accessToken');
+            if (!accessToken) {
+              console.log('❌ accessToken도 없음 → 로그아웃');
+              await logout();
+            } else {
+              // accessToken이 아직 살아있으면 user state만 복원 시도
+              const userData = await AsyncStorage.getItem(USER_KEY);
+              if (userData && !userRef.current) {
+                setUserSync(JSON.parse(userData));
+                console.log('⚠️ refreshToken 재발급 실패, 기존 accessToken + user 복원');
+              } else {
+                console.log('⚠️ refreshToken 재발급 실패, 기존 accessToken 유지');
+              }
             }
           }
+        } else {
+          // refreshToken 없음 - accessToken + userData로 복원 시도
+          const accessToken = await AsyncStorage.getItem('accessToken');
+          const userData = await AsyncStorage.getItem(USER_KEY);
+          if (accessToken && userData && !userRef.current) {
+            setUserSync(JSON.parse(userData));
+            console.log('✅ 백그라운드 복귀 - refreshToken 없지만 accessToken으로 user 복원');
+          }
         }
-      } else {
-        // refreshToken 없음 - accessToken + userData로 복원 시도
-        const accessToken = await AsyncStorage.getItem('accessToken');
-        const userData = await AsyncStorage.getItem(USER_KEY);
-        if (accessToken && userData && !userRef.current) {
-          setUserSync(JSON.parse(userData));
-          console.log('✅ 백그라운드 복귀 - refreshToken 없지만 accessToken으로 user 복원');
-        }
+        await checkSubscription();
+      } finally {
+        setIsLoading(false);
       }
     });
 
@@ -279,7 +286,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <UserContext.Provider value={{ user, deviceId, login, logout, isLoading, incomingFile, setIncomingFile, isPremium, checkSubscription }}>
+    <UserContext.Provider value={{ user, deviceId, login, logout, isLoading, incomingFile, setIncomingFile, isPremium, checkSubscription, markPremiumRequired }}>
       {children}
     </UserContext.Provider>
   );

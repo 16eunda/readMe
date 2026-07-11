@@ -29,6 +29,24 @@
             ],
             "CFBundleTypeRole": "Viewer",
             "LSHandlerRank": "Alternate"
+          },
+          {
+            "CFBundleTypeName": "EPUB Document",
+            "CFBundleTypeIconFiles": [],
+            "LSItemContentTypes": [
+              "org.idpf.epub-container"
+            ],
+            "CFBundleTypeRole": "Viewer",
+            "LSHandlerRank": "Alternate"
+          },
+          {
+            "CFBundleTypeName": "Plain Text",
+            "CFBundleTypeIconFiles": [],
+            "LSItemContentTypes": [
+              "public.plain-text"
+            ],
+            "CFBundleTypeRole": "Viewer",
+            "LSHandlerRank": "Alternate"
           }
         ],
         "UTImportedTypeDeclarations": [
@@ -44,16 +62,28 @@
               ],
               "public.mime-type": "application/epub+zip"
             }
+          },
+          {
+            "UTTypeIdentifier": "org.idpf.epub-container",
+            "UTTypeDescription": "EPUB Document",
+            "UTTypeConformsTo": [
+              "public.data"
+            ],
+            "UTTypeTagSpecification": {
+              "public.filename-extension": [
+                "epub"
+              ],
+              "public.mime-type": "application/epub+zip"
+            }
           }
         ]
-      }
+      },
+      "bundleIdentifier": "com.readme.app"
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
-        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+        "backgroundColor": "#FFF7E8",
+        "foregroundImage": "./assets/images/adaptive-icon.png"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
@@ -98,9 +128,9 @@
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 200,
           "resizeMode": "contain",
-          "backgroundColor": "#ffffff",
+          "backgroundColor": "#FFF7E8",
           "dark": {
-            "backgroundColor": "#000000"
+            "backgroundColor": "#FFF7E8"
           }
         }
       ]

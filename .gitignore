@@ -31,13 +31,21 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
 .env*.local
 
 # typescript
 *.tsbuildinfo
+
+*.swp
 
 app-example
 
 # generated native folders
 /ios
 /android
+
+/docs/
+/.vscode/
+
+modules/*/android/build/

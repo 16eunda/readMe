@@ -1,7 +1,6 @@
 import { API_BASE_URL } from "@/constants/config";
 import { getDeviceId } from "@/utils/deviceId";
 import { FontAwesome5 } from "@expo/vector-icons";
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect, useRouter } from "expo-router";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -15,6 +14,7 @@ import {
   View,
 } from "react-native";
 import { useUser } from '../../contexts/UserContext';
+import { authenticatedFetch } from '../../utils/api';
 
 interface RecommendedFile {
   id: number;
@@ -50,12 +50,13 @@ function getFileIcon(title: string) {
 }
 
 export default function Recommend() {
-  const { user, isPremium, isLoading: isUserLoading } = useUser();
+  const { user, isPremium, isLoading: isUserLoading, checkSubscription, markPremiumRequired } = useUser();
   const [recommendations, setRecommendations] = useState<RecommendedFile[]>([]);
   const [loading, setLoading] = useState(false);
   const [hasRecommendations, setHasRecommendations] = useState(false);
   const [hasFetched, setHasFetched] = useState(false);
   const [loadingStep, setLoadingStep] = useState(0);
+  const [premiumRequired, setPremiumRequired] = useState(false);
   const loadingTimersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const router = useRouter();
 
@@ -72,16 +73,28 @@ export default function Recommend() {
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+  const resetToPremiumLock = async () => {
+    clearLoadingTimers();
+    setLoading(false);
+    setRecommendations([]);
+    setHasRecommendations(false);
+    setHasFetched(false);
+    setPremiumRequired(true);
+    await markPremiumRequired();
+  };
+
   const fetchRecommendations = async () => {
     if (isUserLoading) return;
     if (!user) {
       Alert.alert("로그인 필요", "AI 추천은 로그인 후 이용할 수 있어요.", [{ text: "확인" }]);
       return;
     }
-    if (!isPremium) {
+    const premium = await checkSubscription();
+    if (!premium) {
       router.push("/subscription");
       return;
     }
+    setPremiumRequired(false);
     clearLoadingTimers();
     setLoading(true);
     setHasFetched(true);
@@ -92,19 +105,23 @@ export default function Recommend() {
       setTimeout(() => setLoadingStep(2), 1600),
     );
     try {
-      const token = await AsyncStorage.getItem("accessToken");
       const deviceId = await getDeviceId();
-      const res = await fetch(`${API_BASE_URL}/recommendations`, {
-        headers: {
-          "X-Device-Id": deviceId,
-          ...(token && { Authorization: `Bearer ${token}` }),
-        },
-      });
+      const res = await authenticatedFetch(`${API_BASE_URL}/recommendations`, {}, deviceId);
       if (res.ok) {
         const data = await res.json();
+        if (data?.premiumRequired === true || data?.quality === "PREMIUM_REQUIRED") {
+          await resetToPremiumLock();
+          return;
+        }
         const list = Array.isArray(data) ? data : (data.recommendations ?? []);
         setRecommendations(list);
         setHasRecommendations(list.length > 0);
+      } else if (res.status === 403) {
+        const text = await res.text().catch(() => "");
+        if (text.includes("PREMIUM_REQUIRED")) {
+          await resetToPremiumLock();
+          return;
+        }
       }
     } catch (e) {
       console.error("추천 불러오기 실패:", e);
@@ -116,7 +133,30 @@ export default function Recommend() {
   };
 
   useEffect(() => () => clearLoadingTimers(), []);
-  useFocusEffect(useCallback(() => {}, []));
+  useFocusEffect(
+    useCallback(() => {
+      if (isUserLoading) return;
+      let active = true;
+      checkSubscription().then((premium) => {
+        if (!active) return;
+        if (!premium) {
+          clearLoadingTimers();
+          setLoading(false);
+          setRecommendations([]);
+          setHasRecommendations(false);
+          setHasFetched(false);
+          setPremiumRequired(true);
+        } else {
+          setPremiumRequired(false);
+        }
+      });
+      return () => {
+        active = false;
+      };
+    }, [isUserLoading, checkSubscription])
+  );
+
+  const showPremiumLock = !user || !isPremium || premiumRequired;
 
   return (
     <SafeAreaView style={styles.container}>
@@ -133,7 +173,7 @@ export default function Recommend() {
             당신이 읽은 책들을 분석해{"\n"}취향에 딱 맞는 책을 골라드려요
           </Text>
 
-          {(!user || !isPremium) && (
+          {showPremiumLock && (
             <View style={styles.premiumChip}>
               <FontAwesome5 name="crown" size={11} color="#D97706" />
               <Text style={styles.premiumChipText}>프리미엄 전용</Text>
@@ -404,4 +444,3 @@ const styles = StyleSheet.create({
   progressFill: { height: "100%", backgroundColor: "#7C3AED", borderRadius: 4 },
   progressLabel: { fontSize: 11, color: "#7C3AED", fontWeight: "700" },
 });
-

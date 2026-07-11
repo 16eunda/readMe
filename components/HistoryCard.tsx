@@ -7,11 +7,12 @@ type Props = {
   id: number;
   title: string;
   date: string;
+  lastReadAt?: string | null;
   uri?: string;
   rating: number;
 };
 
-export default function HistoryCard({ id, title, date, uri, rating }: Props) {
+export default function HistoryCard({ id, title, date, lastReadAt, uri, rating }: Props) {
   return (
     <TouchableOpacity style={styles.card} onPress={() => {
       router.push({
@@ -20,7 +21,7 @@ export default function HistoryCard({ id, title, date, uri, rating }: Props) {
       })
     }}>
       <Text style={styles.title}>{title}</Text>
-      <Text style={styles.date}>{formatDisplayDate(date)}</Text>
+      <Text style={styles.date}>{formatDisplayDate(lastReadAt ?? date)}</Text>
       <StarRating rating={rating} />
     </TouchableOpacity>
   );

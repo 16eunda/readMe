@@ -31,7 +31,8 @@ import styles from "../../styles/Home.styles";
 
 // 아이콘
 import { MaterialCommunityIcons } from "@expo/vector-icons";
-import { BASE_URL } from "../../utils/api";
+import { authenticatedFetch, BASE_URL } from "../../utils/api";
+import { getDeviceId } from "../../utils/deviceId";
 
 // 파일 수정 모달
 import iconv from 'iconv-lite';
@@ -106,8 +107,11 @@ export default function Home() {
 
   // ========== 1. 외부 Hooks (useRouter, useLocalSearchParams) ==========
   const router = useRouter();
-  const { folder } = useLocalSearchParams();
+  const { folder, locateFileId } = useLocalSearchParams();
   const currentFolder = Array.isArray(folder) ? String(folder[0] ?? "root") : String(folder ?? "root");
+  const requestedLocateFileId = Array.isArray(locateFileId)
+    ? String(locateFileId[0] ?? "")
+    : String(locateFileId ?? "");
 
   // ========== 2. 모든 useState ==========
   const [search, setSearch] = useState("");
@@ -145,9 +149,16 @@ export default function Home() {
   const [hasMore, setHasMore] = useState(true);
   const [extraFiles, setExtraFiles] = useState<any[]>([]); // 2페이지 이후 누적
   const isLoadingMoreRef = useRef(false); // ref로 관리 → 리렌더 유발 안 함
+  const loadMoreRequestIdRef = useRef(0);
   const [isLoadingMore, setIsLoadingMore] = useState(false); // UI 표시용만
   const [isSearching, setIsSearching] = useState(false); // 검색 모드 추적
   const [searchResults, setSearchResults] = useState<any[]>([]); // 검색 결과
+  const [locationPageFiles, setLocationPageFiles] = useState<any[] | null>(null);
+  const [locatedFileId, setLocatedFileId] = useState<string | null>(null);
+  const [isLocatingFile, setIsLocatingFile] = useState(false);
+  const fileListRef = useRef<FlatList<any>>(null);
+  const locateRequestIdRef = useRef(0);
+  const processedLocateFileIdRef = useRef("");
 
   // 정렬
   const [sortOption, setSortOption] = useState<SortOption>("date-desc");
@@ -204,19 +215,17 @@ export default function Home() {
   const { data: filesData, isLoading: isInitialLoading, refetch: refetchFiles } = useQuery({
     queryKey: filesQueryKey,
     queryFn: async () => {
-      const token = await AsyncStorage.getItem("accessToken");
       const params = new URLSearchParams({
         path: String(currentFolder),
         page: '0',
         size: '15',
         sort: sortParam,
       });
-      const response = await fetch(`${BASE_URL}/files?${params.toString()}`, {
-        headers: {
-          "X-Device-Id": deviceId!,
-          ...(token && { Authorization: `Bearer ${token}` }),
-        },
-      });
+      const response = await authenticatedFetch(
+        `${BASE_URL}/files?${params.toString()}`,
+        {},
+        deviceId!
+      );
       const data = await response.json();
       if (data.content && Array.isArray(data.content)) {
         return { content: data.content, hasMore: !data.last };
@@ -232,18 +241,12 @@ export default function Home() {
 
   // 현재 폴더 폴더 목록
   const foldersQueryKey = ['folders', currentFolder, deviceId];
-  const { data: foldersData, refetch: refetchFolders } = useQuery({
+  const { data: foldersData, isLoading: isFoldersLoading, refetch: refetchFolders } = useQuery({
     queryKey: foldersQueryKey,
     queryFn: async () => {
-      const token = await AsyncStorage.getItem("accessToken");
       const url = `${BASE_URL}/folders?path=${String(currentFolder)}`;
       console.log("📁 폴더 쿼리 요청:", url, "deviceId:", deviceId);
-      const response = await fetch(url, {
-        headers: {
-          "X-Device-Id": deviceId!,
-          ...(token && { Authorization: `Bearer ${token}` }),
-        },
-      });
+      const response = await authenticatedFetch(url, {}, deviceId!);
       const data = await response.json();
 
       console.log("📁 폴더 쿼리 응답:", Array.isArray(data) ? `배열 ${data.length}개` : data);
@@ -260,13 +263,7 @@ export default function Home() {
   const { data: allFoldersData, refetch: refetchAllFolders } = useQuery({
     queryKey: allFoldersQueryKey,
     queryFn: async () => {
-      const token = await AsyncStorage.getItem("accessToken");
-      const response = await fetch(`${BASE_URL}/folders`, {
-        headers: {
-          "X-Device-Id": deviceId!,
-          ...(token && { Authorization: `Bearer ${token}` }),
-        },
-      });
+      const response = await authenticatedFetch(`${BASE_URL}/folders`, {}, deviceId!);
       const data = await response.json();
       return Array.isArray(data) ? data : [];
     },
@@ -277,16 +274,20 @@ export default function Home() {
 
   // React Query 데이터 → 로컬 변수
   const page0Files: any[] = filesData?.content ?? [];
-  const files = isSearching ? searchResults : [...page0Files, ...extraFiles];
+  const files = isSearching
+    ? searchResults
+    : locationPageFiles
+      ? [...locationPageFiles, ...extraFiles]
+      : [...page0Files, ...extraFiles];
   const folders: any[] = foldersData ?? [];
   const allFolders: any[] = allFoldersData ?? [];
 
   // hasMore 동기화 (queryFn 바깥에서 side effect 처리)
   useEffect(() => {
-    if (filesData !== undefined) {
+    if (filesData !== undefined && locationPageFiles === null) {
       setHasMore(filesData.hasMore);
     }
-  }, [filesData]);
+  }, [filesData, locationPageFiles]);
 
   // ========== 3. 모든 useMemo ==========
   const filteredFiles = useMemo(() => {
@@ -395,7 +396,7 @@ export default function Home() {
   // 외부 파일 열기 (Open With) 처리
   // -------------------------------------------------------
   useEffect(() => {
-    if (!incomingFile) return;
+    if (!incomingFile || isUserLoading) return;
 
     setIncomingFile(null); // 중복 처리 방지
     
@@ -403,7 +404,7 @@ export default function Home() {
 
     // 외부 파일 열기에서는 사용자가 이미 파일을 선택했으므로 원본/수신 파일명으로 자동 등록
     processExternalFile({ uri, name });
-  }, [incomingFile]);
+  }, [incomingFile, isUserLoading]);
   
   // 외부 파일 실제 처리
   const processExternalFile = async (file: { uri: string; name: string }) => {
@@ -411,8 +412,10 @@ export default function Home() {
     
     try {
       // 중복 체크 (root 폴더 기준)
-      const checkRes = await fetch(
-        `${BASE_URL}/files/check?title=${encodeURIComponent(name)}&path=root`
+      const checkRes = await authenticatedFetch(
+        `${BASE_URL}/files/check?title=${encodeURIComponent(name)}&path=root`,
+        {},
+        deviceId ?? undefined
       );
       const { exists } = await checkRes.json();
 
@@ -425,11 +428,11 @@ export default function Home() {
               text: '그냥 열기',
               onPress: async () => {
                 // 목록에서 찾아 reader로 이동
-                const res = await fetch(`${BASE_URL}/files?path=root&page=0&size=100`, {
-                  headers: {
-                    'X-Device-Id': deviceId ?? '',
-                  },
-                });
+                const res = await authenticatedFetch(
+                  `${BASE_URL}/files?path=root&page=0&size=100`,
+                  {},
+                  deviceId ?? undefined
+                );
                 const data = await res.json();
                 const list = data.content ?? data;
                 const found = (list as any[]).find((f: any) => f.title === name);
@@ -500,50 +503,130 @@ export default function Home() {
   
   // currentFolder 변경 시 추가 페이지 리셋
   useEffect(() => {
+    loadMoreRequestIdRef.current += 1;
+    isLoadingMoreRef.current = false;
+    setIsLoadingMore(false);
+    setLocationPageFiles(null);
     setExtraFiles([]);
     setCurrentPage(0);
-    setHasMore(true);
+    // 새 폴더의 첫 페이지 응답이 다음 페이지 존재 여부를 알려주기 전에는
+    // FlatList의 onEndReached가 추가 조회를 시작하지 않도록 한다.
+    setHasMore(filesData?.hasMore ?? false);
   }, [currentFolder, sortParam]);
+
+  // 검색 결과의 "파일 위치 열기": 백엔드가 계산한 대상 페이지를 바로 표시한다.
+  useEffect(() => {
+    if (!requestedLocateFileId || !deviceId || isUserLoading) return;
+    if (processedLocateFileIdRef.current === requestedLocateFileId) return;
+
+    processedLocateFileIdRef.current = requestedLocateFileId;
+    const requestId = ++locateRequestIdRef.current;
+
+    const scrollToLocatedFile = (pageFiles: any[], indexInPage: number) => {
+      const actualIndex = pageFiles.findIndex((file) => String(file.id) === requestedLocateFileId);
+      const targetIndex = actualIndex >= 0 ? actualIndex : indexInPage;
+      if (targetIndex < 0) return false;
+
+      setLocatedFileId(requestedLocateFileId);
+      setTimeout(() => {
+        fileListRef.current?.scrollToIndex({
+          index: targetIndex,
+          animated: true,
+          viewPosition: 0.25,
+        });
+      }, 180);
+      setTimeout(() => setLocatedFileId((id) => id === requestedLocateFileId ? null : id), 3000);
+      return true;
+    };
+
+    const locate = async () => {
+      setIsLocatingFile(true);
+      isLoadingMoreRef.current = true;
+      try {
+        const params = new URLSearchParams({ sort: sortParam, size: '15' });
+        const response = await authenticatedFetch(
+          `${BASE_URL}/files/${requestedLocateFileId}/location?${params.toString()}`,
+          {},
+          deviceId
+        );
+        if (!response.ok) throw new Error(`파일 위치 조회 실패: ${response.status}`);
+
+        if (requestId !== locateRequestIdRef.current) return;
+
+        const location = await response.json();
+        const pageFiles: any[] = Array.isArray(location.content) ? location.content : [];
+        setLocationPageFiles(pageFiles);
+        setExtraFiles([]);
+        setCurrentPage(Math.max(0, Number(location.page) || 0));
+        setHasMore(Boolean(location.hasNext));
+
+        if (!scrollToLocatedFile(pageFiles, Number(location.indexInPage))) {
+          Alert.alert("파일 위치를 찾을 수 없어요", "파일이 이동되었거나 삭제되었을 수 있습니다.");
+        }
+      } catch (error) {
+        console.error("파일 위치 열기 실패:", error);
+        Alert.alert("파일 위치 열기 실패", "파일 위치를 불러오지 못했습니다.");
+      } finally {
+        if (requestId === locateRequestIdRef.current) {
+          isLoadingMoreRef.current = false;
+          setIsLocatingFile(false);
+          router.setParams({ locateFileId: "" });
+        }
+      }
+    };
+
+    locate();
+  }, [
+    requestedLocateFileId,
+    deviceId,
+    isUserLoading,
+    sortParam,
+    router,
+  ]);
+
+  useEffect(() => {
+    if (!requestedLocateFileId) processedLocateFileIdRef.current = "";
+  }, [requestedLocateFileId]);
 
   // 추가 페이지 로드 (2페이지 이후 스크롤 끝에 도달)
   async function loadMoreFiles() {
     if (!deviceId || !hasMore || isLoadingMoreRef.current) return;
     isLoadingMoreRef.current = true;
     setIsLoadingMore(true);
+    const requestId = ++loadMoreRequestIdRef.current;
     const nextPage = currentPage + 1;
     try {
-      const token = await AsyncStorage.getItem("accessToken");
       const params = new URLSearchParams({
         path: String(currentFolder),
         page: String(nextPage),
         size: '15',
         sort: sortParam,
       });
-      const response = await fetch(`${BASE_URL}/files?${params.toString()}`, {
-        headers: {
-          "X-Device-Id": deviceId,
-          ...(token && { Authorization: `Bearer ${token}` }),
-        },
-      });
+      const response = await authenticatedFetch(
+        `${BASE_URL}/files?${params.toString()}`,
+        {},
+        deviceId
+      );
       const data = await response.json();
       let fileList: any[] = [];
+      let nextHasMore = false;
       if (data.content && Array.isArray(data.content)) {
         fileList = data.content;
-        setHasMore(!data.last);
+        nextHasMore = !data.last;
       } else if (Array.isArray(data)) {
         fileList = data;
-        setHasMore(false);
-      } else {
-        setHasMore(false);
       }
-      if (fileList.length === 0) setHasMore(false);
+      if (requestId !== loadMoreRequestIdRef.current) return;
+      setHasMore(fileList.length > 0 && nextHasMore);
       setExtraFiles(prev => [...prev, ...fileList]);
       setCurrentPage(nextPage);
     } catch (e) {
       console.log("Error loading more files:", e);
     } finally {
-      isLoadingMoreRef.current = false;
-      setIsLoadingMore(false);
+      if (requestId === loadMoreRequestIdRef.current) {
+        isLoadingMoreRef.current = false;
+        setIsLoadingMore(false);
+      }
     }
   }
 
@@ -578,16 +661,13 @@ export default function Home() {
         sort: sortParam
       });
       
-      const token = await AsyncStorage.getItem("accessToken");
-      
       console.log('🔍 검색 요청:', keyword, 'page:', page, 'sort:', sortParam, "deviceId:", deviceId);
 
-      const response = await fetch(`${BASE_URL}/files/search?${params.toString()}`, {
-        headers: {
-          "X-Device-Id": deviceId,
-          ...(token && { Authorization: `Bearer ${token}` })
-        }
-      });
+      const response = await authenticatedFetch(
+        `${BASE_URL}/files/search?${params.toString()}`,
+        {},
+        deviceId
+      );
       const data = await response.json();
       
       console.log('🔍 검색 결과 (page=' + page + '):', data);
@@ -632,20 +712,26 @@ export default function Home() {
   // -----------------------------
   async function saveFileToServer(fileData: any) {
     try {
-      console.log('🚀 서버 요청 시작:', { url: `${BASE_URL}/files`, method: 'POST' });
+      // 실기기에서는 외부 파일 처리/등록이 UserContext의 deviceId 상태 갱신보다 먼저
+      // 시작될 수 있으므로 저장 직전에 영속 deviceId를 직접 확보한다.
+      const resolvedDeviceId = deviceId ?? await getDeviceId();
+      const requestBody = {
+        ...fileData,
+        deviceId: resolvedDeviceId,
+      };
+      console.log('🚀 서버 요청 시작:', {
+        url: `${BASE_URL}/files`,
+        method: 'POST',
+        deviceId: resolvedDeviceId,
+      });
       
-      const token = await AsyncStorage.getItem("accessToken");
-      console.log('🔐 토큰 확인:', { hasToken: !!token });
-      
-      const response = await fetch(`${BASE_URL}/files`, {
+      const response = await authenticatedFetch(`${BASE_URL}/files`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...(deviceId && { "X-Device-Id": deviceId }),
-          ...(token && { Authorization: `Bearer ${token}` }),
         },
-        body: JSON.stringify(fileData),
-      });
+        body: JSON.stringify(requestBody),
+      }, resolvedDeviceId);
 
       console.log('📡 서버 응답 상태:', response.status);
       
@@ -676,6 +762,7 @@ export default function Home() {
         refetchFolders(),
         refetchAllFolders(),
       ]);
+      setLocationPageFiles(null);
       setExtraFiles([]);
       setCurrentPage(0);
     } catch (e) {
@@ -695,17 +782,13 @@ export default function Home() {
         return;
       }
       
-      const token = await AsyncStorage.getItem("accessToken");
-      
-      const response = await fetch(`${BASE_URL}/folders`, {
+      const response = await authenticatedFetch(`${BASE_URL}/folders`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Device-Id": deviceId,
-          ...(token && { Authorization: `Bearer ${token}` })
         },
         body: JSON.stringify(folderData),
-      });
+      }, deviceId);
 
       return await response.json();
     } catch (e) {
@@ -718,17 +801,13 @@ export default function Home() {
   // -----------------------------
   async function deleteFolderFromServer(id: number) {
   try {
-    const token = await AsyncStorage.getItem("accessToken");
-    
-    const res = await fetch(`${BASE_URL}/folders/${id}`, {
+    const res = await authenticatedFetch(`${BASE_URL}/folders/${id}`, {
       method: "DELETE",
       headers: {
         "Content-Type": "application/json",
-        ...(deviceId && { "X-Device-Id": deviceId }),
-        ...(token && { Authorization: `Bearer ${token}` })
       },
       body: JSON.stringify({ id: id })
-    });
+    }, deviceId ?? undefined);
 
     // 백엔드는 body 없이 200/204만 반환하므로 OK면 삭제 성공
     return res.ok;
@@ -743,11 +822,11 @@ export default function Home() {
   // -----------------------------
   async function moveFolderToServer(folderId: number, newPath: string) {
     try {
-      const res = await fetch(`${BASE_URL}/folders/${folderId}`, {
+      const res = await authenticatedFetch(`${BASE_URL}/folders/${folderId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: newPath })
-      });
+      }, deviceId ?? undefined);
       return res.ok;
     } catch (e) {
       console.log("Error moving folder:", e);
@@ -780,8 +859,10 @@ export default function Home() {
       try {
         // 🔵 서버 API로 중복 체크
         console.log('🔎 중복 체크 중:', file.name);
-        const checkRes = await fetch(
-          `${BASE_URL}/files/check?title=${encodeURIComponent(file.name)}&path=${currentFolder}`
+        const checkRes = await authenticatedFetch(
+          `${BASE_URL}/files/check?title=${encodeURIComponent(file.name)}&path=${currentFolder}`,
+          {},
+          deviceId ?? undefined
         );
         const { exists } = await checkRes.json();
         
@@ -876,6 +957,7 @@ export default function Home() {
         rating: 0,
         uri: newPath,
         path: folderPath,
+        // saveFileToServer에서 저장 직전 영속 deviceId로 확정한다.
         deviceId: deviceId,
       };
       
@@ -1023,7 +1105,7 @@ export default function Home() {
   // -----------------------------
   const handleFilePress = async (file : any) => {
     // 1) 서버에서 진행도 가져오기
-    const res = await fetch(`${BASE_URL}/files/${file.id}`);
+    const res = await authenticatedFetch(`${BASE_URL}/files/${file.id}`, {}, deviceId ?? undefined);
     const info = await res.json();
 
     // progress 없으면 바로 Reader로 이동
@@ -1093,23 +1175,21 @@ export default function Home() {
   const toggleSelect = (id: number) => toggleSelectFile(id);
 
   // 폴더 일괄 삭제 헬퍼 함수
-  const deleteFoldersBulk = async (folderIds: number[], force: boolean, token: string | null) => {
+  const deleteFoldersBulk = async (folderIds: number[], force: boolean) => {
     if (!deviceId) {
       throw new Error("디바이스 ID가 없습니다");
     }
 
-    const res = await fetch(`${BASE_URL}/folders/bulk-delete`, {
+    const res = await authenticatedFetch(`${BASE_URL}/folders/bulk-delete`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Device-Id": deviceId,
-        ...(token && { Authorization: `Bearer ${token}` })
       },
       body: JSON.stringify({
         folderIds: folderIds,
         force: force
       })
-    });
+    }, deviceId);
 
     return res;
   };
@@ -1117,13 +1197,11 @@ export default function Home() {
   // 선택 모드에서 삭제 버튼 핸들러 (파일 + 폴더 삭제)
   const handleBulkDelete = async () => {
     try {
-      const token = await AsyncStorage.getItem("accessToken");
-
       // 1. 폴더 먼저 삭제 (하위 파일/폴더 포함 여부 체크)
       if (selectedItems.folders.length > 0) {
         console.log(`📁 폴더 ${selectedItems.folders.length}개 일괄 삭제:`, selectedItems.folders);
         
-        const res = await deleteFoldersBulk(selectedItems.folders, false, token);
+        const res = await deleteFoldersBulk(selectedItems.folders, false);
 
         // 409: 하위 파일/폴더 존재 경고
         if (res.status === 409) {
@@ -1150,20 +1228,18 @@ export default function Home() {
                   try {
                     // force=true로 재시도
                     console.log("📁 강제 삭제 실행");
-                    await deleteFoldersBulk(selectedItems.folders, true, token);
+                    await deleteFoldersBulk(selectedItems.folders, true);
 
                     // 폴더 삭제 완료 후 파일 삭제
                     if (selectedItems.files.length > 0) {
                       console.log(`🗑️ 파일 ${selectedItems.files.length}개 삭제:`, selectedItems.files);
-                      await fetch(`${BASE_URL}/files`, {
+                      await authenticatedFetch(`${BASE_URL}/files`, {
                         method: "DELETE",
                         headers: {
                           "Content-Type": "application/json",
-                          ...(deviceId && { "X-Device-Id": deviceId }),
-                          ...(token && { Authorization: `Bearer ${token}` })
                         },
                         body: JSON.stringify({ ids: selectedItems.files })
-                      });
+                      }, deviceId ?? undefined);
                     }
 
                     console.log("✅ 일괄 삭제 완료");
@@ -1191,15 +1267,13 @@ export default function Home() {
       // 2. 파일 삭제 (폴더 밖의 개별 파일들만)
       if (selectedItems.files.length > 0) {
         console.log(`🗑️ 파일 ${selectedItems.files.length}개 일괄 삭제:`, selectedItems.files);
-        await fetch(`${BASE_URL}/files`, {
+        await authenticatedFetch(`${BASE_URL}/files`, {
           method: "DELETE",
           headers: {
             "Content-Type": "application/json",
-            ...(deviceId && { "X-Device-Id": deviceId }),
-            ...(token && { Authorization: `Bearer ${token}` })
           },
           body: JSON.stringify({ ids: selectedItems.files })
-        });
+        }, deviceId ?? undefined);
       }
 
       console.log("✅ 일괄 삭제 완료");
@@ -1219,11 +1293,11 @@ export default function Home() {
       // 파일 이동
       for (const id of selectedItems.files) {
         console.log(`🚀 파일 ${id} 이동 요청:`, folder.id);
-        const response = await fetch(`${BASE_URL}/files/${id}`, {
+        const response = await authenticatedFetch(`${BASE_URL}/files/${id}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path: String(folder.id) })
-        });
+        }, deviceId ?? undefined);
 
         if (!response.ok) {
           console.error(`❌ 파일 ${id} 이동 실패:`, response.status);
@@ -1233,11 +1307,11 @@ export default function Home() {
       // 폴더 이동
       for (const id of selectedItems.folders) {
         console.log(`📁 폴더 ${id} 이동 요청:`, folder.id);
-        const response = await fetch(`${BASE_URL}/folders/${id}`, {
+        const response = await authenticatedFetch(`${BASE_URL}/folders/${id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path: String(folder.id) })
-        });
+        }, deviceId ?? undefined);
 
         if (!response.ok) {
           console.error(`❌ 폴더 ${id} 이동 실패:`, response.status);
@@ -1259,7 +1333,7 @@ export default function Home() {
   const updateFileInfo = async (updated: FileItem) => {
     try {
       console.log("🚀 PATCH 요청 보냄:", `${BASE_URL}/files/${updated.id}`);
-      const res = await fetch(`${BASE_URL}/files/${updated.id}`, {
+      const res = await authenticatedFetch(`${BASE_URL}/files/${updated.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1267,7 +1341,7 @@ export default function Home() {
           review: updated.review,
           rating: updated.rating,
         }),
-      });
+      }, deviceId ?? undefined);
 
       console.log("📡 응답 상태:", res.status, res.statusText);
       
@@ -1294,12 +1368,25 @@ export default function Home() {
   };
 
   // 검색어 변경 시 displayCount 리셋 (이미 위에 useEffect로 처리됨)
-  const isInitial = files.length === 0 && !search && !isInitialLoading;
-  const noSearchResult = filteredFiles.length === 0 && search && !isInitialLoading;
+  const isHomeBootstrapping = isUserLoading || !deviceId;
+  const isHomeListLoading =
+    !isSearching &&
+    (isHomeBootstrapping || isInitialLoading || isFoldersLoading);
   const showInitialLoading =
-    isInitialLoading &&
+    isHomeListLoading &&
+    !search &&
     filteredFiles.length === 0 &&
     visibleFolders.length === 0;
+  const isInitial =
+    !showInitialLoading &&
+    files.length === 0 &&
+    visibleFolders.length === 0 &&
+    !search;
+  const noSearchResult =
+    !showInitialLoading &&
+    filteredFiles.length === 0 &&
+    search &&
+    !isInitialLoading;
   return (
     <SafeAreaView style={styles.container}>
        {/* 🔹 상단 전체 묶음 */}
@@ -1457,6 +1544,7 @@ export default function Home() {
     {/* 파일 목록 */}
     {filteredFiles.length > 0 && (
       <FlatList
+        ref={fileListRef}
         data={filteredFiles}
         keyExtractor={(item, index) => `${item.id}-${index}`}
         contentContainerStyle={styles.listContent}
@@ -1473,6 +1561,7 @@ export default function Home() {
             item={item}
             isSelectMode={isSelectMode}
             isSelected={selectedItems.files.includes(item.id)}
+            isLocated={String(item.id) === locatedFileId}
             onPress={ () => {
               if (isSelectMode) {
                 toggleSelect(item.id);
@@ -1501,8 +1590,17 @@ export default function Home() {
           }
         }}
         onEndReachedThreshold={0.5}
+        onScrollToIndexFailed={({ index, averageItemLength }) => {
+          fileListRef.current?.scrollToOffset({
+            offset: Math.max(0, averageItemLength * index),
+            animated: false,
+          });
+          setTimeout(() => {
+            fileListRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.25 });
+          }, 120);
+        }}
         ListFooterComponent={() => {
-          if (isLoadingMore) {
+          if (isLoadingMore && currentPage > 0) {
             return (
               <View style={{ padding: 20, alignItems: 'center' }}>
                 <Text style={{ color: '#999' }}>로딩 중...</Text>
@@ -1512,6 +1610,23 @@ export default function Home() {
           return null;
         }}
       />
+    )}
+
+    {isLocatingFile && (
+      <View style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        backgroundColor: "rgba(255,255,255,0.82)",
+        justifyContent: "center",
+        alignItems: "center",
+        zIndex: 50,
+      }}>
+        <ActivityIndicator size="large" color="#4A90E2" />
+        <Text style={{ marginTop: 12, color: "#555" }}>파일 위치를 찾는 중...</Text>
+      </View>
     )}
 
     {/* 플로팅 버튼 */}
@@ -1665,11 +1780,11 @@ export default function Home() {
       onChangeName={setRenameText}
       onSave={async () => {
         try {
-          const res = await fetch(`${BASE_URL}/folders/${selectedFolder.id}`, {
+          const res = await authenticatedFetch(`${BASE_URL}/folders/${selectedFolder.id}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ name: renameText }),
-          });
+          }, deviceId ?? undefined);
 
           if (!res.ok) {
             throw new Error("폴더 이름 변경 실패");
@@ -1717,17 +1832,13 @@ export default function Home() {
         setIsDeleting(true);
         
         try {
-          const token = await AsyncStorage.getItem("accessToken");
-          
-          const res = await fetch(`${BASE_URL}/files`, {
+          const res = await authenticatedFetch(`${BASE_URL}/files`, {
             method: "DELETE",
             headers: {
               "Content-Type": "application/json",
-              ...(deviceId && { "X-Device-Id": deviceId }),
-              ...(token && { Authorization: `Bearer ${token}` })
             },
             body: JSON.stringify({ ids: [selectedFile.id] })
-          });
+          }, deviceId ?? undefined);
 
           if (!res.ok) {
             Alert.alert("삭제 실패", "서버에서 삭제에 실패했습니다.");
@@ -1759,10 +1870,14 @@ export default function Home() {
         setDebouncedSearch("");
         setIsSearching(false);
         
-        // 파일이 있는 폴더로 이동
-        if (selectedFile.path && selectedFile.path !== currentFolder) {
-          router.push({ pathname: "/", params: { folder: selectedFile.path } });
-        }
+        // 파일이 있는 폴더로 이동한 뒤, 대상 파일이 포함된 페이지까지 불러와 카드로 스크롤한다.
+        router.push({
+          pathname: "/",
+          params: {
+            folder: selectedFile.path || "root",
+            locateFileId: String(selectedFile.id),
+          },
+        });
       }}
       onClose={() => setFileOptionsVisible(false)}
     />
@@ -1779,11 +1894,11 @@ export default function Home() {
         // 서버에 파일 이동 저장
         try {
           console.log("🚀 파일 이동 요청:", `${BASE_URL}/files/${selectedFile.id}`, { path: folder.id });
-          const response = await fetch(`${BASE_URL}/files/${selectedFile.id}`, {
+          const response = await authenticatedFetch(`${BASE_URL}/files/${selectedFile.id}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ path: String(folder.id) })
-          });
+          }, deviceId ?? undefined);
 
           console.log("📥 응답 상태:", response.status);
           
