@@ -273,7 +273,7 @@ export default function ReaderScreen() {
         const decoded = decodeURI(uri as string);
         console.log("📖 파일 읽기 시작:", fileName, "→", decoded);
 
-        // readAsStringAsync 시도 후 ENOENT면 documentDirectory로 폴백
+        // 앱 컨테이너 경로가 바뀐 경우 현재 documentDirectory에서 다시 찾는다.
         const readWithFallback = async (path: string, opts: any): Promise<string> => {
           try {
             return await FileSystem.readAsStringAsync(path, opts);
@@ -281,9 +281,23 @@ export default function ReaderScreen() {
             const msg = String(e);
             if (msg.includes('ENOENT') || msg.includes('FileNotFoundException')) {
               const fileNameOnly = path.split('/').pop() || '';
-              const fallback = (FileSystem.documentDirectory ?? '') + fileNameOnly;
-              console.log("⚠️ 폴백 시도:", fallback);
-              return await FileSystem.readAsStringAsync(fallback, opts);
+              const documentDirectory = FileSystem.documentDirectory ?? '';
+              const fallbackPaths = [
+                `${documentDirectory}library-files/${fileNameOnly}`,
+                `${documentDirectory}${fileNameOnly}`,
+              ];
+
+              for (const fallback of fallbackPaths) {
+                try {
+                  console.log("⚠️ 폴백 시도:", fallback);
+                  return await FileSystem.readAsStringAsync(fallback, opts);
+                } catch (fallbackError) {
+                  const fallbackMessage = String(fallbackError);
+                  if (!fallbackMessage.includes('ENOENT') && !fallbackMessage.includes('FileNotFoundException')) {
+                    throw fallbackError;
+                  }
+                }
+              }
             }
             throw e;
           }

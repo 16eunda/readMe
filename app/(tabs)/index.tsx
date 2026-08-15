@@ -47,6 +47,34 @@ import PreviewModal from "../../components/PreviewModal";
 import SortModal, { SortOption } from "../../components/SortModal";
 import { useUser } from "../../contexts/UserContext";
 
+const MANAGED_FILE_DIRECTORY = "library-files";
+
+async function createManagedFileUri(displayName: string): Promise<string> {
+  const documentDirectory = FileSystem.documentDirectory;
+  if (!documentDirectory) {
+    throw new Error("앱 내부 저장소를 사용할 수 없습니다.");
+  }
+
+  const directoryUri = `${documentDirectory}${MANAGED_FILE_DIRECTORY}/`;
+  await FileSystem.makeDirectoryAsync(directoryUri, { intermediates: true });
+
+  const extensionIndex = displayName.lastIndexOf(".");
+  const extension = extensionIndex >= 0
+    ? displayName.slice(extensionIndex).toLowerCase()
+    : "";
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const uniqueName = `${Date.now()}-${Math.random().toString(36).slice(2, 12)}${extension}`;
+    const managedUri = `${directoryUri}${uniqueName}`;
+    const info = await FileSystem.getInfoAsync(managedUri);
+    if (!info.exists) {
+      return managedUri;
+    }
+  }
+
+  throw new Error("파일의 고유 저장 경로를 만들 수 없습니다.");
+}
+
 // 여러 인코딩 시도 방식 (효율적인 순서)
 function decodeTextSafe(buffer: Buffer): string {
   // 1. UTF-16 BOM 체크 (가장 먼저!)
@@ -900,14 +928,14 @@ export default function Home() {
     setIsUploading(true);
     
     try {
-      // 파일명 그대로 사용 (사용자가 입력한 값 또는 원본 파일명)
-      let displayName = file.name;
+      // 화면에는 원본 파일명을 유지하고, 실제 파일은 충돌 없는 이름으로 저장한다.
+      const displayName = file.name;
       const title = displayName;
-      
-      console.log('📂 파일 복사 시작:', { displayName, title, targetPath: FileSystem.documentDirectory + displayName });
-      
-      // 🔵 앱 전용 폴더로 복사
-      const newPath = FileSystem.documentDirectory + displayName;
+
+      const newPath = await createManagedFileUri(displayName);
+      console.log('📂 파일 복사 시작:', { displayName, title, targetPath: newPath });
+
+      // 앱 전용 영구 폴더로 복사한 URI를 서버에도 저장한다.
       await FileSystem.copyAsync({
         from: file.uri,
         to: newPath,
