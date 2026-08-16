@@ -866,6 +866,9 @@ useEffect(() => {
           width: 100%;
           height: 100%;
           padding: 0;
+          opacity: 1;
+          transform: translateY(0);
+          transform-origin: center;
         }
         #book-cover {
           display: none;
@@ -1122,7 +1125,7 @@ useEffect(() => {
               }
               var atTop = fallbackSectionEl.scrollTop <= 6;
               var atBottom = fallbackSectionEl.scrollTop + fallbackSectionEl.clientHeight >= fallbackSectionEl.scrollHeight - 10;
-              if (dt <= 1400 && Math.abs(dy) >= 55 && Math.abs(dx) < Math.abs(dy) * 0.8) {
+              if (dt <= 1400 && Math.abs(dy) >= 88 && Math.abs(dx) < Math.abs(dy) * 0.8) {
                 if (dy < 0 && atBottom) triggerAutoTransition(false);
                 else if (dy > 0 && atTop) triggerAutoTransition(true);
               }
@@ -1349,10 +1352,11 @@ useEffect(() => {
                 var pullStartY = 0;
                 var pullDist = 0;
                 var pullTriggered = false;
+                var pullReady = false;
                 var startedAtTop = false;
                 var startedAtBottom = false;
                 var startedInShortSection = false;
-                var PULL_TH = 80; // outer indicator threshold와 일치시켜 첫 화면에서도 바로 전환
+                var PULL_TH = 96;
 
                 // 실제로 스크롤되는 엘리먼트를 찾는 함수
                 // scrolled-doc 모드에서는 iframe 내부 body/html이 스크롤되지 않고
@@ -1455,6 +1459,7 @@ useEffect(() => {
                   pullDir = null;
                   pullDist = 0;
                   pullTriggered = false;
+                  pullReady = false;
                   pullStartY = e.touches[0].clientY;
                   try { window.parent.hidePullIndicator(); } catch(_) {}
 
@@ -1514,7 +1519,7 @@ useEffect(() => {
                   // 경계를 벗어나면 취소
                   if ((pullDir === 'prev' && !atTop) || (pullDir === 'next' && !atBottom)) {
                     log('🔍PULL ▶ CANCEL (left boundary)');
-                    pullDir = null; pullDist = 0;
+                    pullDir = null; pullDist = 0; pullReady = false;
                     try { window.parent.hidePullIndicator(); } catch(_) {}
                     return;
                   }
@@ -1527,15 +1532,10 @@ useEffect(() => {
                   }
 
                   try { window.parent.showPullIndicator(pullDir, pullDist / PULL_TH); } catch(_) {}
+                  pullReady = pullDist >= PULL_TH;
 
                   // pull 중 native 스크롤/bounce 방지
                   try { e.preventDefault(); } catch(_) {}
-
-                  if (pullDist >= PULL_TH) {
-                    pullTriggered = true;
-                    log('🔍PULL ▶ TRIGGER ' + pullDir + ' dist=' + Math.round(pullDist));
-                    try { window.parent.triggerAutoTransition(pullDir === 'prev'); } catch(_) {}
-                  }
                 }, { passive: false, capture: true }); // capture로 표지 SVG/이미지의 이벤트 차단 우회
 
                 doc.addEventListener("touchend", function(e) {
@@ -1544,12 +1544,17 @@ useEffect(() => {
                   var dy = Math.abs(signedDy);
                   var dt = Date.now() - tapStartTime;
                   var tappedAnchor = findAnchor(e.target);
+                  if (!pullTriggered && pullReady && pullDir) {
+                    pullTriggered = true;
+                    log('🔍PULL ▶ RELEASE TRIGGER ' + pullDir + ' dist=' + Math.round(pullDist));
+                    try { window.parent.triggerAutoTransition(pullDir === 'prev'); } catch(_) {}
+                  }
                   if (!movedDuringTouch && !pullTriggered && dx <= 8 && dy <= 8 && dt <= 400 && tappedAnchor) {
                     openInternalLink(tappedAnchor, e);
                   }
                   // 표지처럼 스크롤할 영역이 없는 첫 섹션은 touchmove가 네이티브에 소비될 수 있다.
                   // touchend의 전체 이동 거리로 경계 당김을 확정해 다음/이전 spine으로 이동한다.
-                  if (!pullTriggered && dx < dy * 0.8 && dy >= 55 && dt <= 1200) {
+                  if (!pullTriggered && dx < dy * 0.8 && dy >= 88 && dt <= 1200) {
                     if ((startedAtBottom || startedInShortSection) && signedDy < 0) {
                       pullTriggered = true;
                       log('🔍PULL ▶ TOUCHEND NEXT FALLBACK dy=' + Math.round(signedDy));
@@ -1570,7 +1575,7 @@ useEffect(() => {
                   if (!pullTriggered) {
                     try { window.parent.hidePullIndicator(); } catch(_) {}
                   }
-                  pullDir = null; pullDist = 0; pullTriggered = false;
+                  pullDir = null; pullDist = 0; pullTriggered = false; pullReady = false;
                   startedAtTop = false; startedAtBottom = false; startedInShortSection = false;
                 }, { passive: true, capture: true });
 
@@ -2103,7 +2108,10 @@ useEffect(() => {
             var pullBarBottom = document.getElementById('pull-bar-bottom');
             var pullArrowTop = document.getElementById('pull-arrow-top');
             var pullArrowBottom = document.getElementById('pull-arrow-bottom');
-            var PULL_THRESHOLD = 80;
+            var pullLabelTop = document.getElementById('pull-label-top');
+            var pullLabelBottom = document.getElementById('pull-label-bottom');
+            var CHAPTER_EXIT_MS = 190;
+            var CHAPTER_ENTER_MS = 280;
 
             function showPullIndicator(dir, progress) {
               try {
@@ -2116,11 +2124,13 @@ useEffect(() => {
                   if (pullIndicatorTop) pullIndicatorTop.style.height = h + 'px';
                   if (pullBarTop) pullBarTop.style.width = pct;
                   if (pullArrowTop) pullArrowTop.style.transform = clampedP >= 1 ? 'scale(1.3)' : 'scale(1)';
+                  if (pullLabelTop) pullLabelTop.textContent = clampedP >= 1 ? '놓아서 이전 챕터' : '이전 챕터로';
                 } else {
                   if (pullIndicatorTop) pullIndicatorTop.style.height = '0px';
                   if (pullIndicatorBottom) pullIndicatorBottom.style.height = h + 'px';
                   if (pullBarBottom) pullBarBottom.style.width = pct;
                   if (pullArrowBottom) pullArrowBottom.style.transform = clampedP >= 1 ? 'scale(1.3)' : 'scale(1)';
+                  if (pullLabelBottom) pullLabelBottom.textContent = clampedP >= 1 ? '놓아서 다음 챕터' : '다음 챕터로';
                 }
               } catch(e) {}
             }
@@ -2129,21 +2139,58 @@ useEffect(() => {
               try {
                 if (pullIndicatorTop) pullIndicatorTop.style.height = '0px';
                 if (pullIndicatorBottom) pullIndicatorBottom.style.height = '0px';
+                if (pullBarTop) pullBarTop.style.width = '0%';
+                if (pullBarBottom) pullBarBottom.style.width = '0%';
+                if (pullArrowTop) pullArrowTop.style.transform = 'scale(1)';
+                if (pullArrowBottom) pullArrowBottom.style.transform = 'scale(1)';
+                if (pullLabelTop) pullLabelTop.textContent = '이전 챕터로';
+                if (pullLabelBottom) pullLabelBottom.textContent = '다음 챕터로';
               } catch(e) {}
+            }
+
+            function forEachTransitionSurface(callback) {
+              [viewerEl, fallbackSectionEl, bookCoverEl].forEach(function(surface) {
+                if (surface) callback(surface);
+              });
             }
 
             function playSoftTransition(goPrev) {
               try {
-                viewerEl.style.transition = 'transform 180ms ease, opacity 180ms ease';
-                viewerEl.style.opacity = '0.92';
-                viewerEl.style.transform = goPrev ? 'translateY(20px)' : 'translateY(-20px)';
+                forEachTransitionSurface(function(surface) {
+                  surface.style.willChange = 'transform, opacity';
+                  surface.style.transition = 'transform ' + CHAPTER_EXIT_MS + 'ms cubic-bezier(0.4, 0, 1, 1), opacity ' + CHAPTER_EXIT_MS + 'ms ease-out';
+                  surface.style.opacity = '0.35';
+                  surface.style.transform = goPrev ? 'translateY(24px)' : 'translateY(-24px)';
+                });
+              } catch(e) {}
+            }
+
+            function playSoftEntrance(goPrev) {
+              try {
+                forEachTransitionSurface(function(surface) {
+                  surface.style.transition = 'none';
+                  surface.style.opacity = '0.35';
+                  surface.style.transform = goPrev ? 'translateY(-20px)' : 'translateY(20px)';
+                });
+                void viewerEl.offsetHeight;
+                requestAnimationFrame(function() {
+                  forEachTransitionSurface(function(surface) {
+                    surface.style.transition = 'transform ' + CHAPTER_ENTER_MS + 'ms cubic-bezier(0.16, 1, 0.3, 1), opacity ' + CHAPTER_ENTER_MS + 'ms ease-out';
+                    surface.style.opacity = '1';
+                    surface.style.transform = 'translateY(0px)';
+                  });
+                });
               } catch(e) {}
             }
 
             function clearSoftTransition() {
               try {
-                viewerEl.style.opacity = '1';
-                viewerEl.style.transform = 'translateY(0px)';
+                forEachTransitionSurface(function(surface) {
+                  surface.style.opacity = '1';
+                  surface.style.transform = 'translateY(0px)';
+                  surface.style.transition = 'none';
+                  surface.style.willChange = 'auto';
+                });
               } catch(e) {}
             }
 
@@ -2390,6 +2437,7 @@ useEffect(() => {
               isChapterLoading = true;
               hidePullIndicator();
               showChapterIndicator(goPrev ? '이전 챕터 불러오는 중…' : '다음 챕터 불러오는 중…');
+              playSoftTransition(goPrev);
 
               var finished = false;
               function finishTransition() {
@@ -2411,17 +2459,25 @@ useEffect(() => {
               }
 
               // 일부 EPUB은 display Promise가 끝나지 않으므로 상태 잠금 방지 watchdog 필요
-              var watchdog = setTimeout(finishTransition, 2000);
-              displayAdjacentSection(goPrev).then(function() {
-                setTimeout(function() {
+              var watchdog = setTimeout(finishTransition, 3000);
+              setTimeout(function() {
+                displayAdjacentSection(goPrev).then(function() {
+                  if (finished) return;
+                  var settleDelay = pendingSectionEdge ? 520 : 80;
+                  setTimeout(function() {
+                    if (finished) return;
+                    playSoftEntrance(goPrev);
+                    setTimeout(function() {
+                      clearTimeout(watchdog);
+                      finishTransition();
+                    }, CHAPTER_ENTER_MS + 30);
+                  }, settleDelay);
+                }).catch(function(e) {
+                  sendLog('⚠️ 챕터 직접 이동 오류: ' + e.message);
                   clearTimeout(watchdog);
                   finishTransition();
-                }, pendingSectionEdge ? 620 : 180);
-              }).catch(function(e) {
-                sendLog('⚠️ 챕터 직접 이동 오류: ' + e.message);
-                clearTimeout(watchdog);
-                finishTransition();
-              });
+                });
+              }, CHAPTER_EXIT_MS);
             }
 
             function tryBoundaryTransition(goPrev) {
@@ -3836,7 +3892,7 @@ useEffect(() => {
                   const dt = Date.now() - start.time;
                   const isVerticalSwipe =
                     dt <= 1400 &&
-                    Math.abs(dy) >= 70 &&
+                    Math.abs(dy) >= 96 &&
                     Math.abs(dx) < Math.abs(dy) * 0.75;
 
                   if (isVerticalSwipe) {
@@ -3893,7 +3949,7 @@ useEffect(() => {
                     const dt = Date.now() - touch.time;
                     const isVerticalSwipe =
                       dt <= 1400 &&
-                      Math.abs(dy) >= 55 &&
+                      Math.abs(dy) >= 88 &&
                       Math.abs(dx) < Math.abs(dy) * 0.8;
 
                     if (isVerticalSwipe) {
