@@ -33,6 +33,7 @@ import styles from "../../styles/Home.styles";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { authenticatedFetch, BASE_URL } from "../../utils/api";
 import { getDeviceId } from "../../utils/deviceId";
+import { createPreviewText } from "../../utils/preview";
 
 // 파일 수정 모달
 import iconv from 'iconv-lite';
@@ -949,7 +950,8 @@ export default function Home() {
         if (displayName.toLowerCase().endsWith(".epub")) {
           console.log('📖 EPUB 미리보기 추출 중...');
           preview = await extractEpubPreview(newPath);
-          console.log('✅ EPUB 미리보기 완료:', preview.slice(0, 50));
+          preview = createPreviewText(preview);
+          console.log('✅ EPUB 미리보기 완료:', preview);
         } else {
           console.log('📄 TXT 미리보기 추출 중...');
           // Base64로 읽고 자동 인코딩 감지
@@ -963,9 +965,8 @@ export default function Home() {
           // 줄바꿈을 공백으로, 연속 공백을 하나로 압축
           const cleanedText = text.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
           
-          // 50글자 + "..." 으로 제한
-          const trimmedText = cleanedText.slice(0, 50);
-          preview = trimmedText + (cleanedText.length > 50 ? "..." : "");
+          // 공통 미리보기 기준(200자, 줄임표 포함)으로 제한
+          preview = createPreviewText(cleanedText);
           console.log('✅ TXT 미리보기 완료:', preview);
         }
       } catch(e) {
@@ -1160,14 +1161,7 @@ export default function Home() {
       const buffer = Buffer.from(base64, 'base64');
       const localContent = decodeTextSafe(buffer);
 
-      const lines = localContent
-        .replace(/\r/g, '')
-        .split('\n')
-        .map((l: string) => l.trim())
-        .filter((l: string) => l.length > 0);
-
-      const lineIndex = Math.max(0, Math.floor(info.progress * lines.length) - 1);
-      preview = lines.slice(lineIndex, lineIndex + 4).join('\n');
+      preview = createPreviewText(localContent, Math.floor(info.progress * localContent.length));
     }
 
     setPreviewText(preview);

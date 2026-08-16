@@ -23,7 +23,9 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
+import { readExternalTextFile } from "external-file-info";
 import { authenticatedFetch, BASE_URL } from "../utils/api";
+import { createPreviewText, PREVIEW_CHAR_LIMIT } from "../utils/preview";
 
 // 여러 인코딩 시도 방식 (효율적인 순서)
 function decodeTextSafe(buffer: Buffer): string {
@@ -91,16 +93,9 @@ interface ReaderSettings {
   sidePadding: number;  // 좌우 여백 px (8 ~ 60)
 }
 
-interface TxtLineLayout {
-  text: string;
-  y: number;
-  height: number;
-}
-
 interface TxtItemLayout {
   y: number;
   height: number;
-  lines: TxtLineLayout[];
 }
 
 const DEFAULT_SETTINGS: ReaderSettings = {
@@ -126,13 +121,40 @@ const FONT_PRESETS = [
   { label: "명조", value: "Georgia" },
 ];
 
+const TXT_RENDER_CHUNK_SIZE = 12000;
+
+function splitTextIntoRenderChunks(text: string): string[] {
+  if (!text) return [""];
+
+  const chunks: string[] = [];
+  let start = 0;
+
+  while (start < text.length) {
+    let end = Math.min(text.length, start + TXT_RENDER_CHUNK_SIZE);
+
+    if (end < text.length) {
+      const newline = text.lastIndexOf("\n", end);
+      if (newline > start + TXT_RENDER_CHUNK_SIZE * 0.55) {
+        end = newline + 1;
+      } else if (text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) {
+        end -= 1;
+      }
+    }
+
+    chunks.push(text.slice(start, end));
+    start = end;
+  }
+
+  return chunks;
+}
+
 export default function ReaderScreen() {
   const router = useRouter();
   const { fileId, uri, name, type, resetProgress } = useLocalSearchParams();
   const insets = useSafeAreaInsets();
 
   const [isEpub, setIsEpub] = useState(false);
-  const [content, setContent] = useState<string[]>([]); // txt 문단 배열
+  const [content, setContent] = useState<string[]>([]); // txt 렌더링 청크 배열
   const [txtLoading, setTxtLoading] = useState(false); // txt 로딩 중
   const [txtError, setTxtError] = useState<string | null>(null); // txt 에러
   const [showUI, setShowUI] = useState(true);
@@ -154,7 +176,7 @@ export default function ReaderScreen() {
   const contentHeightRef = useRef(1); // setTimeout 내부에서 최신값 읽기용
   const viewHeightRef = useRef(1);
   const hasResumedRef = useRef(false); // TXT 이어읽기 한 번만 실행
-  const contentRef = useRef<string[]>([]); // 현재 렌더링 중인 문단 배열 (저장 시 preview 생성용)
+  const contentRef = useRef<string[]>([]); // 현재 렌더링 중인 청크 배열 (저장 시 preview 생성용)
   const rawTextRef = useRef<string>(""); // 전체 원문 (progress 비율로 preview 추출용)
   const currentReadingPreviewRef = useRef<string>(""); // 현재 화면에 보이는 텍스트
   const lastProgressUpdateAtRef = useRef<number>(0); // 마지막 progress 메시지 수신 시간 (최신 preview 타이밍 추적용)
@@ -303,6 +325,30 @@ export default function ReaderScreen() {
           }
         };
 
+        const getFallbackPaths = (path: string) => {
+          const fileNameOnly = path.split('/').pop() || '';
+          const documentDirectory = FileSystem.documentDirectory ?? '';
+          return [
+            `${documentDirectory}library-files/${fileNameOnly}`,
+            `${documentDirectory}${fileNameOnly}`,
+          ];
+        };
+
+        const readTextWithNativeFallback = async (path: string): Promise<string | null> => {
+          const direct = await readExternalTextFile(path);
+          if (direct != null) return direct;
+
+          for (const fallback of getFallbackPaths(path)) {
+            const fallbackText = await readExternalTextFile(fallback);
+            if (fallbackText != null) {
+              console.log("⚠️ TXT 네이티브 폴백 성공:", fallback);
+              return fallbackText;
+            }
+          }
+
+          return null;
+        };
+
         if (isEpubFile) {
           // 큰 EPUB은 base64를 거대한 WebView HTML에 포함하지 않고 파일 URI로 직접 연다.
           try {
@@ -336,18 +382,35 @@ export default function ReaderScreen() {
         } else {
           // TXT 파일
           console.log("text 파일 읽기");
+          hasResumedRef.current = false;
           setTxtLoading(true);
-          const base64 = await readWithFallback(decoded, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
-          const buffer = Buffer.from(base64, 'base64');
-          const text = decodeTextSafe(buffer);
+          setTxtError(null);
+          setContent([]);
+          contentRef.current = [];
+          rawTextRef.current = "";
+          txtItemLayoutsRef.current = {};
+          currentReadingPreviewRef.current = "";
+          setContentHeight(1);
+          contentHeightRef.current = 1;
+
+          let text = await readTextWithNativeFallback(decoded);
+          if (text == null) {
+            console.log("⚠️ 네이티브 TXT 읽기 실패, JS base64 폴백 사용");
+            const base64 = await readWithFallback(decoded, {
+              encoding: FileSystem.EncodingType.Base64,
+            });
+            const buffer = Buffer.from(base64, 'base64');
+            text = decodeTextSafe(buffer);
+          }
+
+          if (!active) return;
           const normalizedText = text.replace(/\r/g, '');
+          const chunks = splitTextIntoRenderChunks(normalizedText);
           rawTextRef.current = normalizedText; // progress 비율 fallback용
           txtItemLayoutsRef.current = {};
           currentReadingPreviewRef.current = "";
-          setContent([normalizedText]);
-          contentRef.current = [normalizedText];
+          setContent(chunks);
+          contentRef.current = chunks;
           setTxtLoading(false);
         }
       } catch (e) {
@@ -475,18 +538,15 @@ useEffect(() => {
   // 이미 여기서 flag → 중복 실행 방지
   hasResumedRef.current = true;
 
-  // FlatList가 아이템을 완전히 렌더링한 후 스크롤하도록 딜레이
+  // ScrollView가 전체 청크의 높이를 계산한 후 스크롤하도록 딜레이
   // setTimeout 내부에서 ref(최신값)를 읽어야 정확한 위치로 이동
   setTimeout(() => {
     const latestMaxScroll = contentHeightRef.current - viewHeightRef.current;
     if (latestMaxScroll <= 0) return;
     const scrollY = latestMaxScroll * savedProgress;
     console.log("📚 TXT 이어읽기 실행! progress:", savedProgress, "scrollY:", scrollY, "maxScroll:", latestMaxScroll);
-    scrollRef.current?.scrollTo({
-      y: scrollY,
-      animated: false,
-    });
-    // scrollToOffset 후 onScroll이 발사 안 될 수 있으므로 preview 강제 갱신
+    scrollTxtToOffset(scrollY);
+    // 위치 이동 후 onScroll이 발사 안 될 수 있으므로 preview 강제 갱신
     currentScrollYRef.current = scrollY;
     if (updateTxtReadingPreview(scrollY, savedProgress)) {
       console.log("📖 이어읽기 preview 갱신:", currentReadingPreviewRef.current.slice(0, 50));
@@ -507,7 +567,7 @@ useEffect(() => {
     progressRef.current = 0;
     setProgress(0);
     setCurrentPage(1);
-    scrollRef.current?.scrollTo({ y: 0, animated: false });
+    scrollTxtToOffset(0);
     setTimeout(() => updateTxtReadingPreview(0, 0), 80);
   }
 }, [contentHeight, viewHeight, isEpub, resetProgress]);
@@ -579,42 +639,26 @@ useEffect(() => {
 
     const clamped = Math.min(1, Math.max(0, value));
     const pos = Math.floor(clamped * raw.length);
-    const start = Math.max(0, pos - 50);
-    const end = Math.min(raw.length, pos + 200);
-    return raw.slice(start, end).replace(/\s+/g, ' ').trim();
+    return createPreviewText(raw, pos);
   };
 
   const updateTxtReadingPreview = (offsetY = currentScrollYRef.current, progressValue = progressRef.current) => {
     const viewportTop = Math.max(0, offsetY);
-    const viewportBottom = viewportTop + Math.max(viewHeightRef.current, 1);
-    const visibleLines: { itemIndex: number; y: number; text: string }[] = [];
+    let preview = "";
 
-    Object.entries(txtItemLayoutsRef.current).forEach(([key, itemLayout]) => {
+    for (const [key, itemLayout] of Object.entries(txtItemLayoutsRef.current)) {
       const itemTop = itemLayout.y;
       const itemBottom = itemTop + itemLayout.height;
-      if (itemBottom < viewportTop || itemTop > viewportBottom) return;
+      if (viewportTop < itemTop || viewportTop > itemBottom) continue;
 
-      const itemIndex = Number(key);
-      itemLayout.lines.forEach((line) => {
-        const lineTop = itemTop + line.y;
-        const lineBottom = lineTop + line.height;
-        if (lineBottom >= viewportTop && lineTop <= viewportBottom) {
-          const text = line.text.trimEnd();
-          if (text.trim()) visibleLines.push({ itemIndex, y: lineTop, text });
-        }
-      });
-    });
-
-    visibleLines.sort((a, b) => (a.y - b.y) || (a.itemIndex - b.itemIndex));
-
-    let preview = "";
-    let prevItemIndex: number | null = null;
-    for (const line of visibleLines) {
-      const separator = prevItemIndex == null ? "" : (line.itemIndex === prevItemIndex ? "\n" : "\n\n");
-      const next = preview + separator + line.text;
-      preview = next.length > 800 ? next.slice(0, 800).trimEnd() : next;
-      prevItemIndex = line.itemIndex;
-      if (preview.length >= 800) break;
+      const itemText = contentRef.current[Number(key)] || "";
+      const itemRatio = itemLayout.height > 0
+        ? Math.min(1, Math.max(0, (viewportTop - itemTop) / itemLayout.height))
+        : 0;
+      const itemPos = Math.floor(itemText.length * itemRatio);
+      const previewStart = Math.max(0, itemPos - Math.floor(PREVIEW_CHAR_LIMIT * 0.35));
+      preview = createPreviewText(itemText.slice(previewStart, previewStart + PREVIEW_CHAR_LIMIT));
+      break;
     }
 
     if (!preview) {
@@ -622,7 +666,7 @@ useEffect(() => {
     }
 
     if (preview) {
-      currentReadingPreviewRef.current = preview;
+      currentReadingPreviewRef.current = createPreviewText(preview);
       lastProgressUpdateAtRef.current = Date.now();
       return true;
     }
@@ -631,23 +675,15 @@ useEffect(() => {
   };
 
   const setTxtItemFrame = (index: number, y: number, height: number) => {
-    const current = txtItemLayoutsRef.current[index] || { y, height, lines: [] };
-    txtItemLayoutsRef.current[index] = { ...current, y, height };
+    txtItemLayoutsRef.current[index] = { y, height };
     updateTxtReadingPreview();
   };
 
-  const setTxtItemLines = (index: number, lines: any[]) => {
-    const lineHeight = settings.fontSize * settings.lineSpacing;
-    const current = txtItemLayoutsRef.current[index] || { y: 0, height: 0, lines: [] };
-    txtItemLayoutsRef.current[index] = {
-      ...current,
-      lines: lines.map((line, lineIndex) => ({
-        text: String(line.text || ""),
-        y: typeof line.y === "number" ? line.y : lineIndex * lineHeight,
-        height: typeof line.height === "number" ? line.height : lineHeight,
-      })),
-    };
-    updateTxtReadingPreview();
+  const scrollTxtToOffset = (offset: number) => {
+    scrollRef.current?.scrollTo({
+      y: Math.max(0, offset),
+      animated: false,
+    });
   };
 
   const handleScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
@@ -667,7 +703,7 @@ useEffect(() => {
     setTotalPages(pages);
     setCurrentPage(Math.min(pages, Math.max(1, Math.floor(offsetY / Math.max(viewHeight, 1)) + 1)));
 
-    // readingPreview: TXT는 렌더된 줄의 실제 y좌표 기준으로 현재 화면 텍스트를 저장
+    // readingPreview: 현재 청크 안의 위치를 기준으로 화면 근처 텍스트를 저장
     if (!skipPreview) {
       updateTxtReadingPreview(offsetY, clamped);
     }
@@ -684,7 +720,7 @@ useEffect(() => {
     setProgress(value);
     setTotalPages(pages);
     setCurrentPage(Math.min(pages, Math.max(1, Math.floor(value * pages) + 1)));
-    scrollRef.current.scrollTo({ y: offset, animated: false });
+    scrollTxtToOffset(offset);
     setTimeout(() => updateTxtReadingPreview(offset, value), 80);
   };
 
@@ -753,7 +789,7 @@ useEffect(() => {
           if (typeof anchorRatio === 'number') lastAnchorRatioRef.current = anchorRatio;
         }
         if (visibleText) {
-          currentReadingPreviewRef.current = visibleText;
+          currentReadingPreviewRef.current = createPreviewText(visibleText);
           lastProgressUpdateAtRef.current = Date.now(); // 최신 preview 도착 시간 기록
         }
       } else if (data.type === "restored") {
@@ -3933,26 +3969,26 @@ useEffect(() => {
                 }
               }}
             >
-              <Text
-                onLayout={(e) => {
-                  const { y, height } = e.nativeEvent.layout;
-                  setTxtItemFrame(0, y, height);
-                }}
-                onTextLayout={(e) => {
-                  setTxtItemLines(0, e.nativeEvent.lines || []);
-                }}
-                style={[
-                  styles.text,
-                  {
-                    fontSize: settings.fontSize,
-                    color: settings.textColor,
-                    lineHeight: settings.fontSize * settings.lineSpacing,
-                    fontFamily: settings.fontFamily !== "default" ? settings.fontFamily : undefined,
-                  },
-                ]}
-              >
-                {content[0] || ""}
-              </Text>
+              {content.map((item, index) => (
+                <Text
+                  key={`txt-${index}`}
+                  onLayout={(e) => {
+                    const { y, height } = e.nativeEvent.layout;
+                    setTxtItemFrame(index, y, height);
+                  }}
+                  style={[
+                    styles.text,
+                    {
+                      fontSize: settings.fontSize,
+                      color: settings.textColor,
+                      lineHeight: settings.fontSize * settings.lineSpacing,
+                      fontFamily: settings.fontFamily !== "default" ? settings.fontFamily : undefined,
+                    },
+                  ]}
+                >
+                  {item}
+                </Text>
+              ))}
             </ScrollView>
             )}
           </View>
