@@ -23,7 +23,9 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
+import { readExternalTextFile } from "external-file-info";
 import { authenticatedFetch, BASE_URL } from "../utils/api";
+import { createPreviewText, PREVIEW_CHAR_LIMIT } from "../utils/preview";
 
 // 여러 인코딩 시도 방식 (효율적인 순서)
 function decodeTextSafe(buffer: Buffer): string {
@@ -91,16 +93,9 @@ interface ReaderSettings {
   sidePadding: number;  // 좌우 여백 px (8 ~ 60)
 }
 
-interface TxtLineLayout {
-  text: string;
-  y: number;
-  height: number;
-}
-
 interface TxtItemLayout {
   y: number;
   height: number;
-  lines: TxtLineLayout[];
 }
 
 const DEFAULT_SETTINGS: ReaderSettings = {
@@ -126,13 +121,40 @@ const FONT_PRESETS = [
   { label: "명조", value: "Georgia" },
 ];
 
+const TXT_RENDER_CHUNK_SIZE = 12000;
+
+function splitTextIntoRenderChunks(text: string): string[] {
+  if (!text) return [""];
+
+  const chunks: string[] = [];
+  let start = 0;
+
+  while (start < text.length) {
+    let end = Math.min(text.length, start + TXT_RENDER_CHUNK_SIZE);
+
+    if (end < text.length) {
+      const newline = text.lastIndexOf("\n", end);
+      if (newline > start + TXT_RENDER_CHUNK_SIZE * 0.55) {
+        end = newline + 1;
+      } else if (text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) {
+        end -= 1;
+      }
+    }
+
+    chunks.push(text.slice(start, end));
+    start = end;
+  }
+
+  return chunks;
+}
+
 export default function ReaderScreen() {
   const router = useRouter();
   const { fileId, uri, name, type, resetProgress } = useLocalSearchParams();
   const insets = useSafeAreaInsets();
 
   const [isEpub, setIsEpub] = useState(false);
-  const [content, setContent] = useState<string[]>([]); // txt 문단 배열
+  const [content, setContent] = useState<string[]>([]); // txt 렌더링 청크 배열
   const [txtLoading, setTxtLoading] = useState(false); // txt 로딩 중
   const [txtError, setTxtError] = useState<string | null>(null); // txt 에러
   const [showUI, setShowUI] = useState(true);
@@ -154,7 +176,7 @@ export default function ReaderScreen() {
   const contentHeightRef = useRef(1); // setTimeout 내부에서 최신값 읽기용
   const viewHeightRef = useRef(1);
   const hasResumedRef = useRef(false); // TXT 이어읽기 한 번만 실행
-  const contentRef = useRef<string[]>([]); // 현재 렌더링 중인 문단 배열 (저장 시 preview 생성용)
+  const contentRef = useRef<string[]>([]); // 현재 렌더링 중인 청크 배열 (저장 시 preview 생성용)
   const rawTextRef = useRef<string>(""); // 전체 원문 (progress 비율로 preview 추출용)
   const currentReadingPreviewRef = useRef<string>(""); // 현재 화면에 보이는 텍스트
   const lastProgressUpdateAtRef = useRef<number>(0); // 마지막 progress 메시지 수신 시간 (최신 preview 타이밍 추적용)
@@ -273,7 +295,7 @@ export default function ReaderScreen() {
         const decoded = decodeURI(uri as string);
         console.log("📖 파일 읽기 시작:", fileName, "→", decoded);
 
-        // readAsStringAsync 시도 후 ENOENT면 documentDirectory로 폴백
+        // 앱 컨테이너 경로가 바뀐 경우 현재 documentDirectory에서 다시 찾는다.
         const readWithFallback = async (path: string, opts: any): Promise<string> => {
           try {
             return await FileSystem.readAsStringAsync(path, opts);
@@ -281,12 +303,50 @@ export default function ReaderScreen() {
             const msg = String(e);
             if (msg.includes('ENOENT') || msg.includes('FileNotFoundException')) {
               const fileNameOnly = path.split('/').pop() || '';
-              const fallback = (FileSystem.documentDirectory ?? '') + fileNameOnly;
-              console.log("⚠️ 폴백 시도:", fallback);
-              return await FileSystem.readAsStringAsync(fallback, opts);
+              const documentDirectory = FileSystem.documentDirectory ?? '';
+              const fallbackPaths = [
+                `${documentDirectory}library-files/${fileNameOnly}`,
+                `${documentDirectory}${fileNameOnly}`,
+              ];
+
+              for (const fallback of fallbackPaths) {
+                try {
+                  console.log("⚠️ 폴백 시도:", fallback);
+                  return await FileSystem.readAsStringAsync(fallback, opts);
+                } catch (fallbackError) {
+                  const fallbackMessage = String(fallbackError);
+                  if (!fallbackMessage.includes('ENOENT') && !fallbackMessage.includes('FileNotFoundException')) {
+                    throw fallbackError;
+                  }
+                }
+              }
             }
             throw e;
           }
+        };
+
+        const getFallbackPaths = (path: string) => {
+          const fileNameOnly = path.split('/').pop() || '';
+          const documentDirectory = FileSystem.documentDirectory ?? '';
+          return [
+            `${documentDirectory}library-files/${fileNameOnly}`,
+            `${documentDirectory}${fileNameOnly}`,
+          ];
+        };
+
+        const readTextWithNativeFallback = async (path: string): Promise<string | null> => {
+          const direct = await readExternalTextFile(path);
+          if (direct != null) return direct;
+
+          for (const fallback of getFallbackPaths(path)) {
+            const fallbackText = await readExternalTextFile(fallback);
+            if (fallbackText != null) {
+              console.log("⚠️ TXT 네이티브 폴백 성공:", fallback);
+              return fallbackText;
+            }
+          }
+
+          return null;
         };
 
         if (isEpubFile) {
@@ -322,18 +382,35 @@ export default function ReaderScreen() {
         } else {
           // TXT 파일
           console.log("text 파일 읽기");
+          hasResumedRef.current = false;
           setTxtLoading(true);
-          const base64 = await readWithFallback(decoded, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
-          const buffer = Buffer.from(base64, 'base64');
-          const text = decodeTextSafe(buffer);
+          setTxtError(null);
+          setContent([]);
+          contentRef.current = [];
+          rawTextRef.current = "";
+          txtItemLayoutsRef.current = {};
+          currentReadingPreviewRef.current = "";
+          setContentHeight(1);
+          contentHeightRef.current = 1;
+
+          let text = await readTextWithNativeFallback(decoded);
+          if (text == null) {
+            console.log("⚠️ 네이티브 TXT 읽기 실패, JS base64 폴백 사용");
+            const base64 = await readWithFallback(decoded, {
+              encoding: FileSystem.EncodingType.Base64,
+            });
+            const buffer = Buffer.from(base64, 'base64');
+            text = decodeTextSafe(buffer);
+          }
+
+          if (!active) return;
           const normalizedText = text.replace(/\r/g, '');
+          const chunks = splitTextIntoRenderChunks(normalizedText);
           rawTextRef.current = normalizedText; // progress 비율 fallback용
           txtItemLayoutsRef.current = {};
           currentReadingPreviewRef.current = "";
-          setContent([normalizedText]);
-          contentRef.current = [normalizedText];
+          setContent(chunks);
+          contentRef.current = chunks;
           setTxtLoading(false);
         }
       } catch (e) {
@@ -461,18 +538,15 @@ useEffect(() => {
   // 이미 여기서 flag → 중복 실행 방지
   hasResumedRef.current = true;
 
-  // FlatList가 아이템을 완전히 렌더링한 후 스크롤하도록 딜레이
+  // ScrollView가 전체 청크의 높이를 계산한 후 스크롤하도록 딜레이
   // setTimeout 내부에서 ref(최신값)를 읽어야 정확한 위치로 이동
   setTimeout(() => {
     const latestMaxScroll = contentHeightRef.current - viewHeightRef.current;
     if (latestMaxScroll <= 0) return;
     const scrollY = latestMaxScroll * savedProgress;
     console.log("📚 TXT 이어읽기 실행! progress:", savedProgress, "scrollY:", scrollY, "maxScroll:", latestMaxScroll);
-    scrollRef.current?.scrollTo({
-      y: scrollY,
-      animated: false,
-    });
-    // scrollToOffset 후 onScroll이 발사 안 될 수 있으므로 preview 강제 갱신
+    scrollTxtToOffset(scrollY);
+    // 위치 이동 후 onScroll이 발사 안 될 수 있으므로 preview 강제 갱신
     currentScrollYRef.current = scrollY;
     if (updateTxtReadingPreview(scrollY, savedProgress)) {
       console.log("📖 이어읽기 preview 갱신:", currentReadingPreviewRef.current.slice(0, 50));
@@ -493,7 +567,7 @@ useEffect(() => {
     progressRef.current = 0;
     setProgress(0);
     setCurrentPage(1);
-    scrollRef.current?.scrollTo({ y: 0, animated: false });
+    scrollTxtToOffset(0);
     setTimeout(() => updateTxtReadingPreview(0, 0), 80);
   }
 }, [contentHeight, viewHeight, isEpub, resetProgress]);
@@ -565,42 +639,26 @@ useEffect(() => {
 
     const clamped = Math.min(1, Math.max(0, value));
     const pos = Math.floor(clamped * raw.length);
-    const start = Math.max(0, pos - 50);
-    const end = Math.min(raw.length, pos + 200);
-    return raw.slice(start, end).replace(/\s+/g, ' ').trim();
+    return createPreviewText(raw, pos);
   };
 
   const updateTxtReadingPreview = (offsetY = currentScrollYRef.current, progressValue = progressRef.current) => {
     const viewportTop = Math.max(0, offsetY);
-    const viewportBottom = viewportTop + Math.max(viewHeightRef.current, 1);
-    const visibleLines: { itemIndex: number; y: number; text: string }[] = [];
+    let preview = "";
 
-    Object.entries(txtItemLayoutsRef.current).forEach(([key, itemLayout]) => {
+    for (const [key, itemLayout] of Object.entries(txtItemLayoutsRef.current)) {
       const itemTop = itemLayout.y;
       const itemBottom = itemTop + itemLayout.height;
-      if (itemBottom < viewportTop || itemTop > viewportBottom) return;
+      if (viewportTop < itemTop || viewportTop > itemBottom) continue;
 
-      const itemIndex = Number(key);
-      itemLayout.lines.forEach((line) => {
-        const lineTop = itemTop + line.y;
-        const lineBottom = lineTop + line.height;
-        if (lineBottom >= viewportTop && lineTop <= viewportBottom) {
-          const text = line.text.trimEnd();
-          if (text.trim()) visibleLines.push({ itemIndex, y: lineTop, text });
-        }
-      });
-    });
-
-    visibleLines.sort((a, b) => (a.y - b.y) || (a.itemIndex - b.itemIndex));
-
-    let preview = "";
-    let prevItemIndex: number | null = null;
-    for (const line of visibleLines) {
-      const separator = prevItemIndex == null ? "" : (line.itemIndex === prevItemIndex ? "\n" : "\n\n");
-      const next = preview + separator + line.text;
-      preview = next.length > 800 ? next.slice(0, 800).trimEnd() : next;
-      prevItemIndex = line.itemIndex;
-      if (preview.length >= 800) break;
+      const itemText = contentRef.current[Number(key)] || "";
+      const itemRatio = itemLayout.height > 0
+        ? Math.min(1, Math.max(0, (viewportTop - itemTop) / itemLayout.height))
+        : 0;
+      const itemPos = Math.floor(itemText.length * itemRatio);
+      const previewStart = Math.max(0, itemPos - Math.floor(PREVIEW_CHAR_LIMIT * 0.35));
+      preview = createPreviewText(itemText.slice(previewStart, previewStart + PREVIEW_CHAR_LIMIT));
+      break;
     }
 
     if (!preview) {
@@ -608,7 +666,7 @@ useEffect(() => {
     }
 
     if (preview) {
-      currentReadingPreviewRef.current = preview;
+      currentReadingPreviewRef.current = createPreviewText(preview);
       lastProgressUpdateAtRef.current = Date.now();
       return true;
     }
@@ -617,23 +675,15 @@ useEffect(() => {
   };
 
   const setTxtItemFrame = (index: number, y: number, height: number) => {
-    const current = txtItemLayoutsRef.current[index] || { y, height, lines: [] };
-    txtItemLayoutsRef.current[index] = { ...current, y, height };
+    txtItemLayoutsRef.current[index] = { y, height };
     updateTxtReadingPreview();
   };
 
-  const setTxtItemLines = (index: number, lines: any[]) => {
-    const lineHeight = settings.fontSize * settings.lineSpacing;
-    const current = txtItemLayoutsRef.current[index] || { y: 0, height: 0, lines: [] };
-    txtItemLayoutsRef.current[index] = {
-      ...current,
-      lines: lines.map((line, lineIndex) => ({
-        text: String(line.text || ""),
-        y: typeof line.y === "number" ? line.y : lineIndex * lineHeight,
-        height: typeof line.height === "number" ? line.height : lineHeight,
-      })),
-    };
-    updateTxtReadingPreview();
+  const scrollTxtToOffset = (offset: number) => {
+    scrollRef.current?.scrollTo({
+      y: Math.max(0, offset),
+      animated: false,
+    });
   };
 
   const handleScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
@@ -653,7 +703,7 @@ useEffect(() => {
     setTotalPages(pages);
     setCurrentPage(Math.min(pages, Math.max(1, Math.floor(offsetY / Math.max(viewHeight, 1)) + 1)));
 
-    // readingPreview: TXT는 렌더된 줄의 실제 y좌표 기준으로 현재 화면 텍스트를 저장
+    // readingPreview: 현재 청크 안의 위치를 기준으로 화면 근처 텍스트를 저장
     if (!skipPreview) {
       updateTxtReadingPreview(offsetY, clamped);
     }
@@ -670,7 +720,7 @@ useEffect(() => {
     setProgress(value);
     setTotalPages(pages);
     setCurrentPage(Math.min(pages, Math.max(1, Math.floor(value * pages) + 1)));
-    scrollRef.current.scrollTo({ y: offset, animated: false });
+    scrollTxtToOffset(offset);
     setTimeout(() => updateTxtReadingPreview(offset, value), 80);
   };
 
@@ -739,7 +789,7 @@ useEffect(() => {
           if (typeof anchorRatio === 'number') lastAnchorRatioRef.current = anchorRatio;
         }
         if (visibleText) {
-          currentReadingPreviewRef.current = visibleText;
+          currentReadingPreviewRef.current = createPreviewText(visibleText);
           lastProgressUpdateAtRef.current = Date.now(); // 최신 preview 도착 시간 기록
         }
       } else if (data.type === "restored") {
@@ -816,6 +866,9 @@ useEffect(() => {
           width: 100%;
           height: 100%;
           padding: 0;
+          opacity: 1;
+          transform: translateY(0);
+          transform-origin: center;
         }
         #book-cover {
           display: none;
@@ -1072,7 +1125,7 @@ useEffect(() => {
               }
               var atTop = fallbackSectionEl.scrollTop <= 6;
               var atBottom = fallbackSectionEl.scrollTop + fallbackSectionEl.clientHeight >= fallbackSectionEl.scrollHeight - 10;
-              if (dt <= 1400 && Math.abs(dy) >= 55 && Math.abs(dx) < Math.abs(dy) * 0.8) {
+              if (dt <= 1400 && Math.abs(dy) >= 88 && Math.abs(dx) < Math.abs(dy) * 0.8) {
                 if (dy < 0 && atBottom) triggerAutoTransition(false);
                 else if (dy > 0 && atTop) triggerAutoTransition(true);
               }
@@ -1299,10 +1352,11 @@ useEffect(() => {
                 var pullStartY = 0;
                 var pullDist = 0;
                 var pullTriggered = false;
+                var pullReady = false;
                 var startedAtTop = false;
                 var startedAtBottom = false;
                 var startedInShortSection = false;
-                var PULL_TH = 80; // outer indicator threshold와 일치시켜 첫 화면에서도 바로 전환
+                var PULL_TH = 96;
 
                 // 실제로 스크롤되는 엘리먼트를 찾는 함수
                 // scrolled-doc 모드에서는 iframe 내부 body/html이 스크롤되지 않고
@@ -1405,6 +1459,7 @@ useEffect(() => {
                   pullDir = null;
                   pullDist = 0;
                   pullTriggered = false;
+                  pullReady = false;
                   pullStartY = e.touches[0].clientY;
                   try { window.parent.hidePullIndicator(); } catch(_) {}
 
@@ -1464,7 +1519,7 @@ useEffect(() => {
                   // 경계를 벗어나면 취소
                   if ((pullDir === 'prev' && !atTop) || (pullDir === 'next' && !atBottom)) {
                     log('🔍PULL ▶ CANCEL (left boundary)');
-                    pullDir = null; pullDist = 0;
+                    pullDir = null; pullDist = 0; pullReady = false;
                     try { window.parent.hidePullIndicator(); } catch(_) {}
                     return;
                   }
@@ -1477,15 +1532,10 @@ useEffect(() => {
                   }
 
                   try { window.parent.showPullIndicator(pullDir, pullDist / PULL_TH); } catch(_) {}
+                  pullReady = pullDist >= PULL_TH;
 
                   // pull 중 native 스크롤/bounce 방지
                   try { e.preventDefault(); } catch(_) {}
-
-                  if (pullDist >= PULL_TH) {
-                    pullTriggered = true;
-                    log('🔍PULL ▶ TRIGGER ' + pullDir + ' dist=' + Math.round(pullDist));
-                    try { window.parent.triggerAutoTransition(pullDir === 'prev'); } catch(_) {}
-                  }
                 }, { passive: false, capture: true }); // capture로 표지 SVG/이미지의 이벤트 차단 우회
 
                 doc.addEventListener("touchend", function(e) {
@@ -1494,12 +1544,17 @@ useEffect(() => {
                   var dy = Math.abs(signedDy);
                   var dt = Date.now() - tapStartTime;
                   var tappedAnchor = findAnchor(e.target);
+                  if (!pullTriggered && pullReady && pullDir) {
+                    pullTriggered = true;
+                    log('🔍PULL ▶ RELEASE TRIGGER ' + pullDir + ' dist=' + Math.round(pullDist));
+                    try { window.parent.triggerAutoTransition(pullDir === 'prev'); } catch(_) {}
+                  }
                   if (!movedDuringTouch && !pullTriggered && dx <= 8 && dy <= 8 && dt <= 400 && tappedAnchor) {
                     openInternalLink(tappedAnchor, e);
                   }
                   // 표지처럼 스크롤할 영역이 없는 첫 섹션은 touchmove가 네이티브에 소비될 수 있다.
                   // touchend의 전체 이동 거리로 경계 당김을 확정해 다음/이전 spine으로 이동한다.
-                  if (!pullTriggered && dx < dy * 0.8 && dy >= 55 && dt <= 1200) {
+                  if (!pullTriggered && dx < dy * 0.8 && dy >= 88 && dt <= 1200) {
                     if ((startedAtBottom || startedInShortSection) && signedDy < 0) {
                       pullTriggered = true;
                       log('🔍PULL ▶ TOUCHEND NEXT FALLBACK dy=' + Math.round(signedDy));
@@ -1520,7 +1575,7 @@ useEffect(() => {
                   if (!pullTriggered) {
                     try { window.parent.hidePullIndicator(); } catch(_) {}
                   }
-                  pullDir = null; pullDist = 0; pullTriggered = false;
+                  pullDir = null; pullDist = 0; pullTriggered = false; pullReady = false;
                   startedAtTop = false; startedAtBottom = false; startedInShortSection = false;
                 }, { passive: true, capture: true });
 
@@ -2053,7 +2108,10 @@ useEffect(() => {
             var pullBarBottom = document.getElementById('pull-bar-bottom');
             var pullArrowTop = document.getElementById('pull-arrow-top');
             var pullArrowBottom = document.getElementById('pull-arrow-bottom');
-            var PULL_THRESHOLD = 80;
+            var pullLabelTop = document.getElementById('pull-label-top');
+            var pullLabelBottom = document.getElementById('pull-label-bottom');
+            var CHAPTER_EXIT_MS = 190;
+            var CHAPTER_ENTER_MS = 280;
 
             function showPullIndicator(dir, progress) {
               try {
@@ -2066,11 +2124,13 @@ useEffect(() => {
                   if (pullIndicatorTop) pullIndicatorTop.style.height = h + 'px';
                   if (pullBarTop) pullBarTop.style.width = pct;
                   if (pullArrowTop) pullArrowTop.style.transform = clampedP >= 1 ? 'scale(1.3)' : 'scale(1)';
+                  if (pullLabelTop) pullLabelTop.textContent = clampedP >= 1 ? '놓아서 이전 챕터' : '이전 챕터로';
                 } else {
                   if (pullIndicatorTop) pullIndicatorTop.style.height = '0px';
                   if (pullIndicatorBottom) pullIndicatorBottom.style.height = h + 'px';
                   if (pullBarBottom) pullBarBottom.style.width = pct;
                   if (pullArrowBottom) pullArrowBottom.style.transform = clampedP >= 1 ? 'scale(1.3)' : 'scale(1)';
+                  if (pullLabelBottom) pullLabelBottom.textContent = clampedP >= 1 ? '놓아서 다음 챕터' : '다음 챕터로';
                 }
               } catch(e) {}
             }
@@ -2079,21 +2139,58 @@ useEffect(() => {
               try {
                 if (pullIndicatorTop) pullIndicatorTop.style.height = '0px';
                 if (pullIndicatorBottom) pullIndicatorBottom.style.height = '0px';
+                if (pullBarTop) pullBarTop.style.width = '0%';
+                if (pullBarBottom) pullBarBottom.style.width = '0%';
+                if (pullArrowTop) pullArrowTop.style.transform = 'scale(1)';
+                if (pullArrowBottom) pullArrowBottom.style.transform = 'scale(1)';
+                if (pullLabelTop) pullLabelTop.textContent = '이전 챕터로';
+                if (pullLabelBottom) pullLabelBottom.textContent = '다음 챕터로';
               } catch(e) {}
+            }
+
+            function forEachTransitionSurface(callback) {
+              [viewerEl, fallbackSectionEl, bookCoverEl].forEach(function(surface) {
+                if (surface) callback(surface);
+              });
             }
 
             function playSoftTransition(goPrev) {
               try {
-                viewerEl.style.transition = 'transform 180ms ease, opacity 180ms ease';
-                viewerEl.style.opacity = '0.92';
-                viewerEl.style.transform = goPrev ? 'translateY(20px)' : 'translateY(-20px)';
+                forEachTransitionSurface(function(surface) {
+                  surface.style.willChange = 'transform, opacity';
+                  surface.style.transition = 'transform ' + CHAPTER_EXIT_MS + 'ms cubic-bezier(0.4, 0, 1, 1), opacity ' + CHAPTER_EXIT_MS + 'ms ease-out';
+                  surface.style.opacity = '0.35';
+                  surface.style.transform = goPrev ? 'translateY(24px)' : 'translateY(-24px)';
+                });
+              } catch(e) {}
+            }
+
+            function playSoftEntrance(goPrev) {
+              try {
+                forEachTransitionSurface(function(surface) {
+                  surface.style.transition = 'none';
+                  surface.style.opacity = '0.35';
+                  surface.style.transform = goPrev ? 'translateY(-20px)' : 'translateY(20px)';
+                });
+                void viewerEl.offsetHeight;
+                requestAnimationFrame(function() {
+                  forEachTransitionSurface(function(surface) {
+                    surface.style.transition = 'transform ' + CHAPTER_ENTER_MS + 'ms cubic-bezier(0.16, 1, 0.3, 1), opacity ' + CHAPTER_ENTER_MS + 'ms ease-out';
+                    surface.style.opacity = '1';
+                    surface.style.transform = 'translateY(0px)';
+                  });
+                });
               } catch(e) {}
             }
 
             function clearSoftTransition() {
               try {
-                viewerEl.style.opacity = '1';
-                viewerEl.style.transform = 'translateY(0px)';
+                forEachTransitionSurface(function(surface) {
+                  surface.style.opacity = '1';
+                  surface.style.transform = 'translateY(0px)';
+                  surface.style.transition = 'none';
+                  surface.style.willChange = 'auto';
+                });
               } catch(e) {}
             }
 
@@ -2340,6 +2437,7 @@ useEffect(() => {
               isChapterLoading = true;
               hidePullIndicator();
               showChapterIndicator(goPrev ? '이전 챕터 불러오는 중…' : '다음 챕터 불러오는 중…');
+              playSoftTransition(goPrev);
 
               var finished = false;
               function finishTransition() {
@@ -2361,17 +2459,25 @@ useEffect(() => {
               }
 
               // 일부 EPUB은 display Promise가 끝나지 않으므로 상태 잠금 방지 watchdog 필요
-              var watchdog = setTimeout(finishTransition, 2000);
-              displayAdjacentSection(goPrev).then(function() {
-                setTimeout(function() {
+              var watchdog = setTimeout(finishTransition, 3000);
+              setTimeout(function() {
+                displayAdjacentSection(goPrev).then(function() {
+                  if (finished) return;
+                  var settleDelay = pendingSectionEdge ? 520 : 80;
+                  setTimeout(function() {
+                    if (finished) return;
+                    playSoftEntrance(goPrev);
+                    setTimeout(function() {
+                      clearTimeout(watchdog);
+                      finishTransition();
+                    }, CHAPTER_ENTER_MS + 30);
+                  }, settleDelay);
+                }).catch(function(e) {
+                  sendLog('⚠️ 챕터 직접 이동 오류: ' + e.message);
                   clearTimeout(watchdog);
                   finishTransition();
-                }, pendingSectionEdge ? 620 : 180);
-              }).catch(function(e) {
-                sendLog('⚠️ 챕터 직접 이동 오류: ' + e.message);
-                clearTimeout(watchdog);
-                finishTransition();
-              });
+                });
+              }, CHAPTER_EXIT_MS);
             }
 
             function tryBoundaryTransition(goPrev) {
@@ -3786,7 +3892,7 @@ useEffect(() => {
                   const dt = Date.now() - start.time;
                   const isVerticalSwipe =
                     dt <= 1400 &&
-                    Math.abs(dy) >= 70 &&
+                    Math.abs(dy) >= 96 &&
                     Math.abs(dx) < Math.abs(dy) * 0.75;
 
                   if (isVerticalSwipe) {
@@ -3843,7 +3949,7 @@ useEffect(() => {
                     const dt = Date.now() - touch.time;
                     const isVerticalSwipe =
                       dt <= 1400 &&
-                      Math.abs(dy) >= 55 &&
+                      Math.abs(dy) >= 88 &&
                       Math.abs(dx) < Math.abs(dy) * 0.8;
 
                     if (isVerticalSwipe) {
@@ -3919,26 +4025,26 @@ useEffect(() => {
                 }
               }}
             >
-              <Text
-                onLayout={(e) => {
-                  const { y, height } = e.nativeEvent.layout;
-                  setTxtItemFrame(0, y, height);
-                }}
-                onTextLayout={(e) => {
-                  setTxtItemLines(0, e.nativeEvent.lines || []);
-                }}
-                style={[
-                  styles.text,
-                  {
-                    fontSize: settings.fontSize,
-                    color: settings.textColor,
-                    lineHeight: settings.fontSize * settings.lineSpacing,
-                    fontFamily: settings.fontFamily !== "default" ? settings.fontFamily : undefined,
-                  },
-                ]}
-              >
-                {content[0] || ""}
-              </Text>
+              {content.map((item, index) => (
+                <Text
+                  key={`txt-${index}`}
+                  onLayout={(e) => {
+                    const { y, height } = e.nativeEvent.layout;
+                    setTxtItemFrame(index, y, height);
+                  }}
+                  style={[
+                    styles.text,
+                    {
+                      fontSize: settings.fontSize,
+                      color: settings.textColor,
+                      lineHeight: settings.fontSize * settings.lineSpacing,
+                      fontFamily: settings.fontFamily !== "default" ? settings.fontFamily : undefined,
+                    },
+                  ]}
+                >
+                  {item}
+                </Text>
+              ))}
             </ScrollView>
             )}
           </View>

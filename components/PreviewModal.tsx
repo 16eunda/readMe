@@ -1,6 +1,7 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { Modal, Pressable, ScrollView, Text, TouchableOpacity, View } from "react-native";
+import { createPreviewText } from "../utils/preview";
 
 export default function PreviewModal({
   visible,
@@ -10,6 +11,7 @@ export default function PreviewModal({
   onClose
 }: any) {
   const router = useRouter();
+  const singleLinePreview = createPreviewText(previewText);
 
   if (!file) return null;
 
@@ -72,7 +74,7 @@ export default function PreviewModal({
                 lineHeight: 24,
               }}
             >
-              {previewText}
+              {singleLinePreview}
             </Text>
           </ScrollView>
 
