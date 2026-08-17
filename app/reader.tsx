@@ -6,6 +6,7 @@ import * as FileSystem from "expo-file-system/legacy";
 import * as NavigationBar from "expo-navigation-bar";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import iconv from 'iconv-lite';
+import { Search, X } from "lucide-react-native";
 import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -24,6 +25,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 import { readExternalTextFile } from "external-file-info";
+import ReaderSearchModal, { ReaderSearchResult } from "../components/ReaderSearchModal";
 import { authenticatedFetch, BASE_URL } from "../utils/api";
 import { createPreviewText, PREVIEW_CHAR_LIMIT } from "../utils/preview";
 
@@ -98,6 +100,13 @@ interface TxtItemLayout {
   height: number;
 }
 
+interface TxtSearchTarget {
+  chunkIndex: number;
+  localOffset: number;
+  length: number;
+  query: string;
+}
+
 const DEFAULT_SETTINGS: ReaderSettings = {
   fontSize: 18,
   bgColor: "#f5f0e6",
@@ -122,6 +131,28 @@ const FONT_PRESETS = [
 ];
 
 const TXT_RENDER_CHUNK_SIZE = 12000;
+const TXT_SEARCH_SCAN_CHUNK_SIZE = 250000;
+const READER_SEARCH_RESULT_LIMIT = 100;
+
+function escapeSearchPattern(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function splitSearchExcerpt(excerpt: string, query: string) {
+  const normalized = String(excerpt || "").replace(/\s+/g, " ").trim();
+  const normalizedQuery = query.trim();
+  const matchIndex = normalized.toLocaleLowerCase().indexOf(normalizedQuery.toLocaleLowerCase());
+
+  if (matchIndex < 0 || !normalizedQuery) {
+    return { before: normalized, match: "", after: "" };
+  }
+
+  return {
+    before: normalized.slice(0, matchIndex),
+    match: normalized.slice(matchIndex, matchIndex + normalizedQuery.length),
+    after: normalized.slice(matchIndex + normalizedQuery.length),
+  };
+}
 
 function splitTextIntoRenderChunks(text: string): string[] {
   if (!text) return [""];
@@ -211,6 +242,121 @@ export default function ReaderScreen() {
   const [settings, setSettings] = useState<ReaderSettings>(DEFAULT_SETTINGS);
   const [showSettings, setShowSettings] = useState(false);
 
+  // ===== 본문 검색 =====
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<ReaderSearchResult[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchLimited, setSearchLimited] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [txtSearchTarget, setTxtSearchTarget] = useState<TxtSearchTarget | null>(null);
+  const [epubSearchHighlightActive, setEpubSearchHighlightActive] = useState(false);
+  const searchRequestIdRef = useRef(0);
+  const pendingTxtSearchTargetRef = useRef<TxtSearchTarget | null>(null);
+
+  useEffect(() => {
+    if (!showSearch) return;
+
+    const query = searchQuery.trim();
+    const requestId = searchRequestIdRef.current + 1;
+    searchRequestIdRef.current = requestId;
+    setSearchResults([]);
+    setSearchLimited(false);
+    setSearchError(null);
+
+    if (!query) {
+      setSearchLoading(false);
+      webViewRef.current?.postMessage(JSON.stringify({ type: "cancelSearch", requestId }));
+      return;
+    }
+
+    setSearchLoading(true);
+    const debounceTimer = setTimeout(() => {
+      if (searchRequestIdRef.current !== requestId) return;
+
+      if (isEpub) {
+        if (!epubReady || !webViewRef.current) {
+          setSearchLoading(false);
+          setSearchError("EPUB 본문을 불러온 뒤 다시 검색해 주세요.");
+          return;
+        }
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "searchBook",
+          query,
+          requestId,
+          limit: READER_SEARCH_RESULT_LIMIT,
+        }));
+        return;
+      }
+
+      const raw = rawTextRef.current;
+      if (!raw) {
+        setSearchLoading(false);
+        return;
+      }
+
+      const results: ReaderSearchResult[] = [];
+      const pattern = new RegExp(escapeSearchPattern(query), "giu");
+      let cursor = 0;
+      let publishedResultCount = 0;
+
+      const scanNextChunk = () => {
+        if (searchRequestIdRef.current !== requestId) return;
+
+        const ownedEnd = Math.min(raw.length, cursor + TXT_SEARCH_SCAN_CHUNK_SIZE);
+        const scanEnd = Math.min(raw.length, ownedEnd + Math.max(0, query.length - 1));
+        const chunk = raw.slice(cursor, scanEnd);
+        pattern.lastIndex = 0;
+
+        let found: RegExpExecArray | null;
+        while ((found = pattern.exec(chunk)) && results.length < READER_SEARCH_RESULT_LIMIT) {
+          const textOffset = cursor + found.index;
+          if (textOffset >= ownedEnd) break;
+
+          const contextStart = Math.max(0, textOffset - 70);
+          const contextEnd = Math.min(raw.length, textOffset + found[0].length + 110);
+          const before = raw.slice(contextStart, textOffset).replace(/\s+/g, " ").trimStart();
+          const match = raw.slice(textOffset, textOffset + found[0].length).replace(/\s+/g, " ");
+          const after = raw.slice(textOffset + found[0].length, contextEnd).replace(/\s+/g, " ").trimEnd();
+          const ratio = raw.length > 0 ? textOffset / raw.length : 0;
+
+          results.push({
+            id: `txt-${requestId}-${textOffset}`,
+            before: `${contextStart > 0 ? "… " : ""}${before}`,
+            match,
+            after: `${after}${contextEnd < raw.length ? " …" : ""}`,
+            locationLabel: `${Math.max(1, Math.round(ratio * 100))}% 지점`,
+            textOffset,
+          });
+
+          if (found[0].length === 0) pattern.lastIndex += 1;
+        }
+
+        if (results.length !== publishedResultCount) {
+          publishedResultCount = results.length;
+          setSearchResults([...results]);
+        }
+        if (results.length >= READER_SEARCH_RESULT_LIMIT) {
+          setSearchLimited(true);
+          setSearchLoading(false);
+          return;
+        }
+
+        cursor = ownedEnd;
+        if (cursor >= raw.length) {
+          setSearchLoading(false);
+          return;
+        }
+
+        setTimeout(scanNextChunk, 0);
+      };
+
+      scanNextChunk();
+    }, 250);
+
+    return () => clearTimeout(debounceTimer);
+  }, [epubReady, isEpub, searchQuery, showSearch]);
+
   // 리더 진입 기록: lastReadAt/읽기 횟수는 progress 저장과 분리해 세션당 한 번만 기록한다.
   useEffect(() => {
     const currentFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId ?? "");
@@ -283,6 +429,15 @@ export default function ReaderScreen() {
     setEpubNavigationReady(false);
     setEpubNavigationError(false);
     setEpubAtFirstSection(false);
+    setShowSearch(false);
+    setSearchQuery("");
+    setSearchResults([]);
+    setSearchLoading(false);
+    setSearchLimited(false);
+    setSearchError(null);
+    setTxtSearchTarget(null);
+    setEpubSearchHighlightActive(false);
+    pendingTxtSearchTargetRef.current = null;
     setLastCfi(null);
     lastWebPercentRef.current = null;
     epubStartedRef.current = false;
@@ -388,6 +543,8 @@ export default function ReaderScreen() {
           setContent([]);
           contentRef.current = [];
           rawTextRef.current = "";
+          setTxtSearchTarget(null);
+          pendingTxtSearchTargetRef.current = null;
           txtItemLayoutsRef.current = {};
           currentReadingPreviewRef.current = "";
           setContentHeight(1);
@@ -744,6 +901,134 @@ useEffect(() => {
     }
   };
 
+  const openReaderSearch = () => {
+    setShowSettings(false);
+    setShowUI(true);
+    setShowSearch(true);
+  };
+
+  const dismissReaderSearch = () => {
+    const requestId = searchRequestIdRef.current + 1;
+    searchRequestIdRef.current = requestId;
+    setShowSearch(false);
+    setSearchLoading(false);
+    webViewRef.current?.postMessage(JSON.stringify({ type: "cancelSearch", requestId }));
+  };
+
+  const cancelReaderSearch = () => {
+    const requestId = searchRequestIdRef.current + 1;
+    searchRequestIdRef.current = requestId;
+    setShowSearch(false);
+    setSearchQuery("");
+    setSearchResults([]);
+    setSearchLoading(false);
+    setSearchLimited(false);
+    setSearchError(null);
+    setTxtSearchTarget(null);
+    setEpubSearchHighlightActive(false);
+    pendingTxtSearchTargetRef.current = null;
+    webViewRef.current?.postMessage(JSON.stringify({
+      type: "cancelSearch",
+      requestId,
+      clearHighlight: true,
+    }));
+  };
+
+  const moveTxtToSearchOffset = (targetOffset: number) => {
+    const maxScroll = Math.max(0, contentHeightRef.current - viewHeightRef.current);
+    const clampedOffset = Math.min(maxScroll, Math.max(0, targetOffset));
+    const nextProgress = maxScroll > 0 ? clampedOffset / maxScroll : 0;
+    const pages = Math.max(1, Math.ceil(contentHeightRef.current / Math.max(viewHeightRef.current, 1)));
+
+    hasResumedRef.current = true;
+    currentScrollYRef.current = clampedOffset;
+    progressRef.current = nextProgress;
+    setProgress(nextProgress);
+    setTotalPages(pages);
+    setCurrentPage(Math.min(pages, Math.max(1, Math.floor(clampedOffset / Math.max(viewHeightRef.current, 1)) + 1)));
+    scrollTxtToOffset(clampedOffset);
+    setTimeout(() => updateTxtReadingPreview(clampedOffset, nextProgress), 80);
+  };
+
+  const handleTxtSearchTextLayout = (chunkIndex: number, lines: any[]) => {
+    const target = pendingTxtSearchTargetRef.current;
+    const chunkLayout = txtItemLayoutsRef.current[chunkIndex];
+    const chunkText = contentRef.current[chunkIndex] || "";
+    if (!target || target.chunkIndex !== chunkIndex || !chunkLayout || !Array.isArray(lines) || lines.length === 0) return;
+
+    const approximateLineIndex = Math.min(
+      lines.length - 1,
+      Math.max(0, Math.floor((target.localOffset / Math.max(1, chunkText.length)) * lines.length))
+    );
+    const normalizedQuery = target.query.toLocaleLowerCase();
+    let selectedLineIndex = approximateLineIndex;
+    let closestDistance = Number.POSITIVE_INFINITY;
+
+    lines.forEach((line, index) => {
+      if (!String(line.text || "").toLocaleLowerCase().includes(normalizedQuery)) return;
+      const distance = Math.abs(index - approximateLineIndex);
+      if (distance < closestDistance) {
+        closestDistance = distance;
+        selectedLineIndex = index;
+      }
+    });
+
+    const selectedLine = lines[selectedLineIndex];
+    const lineY = typeof selectedLine?.y === "number"
+      ? selectedLine.y
+      : selectedLineIndex * settings.fontSize * settings.lineSpacing;
+    pendingTxtSearchTargetRef.current = null;
+    moveTxtToSearchOffset(chunkLayout.y + lineY - viewHeightRef.current * 0.28);
+  };
+
+  const handleSearchResultSelect = (result: ReaderSearchResult) => {
+    dismissReaderSearch();
+
+    if (isEpub) {
+      if (!result.cfi) return;
+      setEpubSearchHighlightActive(true);
+      webViewRef.current?.postMessage(JSON.stringify({
+        type: "navigateSearchResult",
+        cfi: result.cfi,
+        query: searchQuery.trim(),
+      }));
+      return;
+    }
+
+    if (typeof result.textOffset !== "number") return;
+
+    let chunkStart = 0;
+    let chunkIndex = 0;
+    for (let index = 0; index < contentRef.current.length; index += 1) {
+      const nextStart = chunkStart + contentRef.current[index].length;
+      chunkIndex = index;
+      if (result.textOffset < nextStart || index === contentRef.current.length - 1) break;
+      chunkStart = nextStart;
+    }
+
+    const chunkText = contentRef.current[chunkIndex] || "";
+    const chunkLayout = txtItemLayoutsRef.current[chunkIndex];
+    const localOffset = Math.max(0, result.textOffset - chunkStart);
+    const target: TxtSearchTarget = {
+      chunkIndex,
+      localOffset,
+      length: Math.max(1, result.match.length || searchQuery.trim().length),
+      query: searchQuery.trim(),
+    };
+    setTxtSearchTarget(target);
+    pendingTxtSearchTargetRef.current = target;
+
+    const withinChunk = chunkText.length > 0
+      ? Math.min(1, Math.max(0, localOffset / chunkText.length))
+      : 0;
+    const maxScroll = Math.max(0, contentHeightRef.current - viewHeightRef.current);
+    const estimatedOffset = maxScroll * Math.min(1, Math.max(0, result.textOffset / Math.max(1, rawTextRef.current.length)));
+    const targetOffset = chunkLayout
+      ? chunkLayout.y + chunkLayout.height * withinChunk - viewHeightRef.current * 0.28
+      : estimatedOffset;
+    moveTxtToSearchOffset(targetOffset);
+  };
+
   // ===================== EPUB WebView 메시지 처리 =====================
   const handleWebViewMessage = (event: any) => {
     const message = event.nativeEvent.data;
@@ -826,6 +1111,24 @@ useEffect(() => {
         console.warn("⚠️ EPUB 위치 이동 계산 실패:", data.message);
         setEpubNavigationReady(false);
         setEpubNavigationError(true);
+      } else if (data.type === "searchResults") {
+        if (Number(data.requestId) !== searchRequestIdRef.current) return;
+
+        const responseQuery = String(data.query || searchQuery).trim();
+        const nextResults = (Array.isArray(data.results) ? data.results : []).map((item: any, index: number) => {
+          const parts = splitSearchExcerpt(String(item.excerpt || ""), responseQuery);
+          return {
+            id: `epub-${data.requestId}-${index}-${String(item.cfi || "")}`,
+            ...parts,
+            locationLabel: String(item.chapterLabel || `챕터 ${Number(item.sectionIndex || 0) + 1}`),
+            cfi: String(item.cfi || ""),
+          } satisfies ReaderSearchResult;
+        }).filter((item: ReaderSearchResult) => Boolean(item.cfi));
+
+        setSearchResults(nextResults);
+        setSearchLimited(Boolean(data.limited));
+        setSearchLoading(!data.done);
+        setSearchError(data.error ? String(data.error) : null);
       } else if (data.type === "sectionState") {
         setEpubAtFirstSection(Boolean(data.isFirst));
       } else if (data.type === "toggleUI") {
@@ -3331,12 +3634,421 @@ useEffect(() => {
 
             // nav 영역은 제거 (스와이프만 사용)
 
+            var activeSearchRequestId = 0;
+
+            function normalizeSearchHref(value) {
+              try {
+                return decodeURIComponent(String(value || '')).split('#')[0].replace(/^\\.\\//, '');
+              } catch(e) {
+                return String(value || '').split('#')[0].replace(/^\\.\\//, '');
+              }
+            }
+
+            function getSearchChapterLabel(section, sectionIndex) {
+              try {
+                var targetHref = normalizeSearchHref(section && section.href);
+                var queue = book.navigation && Array.isArray(book.navigation.toc)
+                  ? book.navigation.toc.slice()
+                  : [];
+                while (queue.length > 0) {
+                  var item = queue.shift();
+                  if (!item) continue;
+                  var itemHref = normalizeSearchHref(item.href);
+                  if (itemHref === targetHref || itemHref.endsWith('/' + targetHref) || targetHref.endsWith('/' + itemHref)) {
+                    var label = String(item.label || '').replace(/\\s+/g, ' ').trim();
+                    if (label) return label;
+                  }
+                  if (Array.isArray(item.subitems) && item.subitems.length > 0) {
+                    queue.push.apply(queue, item.subitems);
+                  }
+                }
+              } catch(e) {}
+              return '챕터 ' + (sectionIndex + 1);
+            }
+
+            function postBookSearchResults(requestId, query, results, done, limited, error) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({
+                type: 'searchResults',
+                requestId: requestId,
+                query: query,
+                results: results,
+                done: Boolean(done),
+                limited: Boolean(limited),
+                error: error || null
+              }));
+            }
+
+            function loadSectionForSearch(section) {
+              return new Promise(function(resolve, reject) {
+                var settled = false;
+                var timeout = setTimeout(function() {
+                  if (settled) return;
+                  settled = true;
+                  reject(new Error('챕터 검색 시간 초과'));
+                }, 5000);
+
+                Promise.resolve(section.load(book.load.bind(book))).then(function(contents) {
+                  if (settled) return;
+                  settled = true;
+                  clearTimeout(timeout);
+                  resolve(contents);
+                }).catch(function(error) {
+                  if (settled) return;
+                  settled = true;
+                  clearTimeout(timeout);
+                  reject(error);
+                });
+              });
+            }
+
+            function isExcludedSearchElement(element) {
+              if (!element || element.nodeType !== 1) return false;
+
+              var tagName = String(element.localName || element.nodeName || '').toUpperCase();
+              if (
+                tagName === 'HEAD' ||
+                tagName === 'STYLE' ||
+                tagName === 'SCRIPT' ||
+                tagName === 'NOSCRIPT' ||
+                tagName === 'TEMPLATE' ||
+                tagName === 'TITLE' ||
+                tagName === 'META' ||
+                tagName === 'LINK' ||
+                tagName === 'NAV'
+              ) {
+                return true;
+              }
+
+              try {
+                if (element.hasAttribute('hidden')) return true;
+                if (String(element.getAttribute('aria-hidden') || '').toLowerCase() === 'true') {
+                  return true;
+                }
+
+                var inlineStyle = String(element.getAttribute('style') || '')
+                  .replace(/\\s+/g, '')
+                  .toLowerCase();
+                if (
+                  inlineStyle.indexOf('display:none') >= 0 ||
+                  inlineStyle.indexOf('visibility:hidden') >= 0
+                ) {
+                  return true;
+                }
+              } catch(e) {}
+
+              return false;
+            }
+
+            function isSearchableBodyTextNode(node, body) {
+              if (!node || node.nodeType !== 3 || !node.nodeValue) return false;
+
+              var current = node.parentNode;
+              while (current) {
+                if (isExcludedSearchElement(current)) return false;
+                if (current === body) return true;
+                current = current.parentNode;
+              }
+              return false;
+            }
+
+            function getSearchBlockElement(node, body) {
+              var blockTags = {
+                ADDRESS: true, ARTICLE: true, ASIDE: true, BLOCKQUOTE: true,
+                DD: true, DIV: true, DL: true, DT: true, FIGCAPTION: true,
+                FIGURE: true, FOOTER: true, FORM: true, H1: true, H2: true,
+                H3: true, H4: true, H5: true, H6: true, HEADER: true,
+                HR: true, LI: true, MAIN: true, OL: true, P: true,
+                PRE: true, SECTION: true, TABLE: true, TD: true, TH: true,
+                TR: true, UL: true
+              };
+              var current = node && node.parentNode;
+              while (current && current !== body) {
+                if (blockTags[String(current.localName || current.nodeName || '').toUpperCase()]) {
+                  return current;
+                }
+                current = current.parentNode;
+              }
+              return body;
+            }
+
+            function findBodyTextMatches(section, loadedDocument, query, requestedLimit) {
+              var doc = section && section.document ? section.document : loadedDocument;
+              var body = doc && (doc.body || (doc.querySelector && doc.querySelector('body')));
+              var limit = Math.max(0, Number(requestedLimit) || 0);
+              if (!doc || !body || !limit || !query || typeof doc.createTreeWalker !== 'function') {
+                return [];
+              }
+
+              var walker = doc.createTreeWalker(body, 4, {
+                acceptNode: function(node) {
+                  return isSearchableBodyTextNode(node, body) ? 1 : 2;
+                }
+              });
+              var segments = [];
+              var fullText = '';
+              var previousBlock = null;
+              var textNode = walker.nextNode();
+
+              while (textNode) {
+                var value = String(textNode.nodeValue || '');
+                var block = getSearchBlockElement(textNode, body);
+                if (
+                  fullText &&
+                  previousBlock &&
+                  block !== previousBlock &&
+                  !/\\s$/.test(fullText) &&
+                  !/^\\s/.test(value)
+                ) {
+                  fullText += '\\n';
+                }
+
+                var start = fullText.length;
+                fullText += value;
+                segments.push({
+                  node: textNode,
+                  start: start,
+                  end: fullText.length
+                });
+                previousBlock = block;
+                textNode = walker.nextNode();
+              }
+
+              function locateTextOffset(offset, endPosition) {
+                for (var index = 0; index < segments.length; index += 1) {
+                  var segment = segments[index];
+                  var belongsToSegment = endPosition
+                    ? offset > segment.start && offset <= segment.end
+                    : offset >= segment.start && offset < segment.end;
+                  if (belongsToSegment) {
+                    return {
+                      node: segment.node,
+                      offset: Math.max(0, Math.min(
+                        String(segment.node.nodeValue || '').length,
+                        offset - segment.start
+                      ))
+                    };
+                  }
+                }
+                return null;
+              }
+
+              var normalizedText = fullText.toLocaleLowerCase();
+              var normalizedQuery = String(query).toLocaleLowerCase();
+              var matches = [];
+              var cursor = 0;
+
+              while (cursor <= normalizedText.length - normalizedQuery.length && matches.length < limit) {
+                var matchIndex = normalizedText.indexOf(normalizedQuery, cursor);
+                if (matchIndex < 0) break;
+
+                var matchEnd = matchIndex + normalizedQuery.length;
+                var startPosition = locateTextOffset(matchIndex, false);
+                var endPosition = locateTextOffset(matchEnd, true);
+
+                if (startPosition && endPosition && typeof doc.createRange === 'function') {
+                  try {
+                    var range = doc.createRange();
+                    range.setStart(startPosition.node, startPosition.offset);
+                    range.setEnd(endPosition.node, endPosition.offset);
+                    var cfi = typeof section.cfiFromRange === 'function'
+                      ? section.cfiFromRange(range)
+                      : '';
+
+                    if (cfi) {
+                      var excerptStart = Math.max(0, matchIndex - 70);
+                      var excerptEnd = Math.min(fullText.length, matchEnd + 110);
+                      var excerpt = fullText.slice(excerptStart, excerptEnd)
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                      matches.push({
+                        cfi: cfi,
+                        excerpt:
+                          (excerptStart > 0 ? '… ' : '') +
+                          excerpt +
+                          (excerptEnd < fullText.length ? ' …' : '')
+                      });
+                    }
+                  } catch(e) {}
+                }
+
+                cursor = matchIndex + Math.max(1, normalizedQuery.length);
+              }
+
+              return matches;
+            }
+
+            function searchBook(query, requestId, requestedLimit) {
+              var normalizedQuery = String(query || '').trim();
+              var limit = Math.max(1, Math.min(100, Number(requestedLimit) || 100));
+              activeSearchRequestId = requestId;
+
+              if (!normalizedQuery) {
+                postBookSearchResults(requestId, normalizedQuery, [], true, false, null);
+                return;
+              }
+
+              var sections = book.spine && book.spine.spineItems ? book.spine.spineItems : [];
+              var results = [];
+              var sectionCursor = 0;
+
+              function visitNextSection() {
+                if (activeSearchRequestId !== requestId) return;
+                if (sectionCursor >= sections.length || results.length >= limit) {
+                  postBookSearchResults(
+                    requestId,
+                    normalizedQuery,
+                    results,
+                    true,
+                    results.length >= limit,
+                    null
+                  );
+                  return;
+                }
+
+                var sectionIndex = sectionCursor;
+                var section = sections[sectionCursor];
+                sectionCursor += 1;
+                if (!section || section.linear === false || section.linear === 'no') {
+                  setTimeout(visitNextSection, 0);
+                  return;
+                }
+
+                loadSectionForSearch(section).then(function(contents) {
+                  if (activeSearchRequestId !== requestId) return [];
+                  return findBodyTextMatches(
+                    section,
+                    contents,
+                    normalizedQuery,
+                    limit - results.length
+                  );
+                }).then(function(matches) {
+                  if (activeSearchRequestId !== requestId) return;
+                  var chapterLabel = getSearchChapterLabel(section, sectionIndex);
+                  (Array.isArray(matches) ? matches : []).forEach(function(match) {
+                    if (results.length >= limit || !match || !match.cfi) return;
+                    results.push({
+                      cfi: String(match.cfi),
+                      excerpt: String(match.excerpt || normalizedQuery).replace(/\\s+/g, ' ').trim(),
+                      sectionIndex: sectionIndex,
+                      chapterLabel: chapterLabel
+                    });
+                  });
+                }).catch(function(error) {
+                  sendLog('⚠️ EPUB 검색 섹션 건너뜀 index=' + sectionIndex + ' error=' + error.message);
+                }).then(function() {
+                  try {
+                    if (sectionIndex !== getVisibleSectionIndex() && section && typeof section.unload === 'function') {
+                      section.unload();
+                    }
+                  } catch(e) {}
+
+                  if (activeSearchRequestId !== requestId) return;
+                  if (results.length > 0 || sectionCursor % 4 === 0) {
+                    postBookSearchResults(requestId, normalizedQuery, results, false, false, null);
+                  }
+                  setTimeout(visitNextSection, 0);
+                });
+              }
+
+              visitNextSection();
+            }
+
+            var lastSearchHighlightCfi = '';
+
+            function clearSearchHighlights() {
+              if (!lastSearchHighlightCfi) return;
+              try {
+                if (rendition.annotations && typeof rendition.annotations.remove === 'function') {
+                  rendition.annotations.remove(lastSearchHighlightCfi, 'highlight');
+                }
+              } catch(e) {}
+              lastSearchHighlightCfi = '';
+            }
+
+            function highlightSearchResult(targetCfi) {
+              clearSearchHighlights();
+              try {
+                if (!rendition.annotations || typeof rendition.annotations.highlight !== 'function') return;
+                rendition.annotations.highlight(
+                  targetCfi,
+                  { source: 'reader-search' },
+                  null,
+                  'readme-search-highlight',
+                  { fill: '#f6d878', 'fill-opacity': '0.62', 'mix-blend-mode': 'multiply' }
+                );
+                lastSearchHighlightCfi = targetCfi;
+              } catch(e) {
+                sendLog('⚠️ 검색 결과 강조 실패: ' + e.message);
+              }
+            }
+
+            function navigateSearchResult(targetCfi) {
+              if (!targetCfi || isSeeking || isAutoTransition) return;
+
+              isSeeking = true;
+              isChapterLoading = true;
+              activeSeekTargetCfi = targetCfi;
+              hideBookCover();
+              hideFallbackSection('검색 결과 이동', false);
+              showChapterIndicator('검색 위치로 이동 중…');
+              playSoftTransition(false);
+
+              var finished = false;
+              function finishSearchNavigation() {
+                if (finished) return;
+                finished = true;
+                clearSoftTransition();
+                hideChapterIndicator();
+                isSeeking = false;
+                isChapterLoading = false;
+                activeSeekTargetCfi = '';
+                lastCenterCfi = targetCfi;
+                updateCenterText();
+                try {
+                  var loc = rendition.currentLocation();
+                  if (loc) safeReport(loc, false);
+                } catch(e) {}
+                reportSectionState();
+              }
+
+              var watchdog = setTimeout(finishSearchNavigation, 3000);
+              setTimeout(function() {
+                Promise.resolve(rendition.display(targetCfi)).then(function() {
+                  requestAnimationFrame(function() {
+                    requestAnimationFrame(function() {
+                      setTimeout(function() {
+                        if (finished || activeSeekTargetCfi !== targetCfi) return;
+                        alignCfiInViewport(targetCfi, 0.32);
+                        highlightSearchResult(targetCfi);
+                        playSoftEntrance(false);
+                        setTimeout(function() {
+                          clearTimeout(watchdog);
+                          finishSearchNavigation();
+                        }, CHAPTER_ENTER_MS + 40);
+                      }, 140);
+                    });
+                  });
+                }).catch(function(error) {
+                  sendLog('⚠️ 검색 결과 이동 실패: ' + error.message);
+                  clearTimeout(watchdog);
+                  finishSearchNavigation();
+                });
+              }, CHAPTER_EXIT_MS);
+            }
+
             // React Native -> WebView 메시지 수신 (window로 수정!)
             window.addEventListener("message", function(e) {
               try {
                 var data = JSON.parse(e.data);
+                if (data.type === "searchBook") {
+                  searchBook(String(data.query || ''), Number(data.requestId) || 0, data.limit);
+                } else if (data.type === "cancelSearch") {
+                  activeSearchRequestId = Number(data.requestId) || (activeSearchRequestId + 1);
+                  if (data.clearHighlight) clearSearchHighlights();
+                } else if (data.type === "navigateSearchResult") {
+                  navigateSearchResult(String(data.cfi || ''));
                 // 저장 직전 최신 CFI 요청
-                if (data.type === "getCurrentLocation" && locationsReady) {
+                } else if (data.type === "getCurrentLocation" && locationsReady) {
                   try {
                     var loc = rendition.currentLocation();
                     if (loc) safeReport(loc);
@@ -3640,6 +4352,9 @@ useEffect(() => {
   `;
 
   const title = String(name || "").replace(/\.[^.]+$/, ""); // 확장자 제거
+  const hasActiveSearchHighlight = isEpub
+    ? epubSearchHighlightActive
+    : txtSearchTarget !== null;
 
   // ===================== 진행도 자동 저장 =====================
   // unmount 시점에 최신 progress를 저장하기 위해 useRef 사용
@@ -3819,6 +4534,27 @@ useEffect(() => {
           <Text style={styles.title} numberOfLines={1}>
             {title}
           </Text>
+          <View style={styles.topBarActions}>
+            <TouchableOpacity
+              style={styles.topBarIcon}
+              onPress={openReaderSearch}
+              accessibilityRole="button"
+              accessibilityLabel="본문 검색"
+            >
+              <Search size={22} color="#fff" />
+            </TouchableOpacity>
+            {hasActiveSearchHighlight && (
+              <TouchableOpacity
+                style={styles.topBarIcon}
+                onPress={cancelReaderSearch}
+                accessibilityRole="button"
+                accessibilityLabel="검색 종료 및 강조 해제"
+                accessibilityHint="현재 검색어의 노란색 강조 표시를 지웁니다"
+              >
+                <X size={23} color="#f6d878" />
+              </TouchableOpacity>
+            )}
+          </View>
         </View>
       )}
 
@@ -4025,26 +4761,38 @@ useEffect(() => {
                 }
               }}
             >
-              {content.map((item, index) => (
-                <Text
-                  key={`txt-${index}`}
-                  onLayout={(e) => {
-                    const { y, height } = e.nativeEvent.layout;
-                    setTxtItemFrame(index, y, height);
-                  }}
-                  style={[
-                    styles.text,
-                    {
-                      fontSize: settings.fontSize,
-                      color: settings.textColor,
-                      lineHeight: settings.fontSize * settings.lineSpacing,
-                      fontFamily: settings.fontFamily !== "default" ? settings.fontFamily : undefined,
-                    },
-                  ]}
-                >
-                  {item}
-                </Text>
-              ))}
+              {content.map((item, index) => {
+                const target = txtSearchTarget?.chunkIndex === index ? txtSearchTarget : null;
+                return (
+                  <Text
+                    key={`txt-${index}`}
+                    onLayout={(e) => {
+                      const { y, height } = e.nativeEvent.layout;
+                      setTxtItemFrame(index, y, height);
+                    }}
+                    onTextLayout={target ? (e) => handleTxtSearchTextLayout(index, e.nativeEvent.lines || []) : undefined}
+                    style={[
+                      styles.text,
+                      {
+                        fontSize: settings.fontSize,
+                        color: settings.textColor,
+                        lineHeight: settings.fontSize * settings.lineSpacing,
+                        fontFamily: settings.fontFamily !== "default" ? settings.fontFamily : undefined,
+                      },
+                    ]}
+                  >
+                    {target ? (
+                      <>
+                        {item.slice(0, target.localOffset)}
+                        <Text style={styles.searchHighlight}>
+                          {item.slice(target.localOffset, target.localOffset + target.length)}
+                        </Text>
+                        {item.slice(target.localOffset + target.length)}
+                      </>
+                    ) : item}
+                  </Text>
+                );
+              })}
             </ScrollView>
             )}
           </View>
@@ -4097,6 +4845,18 @@ useEffect(() => {
           backgroundColor: "#000",
           opacity: (1 - settings.brightness) * 0.75,
         }}
+      />
+
+      <ReaderSearchModal
+        visible={showSearch}
+        query={searchQuery}
+        results={searchResults}
+        loading={searchLoading}
+        limited={searchLimited}
+        error={searchError}
+        onQueryChange={setSearchQuery}
+        onSelect={handleSearchResultSelect}
+        onClose={cancelReaderSearch}
       />
 
       {/* 보기 설정 패널 */}
@@ -4265,9 +5025,9 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     paddingHorizontal: 16,
-    paddingBottom: 12,
+    paddingBottom: 8,
     flexDirection: "row",
-    alignItems: "flex-end",
+    alignItems: "center",
     backgroundColor: "rgba(0,0,0,0.5)",
     zIndex: 10,
   },
@@ -4295,9 +5055,21 @@ const styles = StyleSheet.create({
     marginBottom: 20,
   },
   title: {
+    flex: 1,
     color: "#fff",
     fontSize: 18,
     fontWeight: "bold",
+  },
+  topBarIcon: {
+    width: 40,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  topBarActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginRight: -8,
   },
   bottomBar: {
     position: "absolute",
@@ -4326,6 +5098,11 @@ const styles = StyleSheet.create({
     fontSize: 18,
     lineHeight: 28,
     color: "#333",
+  },
+  searchHighlight: {
+    color: "#1b1b1b",
+    backgroundColor: "#f6d878",
+    fontWeight: "700",
   },
   errorContainer: {
     flex: 1,
