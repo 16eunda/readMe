@@ -33,7 +33,7 @@ import styles from "../../styles/Home.styles";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { authenticatedFetch, BASE_URL } from "../../utils/api";
 import { getDeviceId } from "../../utils/deviceId";
-import { createPreviewText } from "../../utils/preview";
+import { createPreviewAroundOffset, createPreviewText } from "../../utils/preview";
 
 // 파일 수정 모달
 import iconv from 'iconv-lite';
@@ -49,6 +49,7 @@ import SortModal, { SortOption } from "../../components/SortModal";
 import { useUser } from "../../contexts/UserContext";
 
 const MANAGED_FILE_DIRECTORY = "library-files";
+const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
 
 async function createManagedFileUri(displayName: string): Promise<string> {
   const documentDirectory = FileSystem.documentDirectory;
@@ -188,6 +189,7 @@ export default function Home() {
   const fileListRef = useRef<FlatList<any>>(null);
   const locateRequestIdRef = useRef(0);
   const processedLocateFileIdRef = useRef("");
+  const externalFileProcessingRef = useRef("");
 
   // 정렬
   const [sortOption, setSortOption] = useState<SortOption>("date-desc");
@@ -438,6 +440,9 @@ export default function Home() {
   // 외부 파일 실제 처리
   const processExternalFile = async (file: { uri: string; name: string }) => {
     const { uri, name } = file;
+    const processingKey = `${name}:${uri}`;
+    if (externalFileProcessingRef.current === processingKey) return;
+    externalFileProcessingRef.current = processingKey;
     
     try {
       // 중복 체크 (root 폴더 기준)
@@ -449,44 +454,42 @@ export default function Home() {
       const { exists } = await checkRes.json();
 
       if (exists) {
-        Alert.alert(
-          '이미 있는 파일',
-          `"${name}"이(가) 이미 라이브러리에 있어요.`,
-          [
-            {
-              text: '그냥 열기',
-              onPress: async () => {
-                // 목록에서 찾아 reader로 이동
-                const res = await authenticatedFetch(
-                  `${BASE_URL}/files?path=root&page=0&size=100`,
-                  {},
-                  deviceId ?? undefined
-                );
-                const data = await res.json();
-                const list = data.content ?? data;
-                const found = (list as any[]).find((f: any) => f.title === name);
-                if (found) {
-                  router.push({
-                    pathname: '/reader',
-                    params: { fileId: found.id, uri: found.uri, name: found.title, type: found.type },
-                  });
-                }
-              },
-            },
-            {
-              text: '새로 추가',
-              onPress: async () => {
-                const saved = await addFileToSystem({ uri, name }, 'root');
-                if (saved) {
-                  router.push({
-                    pathname: '/reader',
-                    params: { fileId: saved.id, uri: saved.uri, name: saved.title, type: saved.type },
-                  });
-                }
-              },
-            },
-          ]
+        const searchParams = new URLSearchParams({
+          keyword: name,
+          page: '0',
+          size: '50',
+          sort: 'date,desc',
+        });
+        const existingResponse = await authenticatedFetch(
+          `${BASE_URL}/files/search?${searchParams.toString()}`,
+          {},
+          deviceId ?? undefined,
         );
+        const existingData = await existingResponse.json();
+        const existingFiles = Array.isArray(existingData)
+          ? existingData
+          : Array.isArray(existingData.content)
+            ? existingData.content
+            : [];
+        const existingFile = existingFiles.find((item: any) => (
+          item.title === name && String(item.path || 'root') === 'root'
+        ));
+
+        if (existingFile) {
+          console.log('📖 이미 등록된 외부 파일 열기:', existingFile.id, existingFile.title);
+          router.replace({
+            pathname: '/reader',
+            params: {
+              fileId: existingFile.id,
+              uri: existingFile.uri,
+              name: existingFile.title,
+              type: existingFile.type,
+            },
+          });
+        } else {
+          Alert.alert('파일 열기 실패', '등록된 파일을 찾지 못했습니다. 목록을 새로고침한 뒤 다시 시도해 주세요.');
+          refetchFiles();
+        }
         return;
       }
 
@@ -500,6 +503,10 @@ export default function Home() {
       }
     } catch (e) {
       console.error('❌ 외부 파일 처리 실패:', e);
+    } finally {
+      if (externalFileProcessingRef.current === processingKey) {
+        externalFileProcessingRef.current = "";
+      }
     }
   };
 
@@ -1136,9 +1143,32 @@ export default function Home() {
     // 1) 서버에서 진행도 가져오기
     const res = await authenticatedFetch(`${BASE_URL}/files/${file.id}`, {}, deviceId ?? undefined);
     const info = await res.json();
+    const isTxtFile = String(file.type || "").toUpperCase() === "TXT"
+      || String(file.title || "").toLowerCase().endsWith(".txt");
+    let localTxtPosition: {
+      progress?: number;
+      characterOffset?: number;
+      previewCharacterOffset?: number;
+    } | null = null;
+
+    if (isTxtFile) {
+      try {
+        const serializedPosition = await AsyncStorage.getItem(
+          `${TXT_LOCAL_PROGRESS_KEY_PREFIX}${file.id}`,
+        );
+        localTxtPosition = serializedPosition ? JSON.parse(serializedPosition) : null;
+      } catch (error) {
+        console.log("TXT 로컬 미리보기 위치 불러오기 실패:", error);
+      }
+    }
+
+    const localProgress = Number(localTxtPosition?.progress);
+    const effectiveProgress = Number.isFinite(localProgress) && localProgress > 0
+      ? localProgress
+      : Number(info.progress) || 0;
 
     // progress 없으면 바로 Reader로 이동
-    if (!info.progress || info.progress === 0) {
+    if (effectiveProgress <= 0) {
       router.push({
         pathname: "/reader",
         params: { fileId: file.id, uri: file.uri, name: file.title, type: file.type }
@@ -1148,10 +1178,10 @@ export default function Home() {
 
     // progress 있음 → 모달 띄우기
     setSelectedFile(file);
-    setLastProgress(info.progress);
+    setLastProgress(effectiveProgress);
 
     // 서버에 저장된 readingPreview 사용 (없으면 파일에서 직접 추출)
-    let preview = info.readingPreview || "";
+    let preview = isTxtFile ? "" : (info.readingPreview || "");
 
     if (!preview) {
       // TXT 미리보기: progress 위치의 줄을 보여줌
@@ -1159,9 +1189,25 @@ export default function Home() {
         encoding: FileSystem.EncodingType.Base64 
       });
       const buffer = Buffer.from(base64, 'base64');
-      const localContent = decodeTextSafe(buffer);
+      const decodedContent = decodeTextSafe(buffer);
+      // reader는 CRLF를 LF로 정규화한 문자열 좌표를 저장하므로 동일한 본문을 사용한다.
+      // 원본 CRLF 문자열에 저장 좌표를 적용하면 줄 수만큼 미리보기가 위로 어긋난다.
+      const localContent = decodedContent.includes('\r')
+        ? decodedContent.replace(/\r/g, '')
+        : decodedContent;
 
-      preview = createPreviewText(localContent, Math.floor(info.progress * localContent.length));
+      const savedPreviewOffset = Number(localTxtPosition?.previewCharacterOffset);
+      const savedCharacterOffset = Number(localTxtPosition?.characterOffset);
+      const characterOffset = Number.isFinite(savedCharacterOffset)
+        ? Math.min(
+            localContent.length,
+            Math.max(
+              0,
+              Math.floor(Number.isFinite(savedPreviewOffset) ? savedPreviewOffset : savedCharacterOffset),
+            ),
+          )
+        : Math.floor(effectiveProgress * localContent.length);
+      preview = createPreviewAroundOffset(localContent, characterOffset);
     }
 
     setPreviewText(preview);

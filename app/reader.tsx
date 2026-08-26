@@ -4,7 +4,7 @@ import Slider from "@react-native-community/slider";
 import { Buffer } from 'buffer';
 import * as FileSystem from "expo-file-system/legacy";
 import * as NavigationBar from "expo-navigation-bar";
-import { Stack, useLocalSearchParams, useRouter } from "expo-router";
+import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import iconv from 'iconv-lite';
 import { Search, X } from "lucide-react-native";
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -28,7 +28,7 @@ import { WebView } from "react-native-webview";
 import { readExternalTextFile } from "external-file-info";
 import ReaderSearchModal, { ReaderSearchResult } from "../components/ReaderSearchModal";
 import { authenticatedFetch, BASE_URL } from "../utils/api";
-import { createPreviewText, PREVIEW_CHAR_LIMIT } from "../utils/preview";
+import { createPreviewAroundOffset, createPreviewText } from "../utils/preview";
 
 // 여러 인코딩 시도 방식 (효율적인 순서)
 function decodeTextSafe(buffer: Buffer): string {
@@ -103,16 +103,6 @@ interface TxtSearchTarget {
   query: string;
 }
 
-interface TxtPendingNavigation {
-  id: number;
-  characterOffset: number;
-  chunkIndex: number;
-  localOffset: number;
-  lineTopInset: number;
-  revealWhenAligned: boolean;
-  viewPosition: number;
-}
-
 interface TxtRenderChunk {
   start: number;
   end: number;
@@ -157,6 +147,7 @@ const TXT_SEARCH_SCAN_CHUNK_SIZE = 250000;
 const READER_SEARCH_RESULT_LIMIT = 100;
 const TXT_SCROLL_UI_UPDATE_INTERVAL_MS = 100;
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
+const ACTIVE_READER_SESSION_KEY = "@active_reader_session";
 
 function escapeSearchPattern(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -208,6 +199,36 @@ export default function ReaderScreen() {
   const { fileId, uri, name, type, resetProgress } = useLocalSearchParams();
   const insets = useSafeAreaInsets();
   const { width: windowWidth } = useWindowDimensions();
+  const readerSessionIdRef = useRef(`${Date.now()}-${Math.random().toString(36).slice(2)}`);
+
+  useFocusEffect(
+    useCallback(() => {
+      const normalizedFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId ?? "");
+      const normalizedUri = Array.isArray(uri) ? String(uri[0] ?? "") : String(uri ?? "");
+      const normalizedName = Array.isArray(name) ? String(name[0] ?? "") : String(name ?? "");
+      const normalizedType = Array.isArray(type) ? String(type[0] ?? "") : String(type ?? "");
+      if (!normalizedFileId || !normalizedUri || !normalizedName) return;
+
+      const serializedSession = JSON.stringify({
+        sessionId: readerSessionIdRef.current,
+        fileId: normalizedFileId,
+        uri: normalizedUri,
+        name: normalizedName,
+        type: normalizedType,
+      });
+      AsyncStorage.setItem(ACTIVE_READER_SESSION_KEY, serializedSession).catch(() => {});
+
+      return () => {
+        AsyncStorage.getItem(ACTIVE_READER_SESSION_KEY)
+          .then((currentSession) => {
+            if (currentSession === serializedSession) {
+              return AsyncStorage.removeItem(ACTIVE_READER_SESSION_KEY);
+            }
+          })
+          .catch(() => {});
+      };
+    }, [fileId, name, type, uri]),
+  );
 
   const [isEpub, setIsEpub] = useState(false);
   const [content, setContent] = useState<TxtRenderChunk[]>([]); // txt 렌더링 구간 배열
@@ -222,15 +243,15 @@ export default function ReaderScreen() {
   const progressRef = useRef(progress); // unmount 시점에 최신 progress 저장용
 
   // 터치 vs 드래그 구분용
-  const touchStartPos = useRef({ x: 0, y: 0 });
-  const isTouchMove = useRef(false);
+  const touchStartPos = useRef({ x: 0, y: 0, time: 0, maxMove: 0 });
 
   // txt 전용 스크롤 정보
   const scrollRef = useRef<FlatList<TxtRenderChunk>>(null);
   const [viewHeight, setViewHeight] = useState(1);
+  const [txtContentHeight, setTxtContentHeight] = useState(1);
   const [txtLayoutEstimateReady, setTxtLayoutEstimateReady] = useState(false);
-  const [txtRestoring, setTxtRestoring] = useState(false);
   const viewHeightRef = useRef(1);
+  const txtContentHeightRef = useRef(1);
   const hasResumedRef = useRef(false); // TXT 이어읽기 한 번만 실행
   const contentRef = useRef<TxtRenderChunk[]>([]); // 현재 렌더링 구간 배열
   const rawTextRef = useRef<string>(""); // 전체 원문 (progress 비율로 preview 추출용)
@@ -238,6 +259,7 @@ export default function ReaderScreen() {
   const lastProgressUpdateAtRef = useRef<number>(0); // 마지막 progress 메시지 수신 시간 (최신 preview 타이밍 추적용)
   const currentScrollYRef = useRef<number>(0);
   const currentTxtCharOffsetRef = useRef(0);
+  const currentTxtPreviewCharOffsetRef = useRef(0);
   const currentTxtLineTopInsetRef = useRef(0);
   const txtVisibleChunkIndexRef = useRef(0);
   const txtItemLayoutsRef = useRef<Record<number, TxtItemLayout>>({});
@@ -247,9 +269,6 @@ export default function ReaderScreen() {
   const txtTotalPagesRef = useRef(1);
   const txtPixelsPerCharacterRef = useRef(1);
   const lastTxtScrollUiUpdateAtRef = useRef(0);
-  const txtNavigationIdRef = useRef(0);
-  const pendingTxtNavigationRef = useRef<TxtPendingNavigation | null>(null);
-  const isTxtProgrammaticNavigationRef = useRef(false);
   const navigateTxtToCharacterOffsetRef = useRef<(
     offset: number,
     viewPosition?: number,
@@ -257,7 +276,7 @@ export default function ReaderScreen() {
     lineTopInset?: number,
     revealWhenAligned?: boolean,
   ) => void>(() => {});
-  const completeTxtNavigationRef = useRef<(chunkIndex: number) => void>(() => {});
+  const updateTxtReadingPreviewRef = useRef<() => void>(() => {});
   const recordedReadFileIdRef = useRef("");
   const txtViewabilityConfigRef = useRef({ viewAreaCoveragePercentThreshold: 10 });
   const onTxtViewableItemsChangedRef = useRef(({ viewableItems }: any) => {
@@ -266,6 +285,7 @@ export default function ReaderScreen() {
       .sort((a: any, b: any) => a.index - b.index)[0];
     if (firstVisible && typeof firstVisible.index === "number") {
       txtVisibleChunkIndexRef.current = firstVisible.index;
+      requestAnimationFrame(() => updateTxtReadingPreviewRef.current());
     }
   });
 
@@ -527,10 +547,6 @@ export default function ReaderScreen() {
     setSearchError(null);
     setTxtSearchTarget(null);
     setEpubSearchHighlightActive(false);
-    setTxtRestoring(false);
-    txtNavigationIdRef.current += 1;
-    pendingTxtNavigationRef.current = null;
-    isTxtProgrammaticNavigationRef.current = false;
     setLastCfi(null);
     lastWebPercentRef.current = null;
     epubStartedRef.current = false;
@@ -634,9 +650,12 @@ export default function ReaderScreen() {
           setTxtLoading(true);
           setTxtError(null);
           setContent([]);
+          setTxtContentHeight(1);
+          txtContentHeightRef.current = 1;
           contentRef.current = [];
           rawTextRef.current = "";
           currentTxtCharOffsetRef.current = 0;
+          currentTxtPreviewCharOffsetRef.current = 0;
           currentTxtLineTopInsetRef.current = 0;
           txtVisibleChunkIndexRef.current = 0;
           txtItemLayoutsRef.current = {};
@@ -645,8 +664,6 @@ export default function ReaderScreen() {
           txtPaginationLockedRef.current = false;
           txtTotalPagesRef.current = 1;
           setTxtLayoutEstimateReady(false);
-          pendingTxtNavigationRef.current = null;
-          isTxtProgrammaticNavigationRef.current = false;
           setTxtSearchTarget(null);
           currentReadingPreviewRef.current = "";
 
@@ -665,6 +682,7 @@ export default function ReaderScreen() {
           const chunks = splitTextIntoRenderChunks(normalizedText);
           rawTextRef.current = normalizedText; // progress 비율 fallback용
           currentTxtCharOffsetRef.current = 0;
+          currentTxtPreviewCharOffsetRef.current = 0;
           currentTxtLineTopInsetRef.current = 0;
           txtVisibleChunkIndexRef.current = 0;
           txtItemLayoutsRef.current = {};
@@ -696,9 +714,6 @@ export default function ReaderScreen() {
     read();
     return () => {
       active = false;
-      txtNavigationIdRef.current += 1;
-      pendingTxtNavigationRef.current = null;
-      isTxtProgrammaticNavigationRef.current = false;
     };
   }, [uri, name, type, fileId]);
 
@@ -725,6 +740,8 @@ export default function ReaderScreen() {
   const initialProgressRef = useRef<number>(0); // saveProgressToServer에서 사용
   const initialTxtCharOffsetRef = useRef<number | null>(null);
   const initialTxtLineTopInsetRef = useRef(0);
+  const initialTxtScrollYRef = useRef<number | null>(null);
+  const initialTxtLayoutSignatureRef = useRef<string | null>(null);
 
   useEffect(() => {
   let active = true;
@@ -734,6 +751,8 @@ export default function ReaderScreen() {
   initialProgressRef.current = 0;
   initialTxtCharOffsetRef.current = null;
   initialTxtLineTopInsetRef.current = 0;
+  initialTxtScrollYRef.current = null;
+  initialTxtLayoutSignatureRef.current = null;
   setProgress(0);
   progressRef.current = 0;
   lastAnchorRatioRef.current = 0.5;
@@ -746,6 +765,8 @@ export default function ReaderScreen() {
       progress?: number;
       characterOffset?: number;
       lineTopInset?: number;
+      scrollY?: number;
+      layoutSignature?: string;
     } | null = null;
 
     try {
@@ -781,7 +802,12 @@ export default function ReaderScreen() {
         if (Number.isFinite(localPosition?.lineTopInset)) {
           initialTxtLineTopInsetRef.current = Math.max(0, Number(localPosition?.lineTopInset));
         }
-        setTxtRestoring(true);
+        if (Number.isFinite(localPosition?.scrollY)) {
+          initialTxtScrollYRef.current = Math.max(0, Number(localPosition?.scrollY));
+        }
+        if (typeof localPosition?.layoutSignature === "string") {
+          initialTxtLayoutSignatureRef.current = localPosition.layoutSignature;
+        }
       } else if (shouldResetProgress) {
         console.log("↩️ 처음으로 열기 - 저장된 progress/CFI 복원 생략");
       } else {
@@ -818,7 +844,12 @@ export default function ReaderScreen() {
         if (Number.isFinite(localPosition?.lineTopInset)) {
           initialTxtLineTopInsetRef.current = Math.max(0, Number(localPosition?.lineTopInset));
         }
-        setTxtRestoring(true);
+        if (Number.isFinite(localPosition?.scrollY)) {
+          initialTxtScrollYRef.current = Math.max(0, Number(localPosition?.scrollY));
+        }
+        if (typeof localPosition?.layoutSignature === "string") {
+          initialTxtLayoutSignatureRef.current = localPosition.layoutSignature;
+        }
       }
       setFileInfoLoaded(true); // 실패해도 EPUB 시작은 해야 함
     }
@@ -838,8 +869,8 @@ useEffect(() => {
   if (
     !fileInfoLoaded
     || !readerSettingsLoaded
-    || !txtLayoutEstimateReady
     || content.length === 0
+    || txtContentHeight <= 1
     || viewHeight <= 1
   ) return;
 
@@ -854,13 +885,22 @@ useEffect(() => {
           Math.min(1, Math.max(0, savedProgress)) * rawTextRef.current.length,
         );
     console.log("📚 TXT 이어읽기 실행! progress:", savedProgress, "characterOffset:", characterOffset);
-    navigateTxtToCharacterOffsetRef.current(
-      characterOffset,
-      0,
-      true,
-      initialTxtLineTopInsetRef.current,
-      true,
-    );
+    const savedScrollY = initialTxtScrollYRef.current;
+    const canRestoreExactScroll = savedScrollY != null
+      && initialTxtLayoutSignatureRef.current === txtLayoutSignature;
+
+    if (canRestoreExactScroll) {
+      const maxScrollY = Math.max(0, txtContentHeightRef.current - viewHeightRef.current);
+      const targetY = Math.min(maxScrollY, Math.max(0, savedScrollY));
+      hasResumedRef.current = true;
+      currentScrollYRef.current = targetY;
+      currentTxtCharOffsetRef.current = characterOffset;
+      currentTxtLineTopInsetRef.current = initialTxtLineTopInsetRef.current;
+      scrollTxtToOffset(targetY);
+      applyTxtCharacterPosition(characterOffset, savedProgress);
+    } else {
+      navigateTxtToCharacterOffsetRef.current(characterOffset, 0);
+    }
   }, 80);
 
   return () => clearTimeout(timer);
@@ -871,7 +911,8 @@ useEffect(() => {
   isEpub,
   readerSettingsLoaded,
   resetProgress,
-  txtLayoutEstimateReady,
+  txtContentHeight,
+  txtLayoutSignature,
   viewHeight,
 ]);
 
@@ -881,7 +922,6 @@ useEffect(() => {
 
   if (resetProgress === "true") {
     hasResumedRef.current = true;
-    setTxtRestoring(false);
     navigateTxtToCharacterOffsetRef.current(0, 0);
   }
 }, [content.length, isEpub, resetProgress, viewHeight]);
@@ -960,7 +1000,6 @@ useEffect(() => {
           const { y, height } = event.nativeEvent.layout;
           if (!(height > 0)) return;
           txtItemLayoutsRef.current[index] = { y, height };
-          requestAnimationFrame(() => completeTxtNavigationRef.current(index));
 
           const chunk = contentRef.current[index];
           if (!chunk || txtPaginationLockedRef.current) return;
@@ -1011,13 +1050,7 @@ useEffect(() => {
   const getRawTextPreviewAtOffset = (characterOffset: number) => {
     const raw = rawTextRef.current;
     if (raw.length === 0) return "";
-
-    const start = Math.min(
-      Math.max(0, raw.length - 1),
-      Math.max(0, Math.floor(characterOffset)),
-    );
-    const excerpt = raw.slice(start, start + PREVIEW_CHAR_LIMIT * 2);
-    return createPreviewText(excerpt);
+    return createPreviewAroundOffset(raw, characterOffset);
   };
 
   const getTxtChunkText = (index: number) => {
@@ -1026,24 +1059,36 @@ useEffect(() => {
     return rawTextRef.current.slice(chunk.start, chunk.end);
   };
 
-  const updateTxtReadingPreview = (_offsetY = currentScrollYRef.current, progressValue = progressRef.current) => {
+  const updateTxtReadingPreview = (offsetY = currentScrollYRef.current, progressValue = progressRef.current) => {
     const rawLength = rawTextRef.current.length;
     const fallbackOffset = Math.floor(
       Math.min(1, Math.max(0, progressValue)) * rawLength,
     );
+    const viewportCenterY = Math.min(
+      Math.max(0, txtContentHeightRef.current - 1),
+      Math.max(0, offsetY) + viewHeightRef.current * 0.5,
+    );
+    const visibleCenterOffset = getTxtCharacterOffsetForScroll(viewportCenterY, false);
     const characterOffset = Math.min(
       rawLength,
-      Math.max(0, currentTxtCharOffsetRef.current || fallbackOffset),
+      Math.max(
+        0,
+        visibleCenterOffset ?? fallbackOffset,
+      ),
     );
     const preview = getRawTextPreviewAtOffset(characterOffset);
 
     if (preview) {
+      currentTxtPreviewCharOffsetRef.current = characterOffset;
       currentReadingPreviewRef.current = createPreviewText(preview);
       lastProgressUpdateAtRef.current = Date.now();
       return true;
     }
 
     return false;
+  };
+  updateTxtReadingPreviewRef.current = () => {
+    updateTxtReadingPreview(currentScrollYRef.current, progressRef.current);
   };
 
   const scrollTxtToOffset = (offset: number) => {
@@ -1052,16 +1097,6 @@ useEffect(() => {
       animated: false,
     });
   };
-
-  const getTxtItemLayout = useCallback((_data: ArrayLike<TxtRenderChunk> | null | undefined, index: number) => {
-    const chunk = contentRef.current[index] || { start: 0, end: 0 };
-    const pixelsPerCharacter = Math.max(0.01, txtPixelsPerCharacterRef.current);
-    return {
-      index,
-      length: Math.max(1, (chunk.end - chunk.start) * pixelsPerCharacter),
-      offset: chunk.start * pixelsPerCharacter,
-    };
-  }, []);
 
   const findTxtChunkIndexForOffset = (characterOffset: number) => {
     const chunks = contentRef.current;
@@ -1084,13 +1119,15 @@ useEffect(() => {
     return Math.min(chunks.length - 1, Math.max(0, low));
   };
 
-  const applyTxtCharacterPosition = (characterOffset: number) => {
+  const applyTxtCharacterPosition = (characterOffset: number, progressOverride?: number) => {
     const rawLength = rawTextRef.current.length;
     const clampedOffset = Math.min(
       rawLength,
       Math.max(0, Math.floor(characterOffset)),
     );
-    const nextProgress = rawLength > 0 ? clampedOffset / rawLength : 0;
+    const nextProgress = typeof progressOverride === "number"
+      ? Math.min(1, Math.max(0, progressOverride))
+      : rawLength > 0 ? clampedOffset / rawLength : 0;
     const pages = Math.max(1, txtTotalPagesRef.current);
 
     currentTxtCharOffsetRef.current = clampedOffset;
@@ -1104,52 +1141,12 @@ useEffect(() => {
     updateTxtReadingPreview(currentScrollYRef.current, nextProgress);
   };
 
-  const completePendingTxtNavigation = (chunkIndex: number) => {
-    const pending = pendingTxtNavigationRef.current;
-    if (!pending || pending.chunkIndex !== chunkIndex) return;
-
-    const layout = txtItemLayoutsRef.current[chunkIndex];
-    const lineMetrics = txtLineMetricsRef.current[chunkIndex];
-    if (!layout || !Array.isArray(lineMetrics) || lineMetrics.length === 0) return;
-
-    let selectedLine = lineMetrics[0];
-    for (const line of lineMetrics) {
-      if (line.offset > pending.localOffset) break;
-      selectedLine = line;
-    }
-
-    const appliedLineTopInset = Math.min(
-      Math.max(0, selectedLine.height - 1),
-      Math.max(0, pending.lineTopInset),
-    );
-    const targetY = Math.max(
-      0,
-      layout.y
-        + selectedLine.y
-        + appliedLineTopInset
-        - viewHeightRef.current * pending.viewPosition,
-    );
-    pendingTxtNavigationRef.current = null;
-    currentScrollYRef.current = targetY;
-    currentTxtLineTopInsetRef.current = appliedLineTopInset;
-    scrollTxtToOffset(targetY);
-    applyTxtCharacterPosition(pending.characterOffset);
-
-    const navigationId = pending.id;
-    setTimeout(() => {
-      if (txtNavigationIdRef.current !== navigationId) return;
-      isTxtProgrammaticNavigationRef.current = false;
-      applyTxtCharacterPosition(pending.characterOffset);
-      if (pending.revealWhenAligned) setTxtRestoring(false);
-    }, 120);
-  };
-
   const navigateTxtToCharacterOffset = (
     characterOffset: number,
     viewPosition = 0,
-    alignToMeasuredLine = false,
+    _alignToMeasuredLine = false,
     lineTopInset = 0,
-    revealWhenAligned = false,
+    _revealWhenAligned = false,
   ) => {
     const rawLength = rawTextRef.current.length;
     const clampedOffset = Math.min(
@@ -1160,46 +1157,47 @@ useEffect(() => {
     const chunk = contentRef.current[chunkIndex];
     if (!scrollRef.current || !chunk) return;
 
-    const pending: TxtPendingNavigation = {
-      id: txtNavigationIdRef.current + 1,
-      characterOffset: clampedOffset,
-      chunkIndex,
-      localOffset: Math.max(0, clampedOffset - chunk.start),
-      lineTopInset: Math.max(0, lineTopInset),
-      revealWhenAligned,
-      viewPosition: Math.min(0.8, Math.max(0, viewPosition)),
-    };
-    txtNavigationIdRef.current = pending.id;
-    pendingTxtNavigationRef.current = alignToMeasuredLine ? pending : null;
-    isTxtProgrammaticNavigationRef.current = true;
-    hasResumedRef.current = true;
-    const targetY = Math.max(
-      0,
-      clampedOffset * Math.max(0.01, txtPixelsPerCharacterRef.current)
-        - viewHeightRef.current * pending.viewPosition,
-    );
-    currentScrollYRef.current = targetY;
-    if (!alignToMeasuredLine) currentTxtLineTopInsetRef.current = 0;
-    applyTxtCharacterPosition(clampedOffset);
-    scrollTxtToOffset(targetY);
+    const requestedProgress = rawLength > 0 ? clampedOffset / rawLength : 0;
+    const maxScrollY = Math.max(0, txtContentHeightRef.current - viewHeightRef.current);
+    const normalizedViewPosition = Math.min(0.8, Math.max(0, viewPosition));
+    let targetY = requestedProgress * maxScrollY;
 
-    setTimeout(() => {
-      if (txtNavigationIdRef.current !== pending.id) return;
-      if (alignToMeasuredLine) {
-        completeTxtNavigationRef.current(chunkIndex);
-        if (pendingTxtNavigationRef.current?.id !== pending.id) return;
+    const layout = txtItemLayoutsRef.current[chunkIndex];
+    const lineMetrics = txtLineMetricsRef.current[chunkIndex];
+    if (layout && Array.isArray(lineMetrics) && lineMetrics.length > 0) {
+      const localOffset = Math.max(0, clampedOffset - chunk.start);
+      let selectedLine = lineMetrics[0];
+      for (const line of lineMetrics) {
+        if (line.offset > localOffset) break;
+        selectedLine = line;
       }
-      pendingTxtNavigationRef.current = null;
-      isTxtProgrammaticNavigationRef.current = false;
-      applyTxtCharacterPosition(pending.characterOffset);
-      if (pending.revealWhenAligned) setTxtRestoring(false);
-    }, alignToMeasuredLine ? (revealWhenAligned ? 2000 : 500) : 80);
+      const appliedLineTopInset = Math.min(
+        Math.max(0, selectedLine.height - 1),
+        Math.max(0, lineTopInset),
+      );
+      targetY = layout.y
+        + selectedLine.y
+        + appliedLineTopInset
+        - viewHeightRef.current * normalizedViewPosition;
+      currentTxtLineTopInsetRef.current = appliedLineTopInset;
+    } else {
+      currentTxtLineTopInsetRef.current = 0;
+    }
+
+    targetY = Math.min(maxScrollY, Math.max(0, targetY));
+    hasResumedRef.current = true;
+    currentScrollYRef.current = targetY;
+    currentTxtCharOffsetRef.current = clampedOffset;
+    scrollTxtToOffset(targetY);
+    applyTxtCharacterPosition(clampedOffset, requestedProgress);
   };
 
   navigateTxtToCharacterOffsetRef.current = navigateTxtToCharacterOffset;
-  completeTxtNavigationRef.current = completePendingTxtNavigation;
 
-  const getTxtCharacterOffsetForScroll = (offsetY: number) => {
+  const getTxtCharacterOffsetForScroll = (
+    offsetY: number,
+    updateLineTopInset = true,
+  ): number | null => {
     let chunkIndex = txtVisibleChunkIndexRef.current;
     const measuredLayouts = Object.entries(txtItemLayoutsRef.current);
     const containingLayout = measuredLayouts.find(([, layout]) => (
@@ -1212,8 +1210,15 @@ useEffect(() => {
 
     const chunk = contentRef.current[chunkIndex];
     const layout = txtItemLayoutsRef.current[chunkIndex];
-    if (!chunk || !layout || layout.height <= 0) {
-      return Math.floor(progressRef.current * rawTextRef.current.length);
+    if (
+      !chunk
+      || !layout
+      || layout.height <= 0
+      || offsetY < layout.y
+      || offsetY >= layout.y + layout.height
+    ) {
+      // 가상 목록이 아직 현재 셀을 측정하지 못한 순간에는 기존 위치를 유지한다.
+      return null;
     }
 
     const relativeY = Math.max(0, offsetY - layout.y);
@@ -1234,10 +1239,12 @@ useEffect(() => {
         }
       }
 
-      currentTxtLineTopInsetRef.current = Math.min(
-        Math.max(0, selected.height - 1),
-        Math.max(0, relativeY - selected.y),
-      );
+      if (updateLineTopInset) {
+        currentTxtLineTopInsetRef.current = Math.min(
+          Math.max(0, selected.height - 1),
+          Math.max(0, relativeY - selected.y),
+        );
+      }
       return Math.min(
         rawTextRef.current.length,
         Math.max(0, chunk.start + selected.offset),
@@ -1248,7 +1255,9 @@ useEffect(() => {
       1,
       Math.max(0, relativeY / layout.height),
     );
-    currentTxtLineTopInsetRef.current = 0;
+    if (updateLineTopInset) {
+      currentTxtLineTopInsetRef.current = 0;
+    }
     return Math.min(
       rawTextRef.current.length,
       Math.max(
@@ -1267,7 +1276,11 @@ useEffect(() => {
       JSON.stringify({
         progress: progressRef.current,
         characterOffset: currentTxtCharOffsetRef.current,
+        previewCharacterOffset: currentTxtPreviewCharOffsetRef.current,
         lineTopInset: currentTxtLineTopInsetRef.current,
+        scrollY: currentScrollYRef.current,
+        contentHeight: txtContentHeightRef.current,
+        layoutSignature: txtLayoutSignature,
         updatedAt: Date.now(),
       }),
     ).catch((error) => console.log("TXT 로컬 이어읽기 위치 저장 실패:", error));
@@ -1279,15 +1292,23 @@ useEffect(() => {
   ) => {
     const offsetY = e.nativeEvent.contentOffset.y;
     currentScrollYRef.current = offsetY;
-    if (isTxtProgrammaticNavigationRef.current) return;
+    const eventContentHeight = e.nativeEvent.contentSize.height;
+    if (eventContentHeight > 0) {
+      txtContentHeightRef.current = eventContentHeight;
+    }
     // offsetY=0이고 아직 이어읽기 복원 전이면 preview 갱신 스킵 (초기 렌더 onScroll 방지)
     const skipPreview = offsetY < 5 && !hasResumedRef.current;
 
-    const characterOffset = getTxtCharacterOffsetForScroll(offsetY);
-    currentTxtCharOffsetRef.current = characterOffset;
-    const clamped = rawTextRef.current.length > 0
-      ? Math.min(1, Math.max(0, characterOffset / rawTextRef.current.length))
+    const maxScrollY = Math.max(
+      0,
+      txtContentHeightRef.current - e.nativeEvent.layoutMeasurement.height,
+    );
+    const clamped = maxScrollY > 0
+      ? Math.min(1, Math.max(0, offsetY / maxScrollY))
       : 0;
+    const characterOffset = getTxtCharacterOffsetForScroll(offsetY)
+      ?? Math.floor(clamped * rawTextRef.current.length);
+    currentTxtCharOffsetRef.current = characterOffset;
 
     progressRef.current = clamped;
     const now = Date.now();
@@ -1325,9 +1346,8 @@ useEffect(() => {
     const requested = Math.min(1, Math.max(0, value));
     navigateTxtToCharacterOffset(
       Math.floor(requested * rawTextRef.current.length),
-      0.15,
+      0,
     );
-    setTimeout(persistTxtProgressLocally, 100);
   };
 
   // ===================== Slider 공통 핸들러 =====================
@@ -1412,9 +1432,6 @@ useEffect(() => {
 
   const handleTxtTextLayout = (chunkIndex: number, lines: any[]) => {
     recordTxtLineMetrics(chunkIndex, lines);
-    setTimeout(() => {
-      completeTxtNavigationRef.current(chunkIndex);
-    }, 0);
   };
 
   const handleSearchResultSelect = (result: ReaderSearchResult) => {
@@ -1840,7 +1857,7 @@ useEffect(() => {
               var dx = e.changedTouches[0].clientX - fallbackTouchStartX;
               var dy = e.changedTouches[0].clientY - fallbackTouchStartY;
               var dt = Date.now() - fallbackTouchStartAt;
-              if (dt >= 40 && dt <= 300 && Math.abs(dx) <= 8 && Math.abs(dy) <= 8 && fallbackTouchMaxMove <= 10) {
+              if (dt >= 40 && dt <= 500 && Math.abs(dx) <= 14 && Math.abs(dy) <= 14 && fallbackTouchMaxMove <= 16) {
                 window.ReactNativeWebView.postMessage(JSON.stringify({ type: "toggleUI" }));
                 return;
               }
@@ -1880,7 +1897,7 @@ useEffect(() => {
               var dx = Math.abs(e.changedTouches[0].clientX - coverTapStartX);
               var dy = Math.abs(e.changedTouches[0].clientY - coverTapStartY);
               var dt = Date.now() - coverTapStartAt;
-              if (dt >= 40 && dt <= 300 && dx <= 8 && dy <= 8 && coverTapMaxMove <= 10) {
+              if (dt >= 40 && dt <= 500 && dx <= 14 && dy <= 14 && coverTapMaxMove <= 16) {
                 sendLog('👆 cover 단일 탭 - UI 토글');
                 window.ReactNativeWebView.postMessage(JSON.stringify({ type: "toggleUI" }));
               }
@@ -2203,7 +2220,7 @@ useEffect(() => {
                   var tapDx = currentX - tapStartX;
                   var tapDy = currentY - tapStartY;
                   tapMaxMove = Math.max(tapMaxMove, Math.sqrt(tapDx * tapDx + tapDy * tapDy));
-                  if (tapMaxMove > 6) movedDuringTouch = true;
+                  if (tapMaxMove > 16) movedDuringTouch = true;
                   var dy = currentY - pullStartY;
 
                   var si = findScrollInfo();
@@ -2288,8 +2305,8 @@ useEffect(() => {
                   }
                   var isStrictTap = !movedDuringTouch && !pullDir && !pullTriggered
                     && !touchedInternalLink
-                    && dx <= 5 && dy <= 5 && tapMaxMove <= 6
-                    && dt >= 40 && dt <= 240;
+                    && dx <= 14 && dy <= 14 && tapMaxMove <= 16
+                    && dt >= 40 && dt <= 500;
                   if (isStrictTap) {
                     window.ReactNativeWebView.postMessage(JSON.stringify({ type: "toggleUI" }));
                   }
@@ -4779,6 +4796,7 @@ useEffect(() => {
   const lastCfiRef = useRef(lastCfi);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSavedProgressRef = useRef<number>(0); // 마지막으로 저장한 progress
+  const progressSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     progressRef.current = progress;
@@ -4805,10 +4823,6 @@ useEffect(() => {
       return;
     }
 
-    if (!isEpub) {
-      persistTxtProgressLocally();
-    }
-
     // 이전과 같은 값이면 저장 안 함 (중복 방지)
     if (currentProgress === lastSavedProgressRef.current && !forceLog) {
       return;
@@ -4823,6 +4837,7 @@ useEffect(() => {
 
     if (!isEpub) {
       updateTxtReadingPreview(currentScrollYRef.current, currentProgress);
+      persistTxtProgressLocally();
     }
 
     const body: any = {
@@ -4841,32 +4856,39 @@ useEffect(() => {
       body.anchorRatio = lastAnchorRatioRef.current;
     }
 
-    try {
-      console.log("📤 [저장 시작]"
-        + "\n  progress=" + currentProgress.toFixed(3)
-        + "\n  cfi=" + (currentCfi ? currentCfi.slice(0, 80) : '❌없음')
-        + "\n  anchorRatio=" + lastAnchorRatioRef.current.toFixed(3)
-        + "\n  preview=" + (currentReadingPreviewRef.current || '').slice(0, 40)
-        + "\n  body=" + JSON.stringify(body).slice(0, 200));
-      
-      const response = await authenticatedFetch(`${BASE_URL}/files/${fileId}/progress`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+    const saveFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId);
+    const saveRequest = progressSaveQueueRef.current
+      .catch(() => {})
+      .then(async () => {
+        try {
+          console.log("📤 [저장 시작]"
+            + "\n  progress=" + currentProgress.toFixed(3)
+            + "\n  cfi=" + (currentCfi ? currentCfi.slice(0, 80) : '❌없음')
+            + "\n  anchorRatio=" + lastAnchorRatioRef.current.toFixed(3)
+            + "\n  preview=" + (body.readingPreview || '').slice(0, 40)
+            + "\n  body=" + JSON.stringify(body).slice(0, 200));
 
-      if (response.ok) {
-        lastSavedProgressRef.current = currentProgress;
-        console.log("✅ [저장 성공] progress=" + currentProgress.toFixed(3)
-          + " anchorRatio=" + lastAnchorRatioRef.current.toFixed(3)
-          + " cfi=" + (currentCfi ? currentCfi.slice(0, 60) : '없음'));
-      } else {
-        const errText = await response.text().catch(() => '');
-        console.log("❌ [저장 실패] status=" + response.status + " body=" + errText.slice(0, 100));
-      }
-    } catch (e) {
-      console.log("❌ 진행도 저장 실패:", e);
-    }
+          const response = await authenticatedFetch(`${BASE_URL}/files/${saveFileId}/progress`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+
+          if (response.ok) {
+            lastSavedProgressRef.current = currentProgress;
+            console.log("✅ [저장 성공] progress=" + currentProgress.toFixed(3)
+              + " anchorRatio=" + lastAnchorRatioRef.current.toFixed(3)
+              + " cfi=" + (currentCfi ? currentCfi.slice(0, 60) : '없음'));
+          } else {
+            const errText = await response.text().catch(() => '');
+            console.log("❌ [저장 실패] status=" + response.status + " body=" + errText.slice(0, 100));
+          }
+        } catch (e) {
+          console.log("❌ 진행도 저장 실패:", e);
+        }
+      });
+    progressSaveQueueRef.current = saveRequest;
+    await saveRequest;
   };
 
   // 함수를 ref로 감싸서 unmount/AppState에서 항상 최신 버전 호출 보장
@@ -4919,6 +4941,15 @@ useEffect(() => {
     return () => subscription.remove();
   }, [isEpub]);
 
+  const exitReader = () => {
+
+    if (router.canGoBack()) {
+      router.back();
+    } else {
+      router.replace('/(tabs)');
+    }
+  };
+
   return (
     <View style={styles.root}>
       {/* Expo Router 헤더 숨기기 */}
@@ -4927,7 +4958,7 @@ useEffect(() => {
       {/* 에러 시 전체 화면 */}
       {(epubError || txtError) ? (
         <View style={[styles.errorFullScreen, { paddingTop: insets.top }]}>
-          <TouchableOpacity style={styles.errorBackTop} onPress={() => router.back()}>
+          <TouchableOpacity style={styles.errorBackTop} onPress={exitReader}>
             <Text style={styles.back}>←</Text>
           </TouchableOpacity>
           <View style={styles.errorBody}>
@@ -4940,7 +4971,7 @@ useEffect(() => {
                   ? `${epubError || txtError}\n\n파일이 손상되지 않았다면 다시 열어주세요.`
                   : '파일이 손상됐거나 지원되지 않는 형식이에요.'}
             </Text>
-            <TouchableOpacity style={styles.errorBackBtn} onPress={() => router.back()}>
+            <TouchableOpacity style={styles.errorBackBtn} onPress={exitReader}>
               <Text style={styles.errorBackBtnText}>← 돌아가기</Text>
             </TouchableOpacity>
           </View>
@@ -4950,7 +4981,7 @@ useEffect(() => {
       {/* 상단바 */}
       {showUI && (
         <View style={[styles.topBar, { paddingTop: insets.top + 8 }]}>
-          <Text style={styles.back} onPress={() => router.back()}>
+          <Text style={styles.back} onPress={exitReader}>
             ←
           </Text>
           <Text style={styles.title} numberOfLines={1}>
@@ -5060,10 +5091,10 @@ useEffect(() => {
                     }));
                   } else if (
                     dt >= 40 &&
-                    dt <= 300 &&
-                    epubTouchMaxMoveRef.current <= 8 &&
-                    Math.abs(dx) <= 6 &&
-                    Math.abs(dy) <= 6
+                    dt <= 500 &&
+                    epubTouchMaxMoveRef.current <= 16 &&
+                    Math.abs(dx) <= 14 &&
+                    Math.abs(dy) <= 14
                   ) {
                     // 높이가 0인 이미지 XHTML 등은 iframe 내부 touch 이벤트가 오지 않을 수 있다.
                     // 내부 이벤트가 먼저 처리됐는지 잠시 기다린 뒤 RN에서 한 번만 보완한다.
@@ -5118,10 +5149,10 @@ useEffect(() => {
                       }));
                     } else if (
                       dt >= 40 &&
-                      dt <= 300 &&
-                      Math.abs(dx) <= 8 &&
-                      Math.abs(dy) <= 8 &&
-                      touch.maxMove <= 10
+                      dt <= 500 &&
+                      Math.abs(dx) <= 14 &&
+                      Math.abs(dy) <= 14 &&
+                      touch.maxMove <= 16
                     ) {
                       console.log("📑 [RN first section] tap - UI toggle");
                       lastEpubWebToggleAtRef.current = Date.now();
@@ -5157,7 +5188,7 @@ useEffect(() => {
             ) : txtError ? (
               <View style={styles.errorContainer}>
                 <Text style={styles.errorText}>⚠️ {txtError}</Text>
-                <TouchableOpacity style={styles.errorBackBtn} onPress={() => router.back()}>
+                <TouchableOpacity style={styles.errorBackBtn} onPress={exitReader}>
                   <Text style={styles.errorBackBtnText}>← 돌아가기</Text>
                 </TouchableOpacity>
               </View>
@@ -5166,7 +5197,6 @@ useEffect(() => {
               ref={scrollRef}
               data={content}
               keyExtractor={(_, index) => txtLayoutSignature + "-txt-" + index}
-              getItemLayout={getTxtItemLayout}
               CellRendererComponent={renderTxtCell}
               onViewableItemsChanged={onTxtViewableItemsChangedRef.current}
               viewabilityConfig={txtViewabilityConfigRef.current}
@@ -5180,21 +5210,34 @@ useEffect(() => {
               onScroll={handleScroll}
               onScrollEndDrag={(e) => updateTxtScrollState(e, true)}
               onMomentumScrollEnd={(e) => updateTxtScrollState(e, true)}
+              onContentSizeChange={(_width, height) => {
+                const measuredHeight = Math.max(1, height);
+                txtContentHeightRef.current = measuredHeight;
+                setTxtContentHeight(measuredHeight);
+              }}
               scrollEventThrottle={16}
               onLayout={(e) => { const h = e.nativeEvent.layout.height; setViewHeight(h); viewHeightRef.current = h; }}
               onTouchStart={(e) => {
-                txtNavigationIdRef.current += 1;
-                pendingTxtNavigationRef.current = null;
-                isTxtProgrammaticNavigationRef.current = false;
-                touchStartPos.current = { x: e.nativeEvent.pageX, y: e.nativeEvent.pageY };
-                isTouchMove.current = false;
+                touchStartPos.current = {
+                  x: e.nativeEvent.pageX,
+                  y: e.nativeEvent.pageY,
+                  time: Date.now(),
+                  maxMove: 0,
+                };
               }}
-              onTouchMove={() => { isTouchMove.current = true; }}
+              onTouchMove={(e) => {
+                const touch = touchStartPos.current;
+                const dx = e.nativeEvent.pageX - touch.x;
+                const dy = e.nativeEvent.pageY - touch.y;
+                touch.maxMove = Math.max(touch.maxMove, Math.sqrt(dx * dx + dy * dy));
+              }}
               onTouchEnd={(e) => {
-                if (!isTouchMove.current) {
-                  const dx = Math.abs(e.nativeEvent.pageX - touchStartPos.current.x);
-                  const dy = Math.abs(e.nativeEvent.pageY - touchStartPos.current.y);
-                  if (dx < 10 && dy < 10) setShowUI((prev) => !prev);
+                const touch = touchStartPos.current;
+                const dx = Math.abs(e.nativeEvent.pageX - touch.x);
+                const dy = Math.abs(e.nativeEvent.pageY - touch.y);
+                const elapsed = Date.now() - touch.time;
+                if (elapsed <= 500 && dx <= 14 && dy <= 14 && touch.maxMove <= 16) {
+                  setShowUI((prev) => !prev);
                 }
               }}
               renderItem={({ item, index }) => {
@@ -5236,12 +5279,6 @@ useEffect(() => {
                 txtLayoutEstimateReady,
               ].join(":")}
             />
-            )}
-            {txtRestoring && !txtLoading && !txtError && (
-              <View style={[styles.restoreOverlay, { backgroundColor: settings.bgColor }]}>
-                <ActivityIndicator size="large" color="#b84a8c" />
-                <Text style={styles.restoreOverlayText}>이어읽기 위치 불러오는 중...</Text>
-              </View>
             )}
           </View>
         </>
