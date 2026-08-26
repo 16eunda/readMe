@@ -51,6 +51,12 @@ import { useUser } from "../../contexts/UserContext";
 const MANAGED_FILE_DIRECTORY = "library-files";
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
 
+// Home 화면이 이동 과정에서 다시 마운트되어도 같은 이름의 외부 파일 등록은 한 번만 진행한다.
+const activeExternalRegistrations = new Set<string>();
+
+const getExternalRegistrationKey = (name: string) =>
+  `root:${name.trim().toLocaleLowerCase()}`;
+
 async function createManagedFileUri(displayName: string): Promise<string> {
   const documentDirectory = FileSystem.documentDirectory;
   if (!documentDirectory) {
@@ -173,6 +179,11 @@ export default function Home() {
   const [duplicateModalVisible, setDuplicateModalVisible] = useState(false);
   const [duplicateFileName, setDuplicateFileName] = useState("");
   const [pendingFile, setPendingFile] = useState<any>(null);
+  const [pendingFileAction, setPendingFileAction] = useState<{
+    targetFolder?: string;
+    openAfterSave: boolean;
+    externalRegistrationKey?: string;
+  } | null>(null);
 
   // 페이지네이션 (추가 페이지 로딩용)
   const [currentPage, setCurrentPage] = useState(0);
@@ -189,7 +200,7 @@ export default function Home() {
   const fileListRef = useRef<FlatList<any>>(null);
   const locateRequestIdRef = useRef(0);
   const processedLocateFileIdRef = useRef("");
-  const externalFileProcessingRef = useRef("");
+  const pendingExternalRegistrationRef = useRef<string | null>(null);
 
   // 정렬
   const [sortOption, setSortOption] = useState<SortOption>("date-desc");
@@ -436,13 +447,25 @@ export default function Home() {
     // 외부 파일 열기에서는 사용자가 이미 파일을 선택했으므로 원본/수신 파일명으로 자동 등록
     processExternalFile({ uri, name });
   }, [incomingFile, isUserLoading]);
+
+  useEffect(() => () => {
+    const registrationKey = pendingExternalRegistrationRef.current;
+    if (registrationKey) {
+      activeExternalRegistrations.delete(registrationKey);
+    }
+  }, []);
   
   // 외부 파일 실제 처리
   const processExternalFile = async (file: { uri: string; name: string }) => {
     const { uri, name } = file;
-    const processingKey = `${name}:${uri}`;
-    if (externalFileProcessingRef.current === processingKey) return;
-    externalFileProcessingRef.current = processingKey;
+    const registrationKey = getExternalRegistrationKey(name);
+    if (activeExternalRegistrations.has(registrationKey)) {
+      console.log('↩️ 이미 진행 중인 외부 파일 등록 무시:', name);
+      return;
+    }
+    activeExternalRegistrations.add(registrationKey);
+
+    let waitingForDuplicateConfirmation = false;
     
     try {
       // 중복 체크 (root 폴더 기준)
@@ -454,42 +477,16 @@ export default function Home() {
       const { exists } = await checkRes.json();
 
       if (exists) {
-        const searchParams = new URLSearchParams({
-          keyword: name,
-          page: '0',
-          size: '50',
-          sort: 'date,desc',
+        waitingForDuplicateConfirmation = true;
+        pendingExternalRegistrationRef.current = registrationKey;
+        setDuplicateFileName(name);
+        setPendingFile({ uri, name });
+        setPendingFileAction({
+          targetFolder: 'root',
+          openAfterSave: true,
+          externalRegistrationKey: registrationKey,
         });
-        const existingResponse = await authenticatedFetch(
-          `${BASE_URL}/files/search?${searchParams.toString()}`,
-          {},
-          deviceId ?? undefined,
-        );
-        const existingData = await existingResponse.json();
-        const existingFiles = Array.isArray(existingData)
-          ? existingData
-          : Array.isArray(existingData.content)
-            ? existingData.content
-            : [];
-        const existingFile = existingFiles.find((item: any) => (
-          item.title === name && String(item.path || 'root') === 'root'
-        ));
-
-        if (existingFile) {
-          console.log('📖 이미 등록된 외부 파일 열기:', existingFile.id, existingFile.title);
-          router.replace({
-            pathname: '/reader',
-            params: {
-              fileId: existingFile.id,
-              uri: existingFile.uri,
-              name: existingFile.title,
-              type: existingFile.type,
-            },
-          });
-        } else {
-          Alert.alert('파일 열기 실패', '등록된 파일을 찾지 못했습니다. 목록을 새로고침한 뒤 다시 시도해 주세요.');
-          refetchFiles();
-        }
+        setDuplicateModalVisible(true);
         return;
       }
 
@@ -504,8 +501,8 @@ export default function Home() {
     } catch (e) {
       console.error('❌ 외부 파일 처리 실패:', e);
     } finally {
-      if (externalFileProcessingRef.current === processingKey) {
-        externalFileProcessingRef.current = "";
+      if (!waitingForDuplicateConfirmation) {
+        activeExternalRegistrations.delete(registrationKey);
       }
     }
   };
@@ -910,6 +907,7 @@ export default function Home() {
           setIsUploading(false);
           setDuplicateFileName(file.name);
           setPendingFile(file);
+          setPendingFileAction(null);
           setDuplicateModalVisible(true);
           return;
         }
@@ -1013,7 +1011,10 @@ export default function Home() {
       // 2) Optimistic update: 캐시에 즉시 추가 → 기존 파일 유지하면서 새 파일 표시
       if (saved) {
         queryClient.setQueryData(filesQueryKey, (old: any) => ({
-          content: [saved, ...(old?.content ?? [])],
+          content: [
+            saved,
+            ...(old?.content ?? []).filter((item: any) => String(item.id) !== String(saved.id)),
+          ],
           hasMore: old?.hasMore ?? false,
         }));
         // 백그라운드에서 서버와 동기화
@@ -1878,15 +1879,48 @@ export default function Home() {
     <DuplicateConfirmModal
       visible={duplicateModalVisible}
       fileName={duplicateFileName}
-      onConfirm={() => {
+      onConfirm={async () => {
+        const file = pendingFile;
+        const action = pendingFileAction;
         setDuplicateModalVisible(false);
-        if (pendingFile) {
-          addFileToSystem(pendingFile);
+        setPendingFile(null);
+        setPendingFileAction(null);
+
+        try {
+          if (file) {
+            const saved = await addFileToSystem(file, action?.targetFolder);
+            if (saved && action?.openAfterSave) {
+              router.replace({
+                pathname: '/reader',
+                params: {
+                  fileId: saved.id,
+                  uri: saved.uri,
+                  name: saved.title,
+                  type: saved.type,
+                },
+              });
+            }
+          }
+        } finally {
+          if (action?.externalRegistrationKey) {
+            activeExternalRegistrations.delete(action.externalRegistrationKey);
+            if (pendingExternalRegistrationRef.current === action.externalRegistrationKey) {
+              pendingExternalRegistrationRef.current = null;
+            }
+          }
         }
       }}
       onCancel={() => {
+        const registrationKey = pendingFileAction?.externalRegistrationKey;
+        if (registrationKey) {
+          activeExternalRegistrations.delete(registrationKey);
+          if (pendingExternalRegistrationRef.current === registrationKey) {
+            pendingExternalRegistrationRef.current = null;
+          }
+        }
         setDuplicateModalVisible(false);
         setPendingFile(null);
+        setPendingFileAction(null);
       }}
     />
 

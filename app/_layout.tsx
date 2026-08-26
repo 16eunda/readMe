@@ -3,7 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Linking from 'expo-linking';
-import { Stack, usePathname, useRouter } from 'expo-router';
+import { Stack, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useRef } from 'react';
 import 'react-native-reanimated';
@@ -64,13 +64,10 @@ const makeExternalFileName = (sourceUrl: string, ext: string, displayName?: stri
 function AppContent() {
   const colorScheme = useColorScheme();
   const router = useRouter();
-  const pathname = usePathname();
-  const pathnameRef = useRef(pathname);
   const processingUrlsRef = useRef(new Set<string>());
   const lastIncomingUrlRef = useRef<{ url: string; handledAt: number } | null>(null);
+  const didReadInitialUrlRef = useRef(false);
   const { setIncomingFile } = useUser();
-
-  pathnameRef.current = pathname;
 
   useEffect(() => {
     const restoreActiveReader = async () => {
@@ -129,11 +126,9 @@ function AppContent() {
 
       const now = Date.now();
       const lastIncoming = lastIncomingUrlRef.current;
-      const isRepeatedWhileReading =
-        lastIncoming?.url === normalizedUrl && pathnameRef.current === '/reader';
       const isImmediateDuplicate =
         lastIncoming?.url === normalizedUrl && now - lastIncoming.handledAt < 5000;
-      if (processingUrlsRef.current.has(normalizedUrl) || isRepeatedWhileReading || isImmediateDuplicate) {
+      if (processingUrlsRef.current.has(normalizedUrl) || isImmediateDuplicate) {
         console.log('↩️ 이미 처리한 외부 파일 이벤트 무시:', normalizedUrl);
         return;
       }
@@ -192,9 +187,8 @@ function AppContent() {
         console.log('📂 외부 파일 수신 완료:', name);
         lastIncomingUrlRef.current = { url: normalizedUrl, handledAt: Date.now() };
         setIncomingFile({ uri: finalUri, name });
-        if (pathnameRef.current !== '/reader') {
-          router.replace('/(tabs)' as any);
-        }
+        // 리더가 열려 있더라도 중복 확인창과 등록 상태가 보이는 홈으로 이동한다.
+        router.replace('/(tabs)' as any);
       } catch (e) {
         console.error('❌ 외부 파일 처리 실패:', e);
       } finally {
@@ -203,13 +197,17 @@ function AppContent() {
     };
 
     // 앱이 종료된 상태에서 파일로 열린 경우 (cold start)
-    Linking.getInitialURL().then(async (initialUrl) => {
-      if (initialUrl) {
-        await processIncomingUrl(initialUrl);
-      } else {
-        await restoreActiveReader();
-      }
-    });
+    // router 객체가 바뀌어 effect가 다시 연결되더라도 cold-start 인텐트는 한 번만 소비한다.
+    if (!didReadInitialUrlRef.current) {
+      didReadInitialUrlRef.current = true;
+      Linking.getInitialURL().then(async (initialUrl) => {
+        if (initialUrl) {
+          await processIncomingUrl(initialUrl);
+        } else {
+          await restoreActiveReader();
+        }
+      });
+    }
 
     // 앱이 백그라운드에 있다가 파일로 열린 경우
     const subscription = Linking.addEventListener('url', ({ url }) => {
