@@ -1,0 +1,333 @@
+diff --git a/lib/png-metadata.ts b/lib/png-metadata.ts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/lib/png-metadata.ts
+@@ -0,0 +1,122 @@
++const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10];
++
++function readUint32(bytes: Uint8Array, offset: number) {
++  return (
++    bytes[offset] * 0x1000000 +
++    ((bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3])
++  );
++}
++
++function writeUint32(bytes: Uint8Array, offset: number, value: number) {
++  bytes[offset] = (value >>> 24) & 0xff;
++  bytes[offset + 1] = (value >>> 16) & 0xff;
++  bytes[offset + 2] = (value >>> 8) & 0xff;
++  bytes[offset + 3] = value & 0xff;
++}
++
++function chunkType(bytes: Uint8Array, offset: number) {
++  return String.fromCharCode(
++    bytes[offset],
++    bytes[offset + 1],
++    bytes[offset + 2],
++    bytes[offset + 3],
++  );
++}
++
++function crc32(bytes: Uint8Array) {
++  let crc = 0xffffffff;
++  for (const byte of bytes) {
++    crc ^= byte;
++    for (let bit = 0; bit < 8; bit += 1) {
++      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
++    }
++  }
++  return (crc ^ 0xffffffff) >>> 0;
++}
++
++function makeChunk(type: string, data: Uint8Array) {
++  const output = new Uint8Array(data.length + 12);
++  writeUint32(output, 0, data.length);
++  for (let index = 0; index < 4; index += 1) {
++    output[4 + index] = type.charCodeAt(index);
++  }
++  output.set(data, 8);
++  writeUint32(output, output.length - 4, crc32(output.subarray(4, output.length - 4)));
++  return output;
++}
++
++function concat(parts: Uint8Array[]) {
++  const length = parts.reduce((total, part) => total + part.length, 0);
++  const output = new Uint8Array(length);
++  let offset = 0;
++  for (const part of parts) {
++    output.set(part, offset);
++    offset += part.length;
++  }
++  return output;
++}
++
++function assertPng(bytes: Uint8Array) {
++  if (
++    bytes.length < PNG_SIGNATURE.length ||
++    PNG_SIGNATURE.some((value, index) => bytes[index] !== value)
++  ) {
++    throw new Error("유효한 PNG 파일이 아닙니다.");
++  }
++}
++
++export function readPngDpi(bytes: Uint8Array): number | null {
++  assertPng(bytes);
++  let offset = 8;
++  while (offset + 12 <= bytes.length) {
++    const length = readUint32(bytes, offset);
++    const type = chunkType(bytes, offset + 4);
++    const next = offset + 12 + length;
++    if (next > bytes.length) break;
++    if (type === "pHYs" && length === 9 && bytes[offset + 16] === 1) {
++      const x = readUint32(bytes, offset + 8);
++      const y = readUint32(bytes, offset + 12);
++      return ((x + y) / 2) * 0.0254;
++    }
++    offset = next;
++  }
++  return null;
++}
++
++export function setPngDpi(bytes: Uint8Array, dpi: number): Uint8Array {
++  assertPng(bytes);
++  const pixelsPerMeter = Math.max(1, Math.round(dpi / 0.0254));
++  const data = new Uint8Array(9);
++  writeUint32(data, 0, pixelsPerMeter);
++  writeUint32(data, 4, pixelsPerMeter);
++  data[8] = 1;
++  const physicalChunk = makeChunk("pHYs", data);
++  const parts = [bytes.slice(0, 8)];
++  let offset = 8;
++  let inserted = false;
++
++  while (offset + 12 <= bytes.length) {
++    const length = readUint32(bytes, offset);
++    const type = chunkType(bytes, offset + 4);
++    const next = offset + 12 + length;
++    if (next > bytes.length) throw new Error("손상된 PNG 파일입니다.");
++    if (type !== "pHYs") parts.push(bytes.slice(offset, next));
++    if (type === "IHDR" && !inserted) {
++      parts.push(physicalChunk);
++      inserted = true;
++    }
++    offset = next;
++  }
++  if (!inserted) throw new Error("PNG 헤더를 찾지 못했습니다.");
++  return concat(parts);
++}
++
++export async function setBlobPngDpi(blob: Blob, dpi: number) {
++  const bytes = new Uint8Array(await blob.arrayBuffer());
++  const output = setPngDpi(bytes, dpi);
++  return new Blob([output], { type: "image/png" });
++}
+diff --git a/lib/miricanvas-preset.ts b/lib/miricanvas-preset.ts
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/lib/miricanvas-preset.ts
+@@ -0,0 +1,161 @@
++import type { PixelBounds } from "./image-core";
++
++export const MIRICANVAS_PNG_RULES = {
++  minDpi: 120,
++  minShortEdge: 700,
++  maxLongEdge: 9800,
++  maxFileBytes: 50 * 1024 * 1024,
++} as const;
++
++export type ImageInspection = {
++  originalWidth: number;
++  originalHeight: number;
++  contentBounds: PixelBounds | null;
++  hasTransparency: boolean;
++  hasTransparentBackground: boolean;
++  touchesEdge: boolean;
++  isSvg: boolean;
++  dpi: number | null;
++};
++
++export type AuditLevel = "ready" | "fixable" | "review" | "blocked";
++
++export type AuditIssue = {
++  code:
++    | "empty"
++    | "format"
++    | "background"
++    | "margin"
++    | "too-small"
++    | "too-large"
++    | "file-size"
++    | "dpi"
++    | "edge-contact";
++  level: Exclude<AuditLevel, "ready">;
++  message: string;
++};
++
++export type PresetAudit = {
++  level: AuditLevel;
++  issues: AuditIssue[];
++};
++
++export type FileFacts = {
++  name: string;
++  size: number;
++  type: string;
++};
++
++function extensionOf(name: string) {
++  return name.split(".").pop()?.toLowerCase() ?? "";
++}
++
++function hasExcessMargin(inspection: ImageInspection) {
++  const bounds = inspection.contentBounds;
++  if (!bounds) return false;
++  const right = inspection.originalWidth - bounds.x - bounds.width;
++  const bottom = inspection.originalHeight - bounds.y - bounds.height;
++  const xTolerance = Math.max(3, Math.round(inspection.originalWidth * 0.01));
++  const yTolerance = Math.max(3, Math.round(inspection.originalHeight * 0.01));
++  return (
++    bounds.x > xTolerance ||
++    right > xTolerance ||
++    bounds.y > yTolerance ||
++    bottom > yTolerance
++  );
++}
++
++function highestLevel(issues: AuditIssue[]): AuditLevel {
++  if (issues.some((issue) => issue.level === "blocked")) return "blocked";
++  if (issues.some((issue) => issue.level === "review")) return "review";
++  if (issues.some((issue) => issue.level === "fixable")) return "fixable";
++  return "ready";
++}
++
++export function auditMiricanvasPng(
++  file: FileFacts,
++  inspection: ImageInspection,
++): PresetAudit {
++  const issues: AuditIssue[] = [];
++  const bounds = inspection.contentBounds;
++  if (!bounds) {
++    return {
++      level: "blocked",
++      issues: [
++        {
++          code: "empty",
++          level: "blocked",
++          message: "완전히 투명해 등록할 요소를 찾을 수 없습니다.",
++        },
++      ],
++    };
++  }
++
++  if (extensionOf(file.name) !== "png" || file.type !== "image/png") {
++    issues.push({
++      code: "format",
++      level: "fixable",
++      message: "PNG 형식으로 변환이 필요합니다.",
++    });
++  }
++  if (!inspection.hasTransparency || !inspection.hasTransparentBackground) {
++    issues.push({
++      code: "background",
++      level: "review",
++      message: "투명 배경이 아닙니다. 배경 제거 여부를 확인하세요.",
++    });
++  }
++  if (hasExcessMargin(inspection)) {
++    issues.push({
++      code: "margin",
++      level: "fixable",
++      message: "객체 주변에 제거할 투명 여백이 있습니다.",
++    });
++  }
++
++  const contentShortEdge = Math.min(bounds.width, bounds.height);
++  const contentLongEdge = Math.max(bounds.width, bounds.height);
++  if (!inspection.isSvg && contentShortEdge < MIRICANVAS_PNG_RULES.minShortEdge) {
++    issues.push({
++      code: "too-small",
++      level: "review",
++      message: `원본 요소의 짧은 변이 ${MIRICANVAS_PNG_RULES.minShortEdge}px 미만입니다.`,
++    });
++  }
++  if (contentLongEdge > MIRICANVAS_PNG_RULES.maxLongEdge) {
++    issues.push({
++      code: "too-large",
++      level: "fixable",
++      message: `${MIRICANVAS_PNG_RULES.maxLongEdge.toLocaleString()}px 이하로 축소해야 합니다.`,
++    });
++  }
++  if (file.size > MIRICANVAS_PNG_RULES.maxFileBytes) {
++    issues.push({
++      code: "file-size",
++      level: "fixable",
++      message: "파일 용량을 50MB 이하로 줄여야 합니다.",
++    });
++  }
++  if (!inspection.dpi || Math.abs(inspection.dpi - 120) > 0.5) {
++    issues.push({
++      code: "dpi",
++      level: "fixable",
++      message: "120dpi 출력 정보가 필요합니다.",
++    });
++  }
++  if (inspection.touchesEdge) {
++    issues.push({
++      code: "edge-contact",
++      level: "review",
++      message: "요소가 원본 가장자리에 닿아 이미 잘렸을 수 있습니다.",
++    });
++  }
++
++  return { level: highestLevel(issues), issues };
++}
++
++export function auditLabel(level: AuditLevel) {
++  if (level === "ready") return "바로 등록 가능";
++  if (level === "fixable") return "자동 수정 필요";
++  if (level === "review") return "원본 확인 필요";
++  return "처리 불가";
++}
+diff --git a/lib/image-core.ts b/lib/image-core.ts
+index 3fa68fb..3333333 100644
+--- a/lib/image-core.ts
++++ b/lib/image-core.ts
+@@ -114,4 +114,40 @@ export function calculateOutputSize(
+   };
+ }
+ 
++export function calculateConstrainedOutputSize(
++  width: number,
++  height: number,
++  targetLongEdge: number | null,
++  preventDownscale: boolean,
++  minShortEdge: number | null,
++  maxLongEdge: number | null,
++): OutputSize {
++  const sourceWidth = Math.max(1, Math.round(width));
++  const sourceHeight = Math.max(1, Math.round(height));
++  const sourceLong = Math.max(sourceWidth, sourceHeight);
++  const sourceShort = Math.min(sourceWidth, sourceHeight);
++  let scale = 1;
++
++  if (targetLongEdge && targetLongEdge > 0) {
++    const targetScale = targetLongEdge / sourceLong;
++    scale = preventDownscale ? Math.max(1, targetScale) : targetScale;
++  }
++  if (minShortEdge && minShortEdge > 0) {
++    scale = Math.max(scale, minShortEdge / sourceShort);
++  }
++  if (maxLongEdge && maxLongEdge > 0) {
++    scale = Math.min(scale, maxLongEdge / sourceLong);
++  }
++
++  return {
++    width: Math.max(1, Math.round(sourceWidth * scale)),
++    height: Math.max(1, Math.round(sourceHeight * scale)),
++  };
++}
++
+ export function makeOutputName(fileName: string, suffix: string): string {
+

@@ -198,6 +198,10 @@ export default function ReaderScreen() {
   const router = useRouter();
   const { fileId, uri, name, type, resetProgress } = useLocalSearchParams();
   const insets = useSafeAreaInsets();
+  const readerTopInset = Math.max(
+    insets.top,
+    Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) : 0,
+  );
   const { width: windowWidth } = useWindowDimensions();
   const readerSessionIdRef = useRef(`${Date.now()}-${Math.random().toString(36).slice(2)}`);
 
@@ -234,7 +238,7 @@ export default function ReaderScreen() {
   const [content, setContent] = useState<TxtRenderChunk[]>([]); // txt 렌더링 구간 배열
   const [txtLoading, setTxtLoading] = useState(false); // txt 로딩 중
   const [txtError, setTxtError] = useState<string | null>(null); // txt 에러
-  const [showUI, setShowUI] = useState(true);
+  const [showUI, setShowUI] = useState(false);
 
   // 공통 진행도 상태 (0~1)
   const [progress, setProgress] = useState(0);
@@ -243,7 +247,14 @@ export default function ReaderScreen() {
   const progressRef = useRef(progress); // unmount 시점에 최신 progress 저장용
 
   // 터치 vs 드래그 구분용
-  const touchStartPos = useRef({ x: 0, y: 0, time: 0, maxMove: 0 });
+  const touchStartPos = useRef({
+    x: 0,
+    y: 0,
+    time: 0,
+    maxMove: 0,
+    active: false,
+    didScroll: false,
+  });
 
   // txt 전용 스크롤 정보
   const scrollRef = useRef<FlatList<TxtRenderChunk>>(null);
@@ -294,7 +305,13 @@ export default function ReaderScreen() {
   const [epubLoadKey, setEpubLoadKey] = useState("");
   const epubLoadRetryRef = useRef(0);
   const webViewRef = useRef<WebView>(null);
-  const epubTouchStartRef = useRef({ x: 0, y: 0, time: 0 });
+  const epubTouchStartRef = useRef({
+    x: 0,
+    y: 0,
+    time: 0,
+    active: false,
+    didScroll: false,
+  });
   const epubTouchMaxMoveRef = useRef(0);
   const lastEpubWebToggleAtRef = useRef(0);
   const [lastCfi, setLastCfi] = useState<string | null>(null);     // 마지막 위치
@@ -308,7 +325,14 @@ export default function ReaderScreen() {
   const [epubNavigationReady, setEpubNavigationReady] = useState(false);
   const [epubNavigationError, setEpubNavigationError] = useState(false);
   const [epubAtFirstSection, setEpubAtFirstSection] = useState(false);
-  const firstSectionTouchRef = useRef({ x: 0, y: 0, time: 0, maxMove: 0 });
+  const firstSectionTouchRef = useRef({
+    x: 0,
+    y: 0,
+    time: 0,
+    maxMove: 0,
+    active: false,
+    didScroll: false,
+  });
   const lastWebPercentRef = useRef<number | null>(null);
   const lastWebLogAtRef = useRef<number>(0);
 
@@ -1338,6 +1362,9 @@ useEffect(() => {
   };
 
   const handleScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    if (touchStartPos.current.active) {
+      touchStartPos.current.didScroll = true;
+    }
     updateTxtScrollState(e);
   };
 
@@ -1838,6 +1865,9 @@ useEffect(() => {
           var fallbackTouchStartY = 0;
           var fallbackTouchStartAt = 0;
           var fallbackTouchMaxMove = 0;
+          var fallbackTouchStartScrollTop = 0;
+          var fallbackTouchActive = false;
+          var fallbackScrolledDuringTouch = false;
           if (fallbackSectionEl) {
             fallbackSectionEl.addEventListener('touchstart', function(e) {
               if (!e.touches || !e.touches[0]) return;
@@ -1845,19 +1875,30 @@ useEffect(() => {
               fallbackTouchStartY = e.touches[0].clientY;
               fallbackTouchStartAt = Date.now();
               fallbackTouchMaxMove = 0;
+              fallbackTouchStartScrollTop = fallbackSectionEl.scrollTop;
+              fallbackTouchActive = true;
+              fallbackScrolledDuringTouch = false;
             }, { passive: true });
             fallbackSectionEl.addEventListener('touchmove', function(e) {
               if (!e.touches || !e.touches[0]) return;
               var dx = e.touches[0].clientX - fallbackTouchStartX;
               var dy = e.touches[0].clientY - fallbackTouchStartY;
               fallbackTouchMaxMove = Math.max(fallbackTouchMaxMove, Math.sqrt(dx * dx + dy * dy));
+              if (fallbackTouchMaxMove > 8) fallbackScrolledDuringTouch = true;
+            }, { passive: true });
+            fallbackSectionEl.addEventListener('scroll', function() {
+              if (fallbackTouchActive) fallbackScrolledDuringTouch = true;
             }, { passive: true });
             fallbackSectionEl.addEventListener('touchend', function(e) {
               if (!e.changedTouches || !e.changedTouches[0]) return;
               var dx = e.changedTouches[0].clientX - fallbackTouchStartX;
               var dy = e.changedTouches[0].clientY - fallbackTouchStartY;
               var dt = Date.now() - fallbackTouchStartAt;
-              if (dt >= 40 && dt <= 500 && Math.abs(dx) <= 14 && Math.abs(dy) <= 14 && fallbackTouchMaxMove <= 16) {
+              var scrollChanged = Math.abs(fallbackSectionEl.scrollTop - fallbackTouchStartScrollTop) > 2;
+              fallbackTouchActive = false;
+              if (!fallbackScrolledDuringTouch && !scrollChanged
+                && dt >= 40 && dt <= 350
+                && Math.abs(dx) <= 8 && Math.abs(dy) <= 8 && fallbackTouchMaxMove <= 8) {
                 window.ReactNativeWebView.postMessage(JSON.stringify({ type: "toggleUI" }));
                 return;
               }
@@ -1867,6 +1908,10 @@ useEffect(() => {
                 if (dy < 0 && atBottom) triggerAutoTransition(false);
                 else if (dy > 0 && atTop) triggerAutoTransition(true);
               }
+            }, { passive: true });
+            fallbackSectionEl.addEventListener('touchcancel', function() {
+              fallbackTouchActive = false;
+              fallbackScrolledDuringTouch = true;
             }, { passive: true });
           }
 
@@ -1897,7 +1942,7 @@ useEffect(() => {
               var dx = Math.abs(e.changedTouches[0].clientX - coverTapStartX);
               var dy = Math.abs(e.changedTouches[0].clientY - coverTapStartY);
               var dt = Date.now() - coverTapStartAt;
-              if (dt >= 40 && dt <= 500 && dx <= 14 && dy <= 14 && coverTapMaxMove <= 16) {
+              if (dt >= 40 && dt <= 350 && dx <= 8 && dy <= 8 && coverTapMaxMove <= 8) {
                 sendLog('👆 cover 단일 탭 - UI 토글');
                 window.ReactNativeWebView.postMessage(JSON.stringify({ type: "toggleUI" }));
               }
@@ -2026,6 +2071,8 @@ useEffect(() => {
               lineSpacing: 1.9, sidePadding: 24, fontFamily: 'default'
             };
             var loadedContents = [];
+            var contentTouchActive = false;
+            var contentScrolledDuringTouch = false;
 
             function buildThemeCss(t, preserveLayout) {
               var ff = (t.fontFamily && t.fontFamily !== 'default')
@@ -2039,7 +2086,8 @@ useEffect(() => {
                 'body{background:' + t.bgColor + '!important;color:' + t.textColor + '!important;' +
                 'font-size:' + t.fontSize + 'px!important;line-height:' + t.lineSpacing + '!important;' +
                 'padding-left:' + t.sidePadding + 'px!important;padding-right:' + t.sidePadding + 'px!important;' +
-                'padding-top:36px!important;padding-bottom:36px!important;' +
+                // WebView 자체가 safe area 아래에서 시작하므로 여기에는 읽기용 최소 여백만 둔다.
+                'padding-top:16px!important;padding-bottom:36px!important;' +
                 'margin:0!important;box-sizing:border-box!important;width:100%!important;' +
                 'word-break:keep-all!important;overflow-wrap:break-word!important;' +
                 'text-align:left!important;' +
@@ -2081,6 +2129,7 @@ useEffect(() => {
                 // ── 탭(toggleUI) 감지 ──
                 var tapStartX = 0, tapStartY = 0, tapStartTime = 0;
                 var tapMaxMove = 0;
+                var tapStartScrollTop = 0;
                 var movedDuringTouch = false;
                 var touchedInternalLink = false;
                 var lastInternalLinkAt = 0;
@@ -2193,6 +2242,8 @@ useEffect(() => {
                   tapStartTime = Date.now();
                   tapMaxMove = 0;
                   movedDuringTouch = false;
+                  contentTouchActive = true;
+                  contentScrolledDuringTouch = false;
                   touchedInternalLink = Boolean(findAnchor(e.target));
                   pullDir = null;
                   pullDist = 0;
@@ -2203,6 +2254,7 @@ useEffect(() => {
 
                   // touchstart 시 스크롤 상태 진단 로그
                   var si = findScrollInfo();
+                  tapStartScrollTop = si.scrollTop;
                   startedAtTop = si.scrollTop <= 6;
                   startedAtBottom = (si.scrollTop + si.clientH) >= (si.scrollH - 10);
                   startedInShortSection = si.clientH > 0 && (si.scrollH - si.clientH) <= 140;
@@ -2220,7 +2272,10 @@ useEffect(() => {
                   var tapDx = currentX - tapStartX;
                   var tapDy = currentY - tapStartY;
                   tapMaxMove = Math.max(tapMaxMove, Math.sqrt(tapDx * tapDx + tapDy * tapDy));
-                  if (tapMaxMove > 16) movedDuringTouch = true;
+                  if (tapMaxMove > 8) {
+                    movedDuringTouch = true;
+                    contentScrolledDuringTouch = true;
+                  }
                   var dy = currentY - pullStartY;
 
                   var si = findScrollInfo();
@@ -2282,6 +2337,8 @@ useEffect(() => {
                   var dy = Math.abs(signedDy);
                   var dt = Date.now() - tapStartTime;
                   var tappedAnchor = findAnchor(e.target);
+                  var endScrollInfo = findScrollInfo();
+                  var scrollChangedDuringTouch = Math.abs(endScrollInfo.scrollTop - tapStartScrollTop) > 2;
                   if (!pullTriggered && pullReady && pullDir) {
                     pullTriggered = true;
                     log('🔍PULL ▶ RELEASE TRIGGER ' + pullDir + ' dist=' + Math.round(pullDist));
@@ -2304,9 +2361,10 @@ useEffect(() => {
                     }
                   }
                   var isStrictTap = !movedDuringTouch && !pullDir && !pullTriggered
+                    && !contentScrolledDuringTouch && !scrollChangedDuringTouch
                     && !touchedInternalLink
-                    && dx <= 14 && dy <= 14 && tapMaxMove <= 16
-                    && dt >= 40 && dt <= 500;
+                    && dx <= 8 && dy <= 8 && tapMaxMove <= 8
+                    && dt >= 40 && dt <= 350;
                   if (isStrictTap) {
                     window.ReactNativeWebView.postMessage(JSON.stringify({ type: "toggleUI" }));
                   }
@@ -2315,7 +2373,23 @@ useEffect(() => {
                   }
                   pullDir = null; pullDist = 0; pullTriggered = false; pullReady = false;
                   startedAtTop = false; startedAtBottom = false; startedInShortSection = false;
+                  contentTouchActive = false;
                 }, { passive: true, capture: true });
+
+                doc.addEventListener('touchcancel', function() {
+                  contentTouchActive = false;
+                  contentScrolledDuringTouch = true;
+                  movedDuringTouch = true;
+                  try { window.parent.hidePullIndicator(); } catch(_) {}
+                }, { passive: true, capture: true });
+
+                var markContentScroll = function() {
+                  if (contentTouchActive) contentScrolledDuringTouch = true;
+                };
+                doc.addEventListener('scroll', markContentScroll, { passive: true, capture: true });
+                if (doc.defaultView) {
+                  doc.defaultView.addEventListener('scroll', markContentScroll, { passive: true });
+                }
 
                 doc.addEventListener('click', function(e) {
                   var anchor = findAnchor(e.target);
@@ -3340,6 +3414,7 @@ useEffect(() => {
 
             var scrollReportTimer = null;
             function onContainerScroll() {
+              if (contentTouchActive) contentScrolledDuringTouch = true;
               if (isSeeking || isChapterLoading) return;
               clearTimeout(centerTextTimer);
               clearTimeout(scrollReportTimer);
@@ -4957,7 +5032,7 @@ useEffect(() => {
 
       {/* 에러 시 전체 화면 */}
       {(epubError || txtError) ? (
-        <View style={[styles.errorFullScreen, { paddingTop: insets.top }]}>
+        <View style={[styles.errorFullScreen, { paddingTop: readerTopInset }]}>
           <TouchableOpacity style={styles.errorBackTop} onPress={exitReader}>
             <Text style={styles.back}>←</Text>
           </TouchableOpacity>
@@ -4980,7 +5055,7 @@ useEffect(() => {
       <>
       {/* 상단바 */}
       {showUI && (
-        <View style={[styles.topBar, { paddingTop: insets.top + 8 }]}>
+        <View style={[styles.topBar, { paddingTop: readerTopInset + 8 }]}>
           <Text style={styles.back} onPress={exitReader}>
             ←
           </Text>
@@ -5015,7 +5090,7 @@ useEffect(() => {
       {isEpub ? (
         /* EPUB: WebView 터치 이벤트를 방해하지 않음 */
         <>
-          <View style={styles.readerArea}>
+          <View style={[styles.readerArea, { paddingTop: readerTopInset }]}>
             {epubBase64 && epubBase64.length > 0 ? (
               <>
               <WebView
@@ -5062,6 +5137,8 @@ useEffect(() => {
                     x: e.nativeEvent.pageX,
                     y: e.nativeEvent.pageY,
                     time: Date.now(),
+                    active: true,
+                    didScroll: false,
                   };
                   epubTouchMaxMoveRef.current = 0;
                 }}
@@ -5073,6 +5150,14 @@ useEffect(() => {
                     epubTouchMaxMoveRef.current,
                     Math.sqrt(dx * dx + dy * dy)
                   );
+                  if (epubTouchMaxMoveRef.current > 8) {
+                    start.didScroll = true;
+                  }
+                }}
+                onScroll={() => {
+                  if (epubTouchStartRef.current.active) {
+                    epubTouchStartRef.current.didScroll = true;
+                  }
                 }}
                 onTouchEnd={(e) => {
                   const start = epubTouchStartRef.current;
@@ -5090,11 +5175,12 @@ useEffect(() => {
                       direction: dy > 0 ? "prev" : "next",
                     }));
                   } else if (
+                    !start.didScroll &&
                     dt >= 40 &&
-                    dt <= 500 &&
-                    epubTouchMaxMoveRef.current <= 16 &&
-                    Math.abs(dx) <= 14 &&
-                    Math.abs(dy) <= 14
+                    dt <= 350 &&
+                    epubTouchMaxMoveRef.current <= 8 &&
+                    Math.abs(dx) <= 8 &&
+                    Math.abs(dy) <= 8
                   ) {
                     // 높이가 0인 이미지 XHTML 등은 iframe 내부 touch 이벤트가 오지 않을 수 있다.
                     // 내부 이벤트가 먼저 처리됐는지 잠시 기다린 뒤 RN에서 한 번만 보완한다.
@@ -5107,6 +5193,11 @@ useEffect(() => {
                       }
                     }, 120);
                   }
+                  start.active = false;
+                }}
+                onTouchCancel={() => {
+                  epubTouchStartRef.current.active = false;
+                  epubTouchStartRef.current.didScroll = true;
                 }}
                 onError={(syntheticEvent) => {
                   const { nativeEvent } = syntheticEvent;
@@ -5123,6 +5214,8 @@ useEffect(() => {
                       y: e.nativeEvent.pageY,
                       time: Date.now(),
                       maxMove: 0,
+                      active: true,
+                      didScroll: false,
                     };
                   }}
                   onTouchMove={(e) => {
@@ -5130,6 +5223,7 @@ useEffect(() => {
                     const dx = e.nativeEvent.pageX - touch.x;
                     const dy = e.nativeEvent.pageY - touch.y;
                     touch.maxMove = Math.max(touch.maxMove, Math.sqrt(dx * dx + dy * dy));
+                    if (touch.maxMove > 8) touch.didScroll = true;
                   }}
                   onTouchEnd={(e) => {
                     const touch = firstSectionTouchRef.current;
@@ -5148,16 +5242,22 @@ useEffect(() => {
                         direction: dy > 0 ? "prev" : "next",
                       }));
                     } else if (
+                      !touch.didScroll &&
                       dt >= 40 &&
-                      dt <= 500 &&
-                      Math.abs(dx) <= 14 &&
-                      Math.abs(dy) <= 14 &&
-                      touch.maxMove <= 16
+                      dt <= 350 &&
+                      Math.abs(dx) <= 8 &&
+                      Math.abs(dy) <= 8 &&
+                      touch.maxMove <= 8
                     ) {
                       console.log("📑 [RN first section] tap - UI toggle");
                       lastEpubWebToggleAtRef.current = Date.now();
                       setShowUI((prev) => !prev);
                     }
+                    touch.active = false;
+                  }}
+                  onTouchCancel={() => {
+                    firstSectionTouchRef.current.active = false;
+                    firstSectionTouchRef.current.didScroll = true;
                   }}
                 />
               )}
@@ -5179,7 +5279,7 @@ useEffect(() => {
       ) : (
         /* TXT: 스크롤 + UI 토글 */
         <>
-          <View style={styles.readerArea}>
+          <View style={[styles.readerArea, { paddingTop: readerTopInset }]}>
             {txtLoading ? (
               <View style={styles.loadingContainer}>
                 <ActivityIndicator size="large" color="#b84a8c" />
@@ -5223,6 +5323,8 @@ useEffect(() => {
                   y: e.nativeEvent.pageY,
                   time: Date.now(),
                   maxMove: 0,
+                  active: true,
+                  didScroll: false,
                 };
               }}
               onTouchMove={(e) => {
@@ -5230,15 +5332,33 @@ useEffect(() => {
                 const dx = e.nativeEvent.pageX - touch.x;
                 const dy = e.nativeEvent.pageY - touch.y;
                 touch.maxMove = Math.max(touch.maxMove, Math.sqrt(dx * dx + dy * dy));
+                if (touch.maxMove > 8) touch.didScroll = true;
+              }}
+              onScrollBeginDrag={() => {
+                if (touchStartPos.current.active) {
+                  touchStartPos.current.didScroll = true;
+                }
               }}
               onTouchEnd={(e) => {
                 const touch = touchStartPos.current;
                 const dx = Math.abs(e.nativeEvent.pageX - touch.x);
                 const dy = Math.abs(e.nativeEvent.pageY - touch.y);
                 const elapsed = Date.now() - touch.time;
-                if (elapsed <= 500 && dx <= 14 && dy <= 14 && touch.maxMove <= 16) {
+                if (
+                  !touch.didScroll &&
+                  elapsed >= 40 &&
+                  elapsed <= 350 &&
+                  dx <= 8 &&
+                  dy <= 8 &&
+                  touch.maxMove <= 8
+                ) {
                   setShowUI((prev) => !prev);
                 }
+                touch.active = false;
+              }}
+              onTouchCancel={() => {
+                touchStartPos.current.active = false;
+                touchStartPos.current.didScroll = true;
               }}
               renderItem={({ item, index }) => {
                 const target = txtSearchTarget?.chunkIndex === index ? txtSearchTarget : null;
