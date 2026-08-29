@@ -928,22 +928,13 @@ useEffect(() => {
           Math.min(1, Math.max(0, savedProgress)) * rawTextRef.current.length,
         );
     console.log("📚 TXT 이어읽기 실행! progress:", savedProgress, "characterOffset:", characterOffset);
-    const savedScrollY = initialTxtScrollYRef.current;
-    const canRestoreExactScroll = savedScrollY != null
-      && initialTxtLayoutSignatureRef.current === txtLayoutSignature;
-
-    if (canRestoreExactScroll) {
-      const maxScrollY = Math.max(0, txtContentHeightRef.current - viewHeightRef.current);
-      const targetY = Math.min(maxScrollY, Math.max(0, savedScrollY));
-      hasResumedRef.current = true;
-      currentScrollYRef.current = targetY;
-      currentTxtCharOffsetRef.current = characterOffset;
-      currentTxtLineTopInsetRef.current = initialTxtLineTopInsetRef.current;
-      scrollTxtToOffset(targetY);
-      applyTxtCharacterPosition(characterOffset, savedProgress);
-    } else {
-      navigateTxtToCharacterOffsetRef.current(characterOffset, 0);
-    }
+    const canRestoreLineInset = initialTxtLayoutSignatureRef.current === txtLayoutSignature;
+    navigateTxtToCharacterOffsetRef.current(
+      characterOffset,
+      0,
+      true,
+      canRestoreLineInset ? initialTxtLineTopInsetRef.current : 0,
+    );
   }, 80);
 
   return () => clearTimeout(timer);
