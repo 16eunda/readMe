@@ -5,6 +5,7 @@ import { Buffer } from 'buffer';
 import * as FileSystem from "expo-file-system/legacy";
 import * as NavigationBar from "expo-navigation-bar";
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
+import { readExternalTextFile } from "external-file-info";
 import iconv from 'iconv-lite';
 import { Search, X } from "lucide-react-native";
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -25,7 +26,6 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
-import { readExternalTextFile } from "external-file-info";
 import ReaderSearchModal, { ReaderSearchResult } from "../components/ReaderSearchModal";
 import { authenticatedFetch, BASE_URL } from "../utils/api";
 import { createPreviewAroundOffset, createPreviewText } from "../utils/preview";
@@ -103,6 +103,15 @@ interface TxtSearchTarget {
   query: string;
 }
 
+interface TxtPendingNavigation {
+  id: number;
+  characterOffset: number;
+  chunkIndex: number;
+  localOffset: number;
+  lineTopInset: number;
+  viewPosition: number;
+}
+
 interface TxtRenderChunk {
   start: number;
   end: number;
@@ -131,7 +140,7 @@ const DEFAULT_SETTINGS: ReaderSettings = {
 
 const BG_PRESETS = [
   { label: "종이", bg: "#f5f0e6", text: "#000000" },
-  { label: "흰색", bg: "#e5e5e7", text: "#000000" },
+  { label: "흰색", bg: "#fafaf8", text: "#000000" },
   { label: "회색", bg: "#e8e8e8", text: "#000000" },
   { label: "다크", bg: "#1c1c1e", text: "#e5e5e7" },
   { label: "초록", bg: "#c3dda8", text: "#000000" }, // #dde9cc : 연한 아라그린, #c3dda8 : 아라그린
@@ -280,6 +289,10 @@ export default function ReaderScreen() {
   const txtTotalPagesRef = useRef(1);
   const txtPixelsPerCharacterRef = useRef(1);
   const lastTxtScrollUiUpdateAtRef = useRef(0);
+  const txtNavigationIdRef = useRef(0);
+  const pendingTxtNavigationRef = useRef<TxtPendingNavigation | null>(null);
+  const isTxtProgrammaticNavigationRef = useRef(false);
+  const completeTxtNavigationRef = useRef<(chunkIndex: number) => void>(() => {});
   const navigateTxtToCharacterOffsetRef = useRef<(
     offset: number,
     viewPosition?: number,
@@ -571,6 +584,9 @@ export default function ReaderScreen() {
     setSearchError(null);
     setTxtSearchTarget(null);
     setEpubSearchHighlightActive(false);
+    txtNavigationIdRef.current += 1;
+    pendingTxtNavigationRef.current = null;
+    isTxtProgrammaticNavigationRef.current = false;
     setLastCfi(null);
     lastWebPercentRef.current = null;
     epubStartedRef.current = false;
@@ -738,6 +754,9 @@ export default function ReaderScreen() {
     read();
     return () => {
       active = false;
+      txtNavigationIdRef.current += 1;
+      pendingTxtNavigationRef.current = null;
+      isTxtProgrammaticNavigationRef.current = false;
     };
   }, [uri, name, type, fileId]);
 
@@ -1024,6 +1043,7 @@ useEffect(() => {
           const { y, height } = event.nativeEvent.layout;
           if (!(height > 0)) return;
           txtItemLayoutsRef.current[index] = { y, height };
+          completeTxtNavigationRef.current(index);
 
           const chunk = contentRef.current[index];
           if (!chunk || txtPaginationLockedRef.current) return;
@@ -1122,6 +1142,21 @@ useEffect(() => {
     });
   };
 
+  const getTxtEstimatedItemLayout = (index: number) => {
+    const chunk = contentRef.current[index];
+    const pixelsPerCharacter = Math.max(0.01, txtPixelsPerCharacterRef.current);
+    const minimumHeight = Math.max(1, settings.fontSize * settings.lineSpacing);
+    if (!chunk) {
+      return { length: minimumHeight, offset: 0, index };
+    }
+
+    return {
+      length: Math.max(minimumHeight, (chunk.end - chunk.start) * pixelsPerCharacter),
+      offset: chunk.start * pixelsPerCharacter,
+      index,
+    };
+  };
+
   const findTxtChunkIndexForOffset = (characterOffset: number) => {
     const chunks = contentRef.current;
     if (chunks.length === 0) return -1;
@@ -1165,6 +1200,51 @@ useEffect(() => {
     updateTxtReadingPreview(currentScrollYRef.current, nextProgress);
   };
 
+  const completePendingTxtNavigation = (chunkIndex: number) => {
+    const pending = pendingTxtNavigationRef.current;
+    if (!pending || pending.chunkIndex !== chunkIndex) return;
+
+    const chunk = contentRef.current[chunkIndex];
+    const layout = txtItemLayoutsRef.current[chunkIndex];
+    const lineMetrics = txtLineMetricsRef.current[chunkIndex];
+    if (!chunk || !layout || !Array.isArray(lineMetrics) || lineMetrics.length === 0) return;
+
+    let targetWithinChunk = layout.height;
+    if (pending.characterOffset < rawTextRef.current.length) {
+      let selectedLine = lineMetrics[0];
+      for (const line of lineMetrics) {
+        if (line.offset > pending.localOffset) break;
+        selectedLine = line;
+      }
+      const appliedLineTopInset = Math.min(
+        Math.max(0, selectedLine.height - 1),
+        Math.max(0, pending.lineTopInset),
+      );
+      currentTxtLineTopInsetRef.current = appliedLineTopInset;
+      targetWithinChunk = selectedLine.y + appliedLineTopInset;
+    } else {
+      currentTxtLineTopInsetRef.current = 0;
+    }
+
+    const targetY = Math.max(
+      0,
+      layout.y + targetWithinChunk - viewHeightRef.current * pending.viewPosition,
+    );
+    pendingTxtNavigationRef.current = null;
+    currentScrollYRef.current = targetY;
+    currentTxtCharOffsetRef.current = pending.characterOffset;
+    scrollTxtToOffset(targetY);
+    applyTxtCharacterPosition(pending.characterOffset);
+
+    const navigationId = pending.id;
+    setTimeout(() => {
+      if (txtNavigationIdRef.current !== navigationId) return;
+      isTxtProgrammaticNavigationRef.current = false;
+      applyTxtCharacterPosition(pending.characterOffset);
+      updateTxtReadingPreview(currentScrollYRef.current, progressRef.current);
+    }, 80);
+  };
+
   const navigateTxtToCharacterOffset = (
     characterOffset: number,
     viewPosition = 0,
@@ -1182,41 +1262,33 @@ useEffect(() => {
     if (!scrollRef.current || !chunk) return;
 
     const requestedProgress = rawLength > 0 ? clampedOffset / rawLength : 0;
-    const maxScrollY = Math.max(0, txtContentHeightRef.current - viewHeightRef.current);
-    const normalizedViewPosition = Math.min(0.8, Math.max(0, viewPosition));
-    let targetY = requestedProgress * maxScrollY;
-
-    const layout = txtItemLayoutsRef.current[chunkIndex];
-    const lineMetrics = txtLineMetricsRef.current[chunkIndex];
-    if (layout && Array.isArray(lineMetrics) && lineMetrics.length > 0) {
-      const localOffset = Math.max(0, clampedOffset - chunk.start);
-      let selectedLine = lineMetrics[0];
-      for (const line of lineMetrics) {
-        if (line.offset > localOffset) break;
-        selectedLine = line;
-      }
-      const appliedLineTopInset = Math.min(
-        Math.max(0, selectedLine.height - 1),
-        Math.max(0, lineTopInset),
-      );
-      targetY = layout.y
-        + selectedLine.y
-        + appliedLineTopInset
-        - viewHeightRef.current * normalizedViewPosition;
-      currentTxtLineTopInsetRef.current = appliedLineTopInset;
-    } else {
-      currentTxtLineTopInsetRef.current = 0;
-    }
-
-    targetY = Math.min(maxScrollY, Math.max(0, targetY));
+    const pending: TxtPendingNavigation = {
+      id: txtNavigationIdRef.current + 1,
+      characterOffset: clampedOffset,
+      chunkIndex,
+      localOffset: Math.max(0, clampedOffset - chunk.start),
+      lineTopInset: Math.max(0, lineTopInset),
+      viewPosition: Math.min(0.8, Math.max(0, viewPosition)),
+    };
+    txtNavigationIdRef.current = pending.id;
+    pendingTxtNavigationRef.current = pending;
+    isTxtProgrammaticNavigationRef.current = true;
     hasResumedRef.current = true;
-    currentScrollYRef.current = targetY;
     currentTxtCharOffsetRef.current = clampedOffset;
-    scrollTxtToOffset(targetY);
     applyTxtCharacterPosition(clampedOffset, requestedProgress);
+
+    completePendingTxtNavigation(chunkIndex);
+    if (!pendingTxtNavigationRef.current) return;
+
+    scrollRef.current.scrollToIndex({
+      index: chunkIndex,
+      animated: false,
+      viewPosition: pending.viewPosition,
+    });
   };
 
   navigateTxtToCharacterOffsetRef.current = navigateTxtToCharacterOffset;
+  completeTxtNavigationRef.current = completePendingTxtNavigation;
 
   const getTxtCharacterOffsetForScroll = (
     offsetY: number,
@@ -1320,19 +1392,23 @@ useEffect(() => {
     if (eventContentHeight > 0) {
       txtContentHeightRef.current = eventContentHeight;
     }
+    if (pendingTxtNavigationRef.current || isTxtProgrammaticNavigationRef.current) return;
     // offsetY=0이고 아직 이어읽기 복원 전이면 preview 갱신 스킵 (초기 렌더 onScroll 방지)
     const skipPreview = offsetY < 5 && !hasResumedRef.current;
 
-    const maxScrollY = Math.max(
-      0,
-      txtContentHeightRef.current - e.nativeEvent.layoutMeasurement.height,
-    );
-    const clamped = maxScrollY > 0
-      ? Math.min(1, Math.max(0, offsetY / maxScrollY))
-      : 0;
-    const characterOffset = getTxtCharacterOffsetForScroll(offsetY)
-      ?? Math.floor(clamped * rawTextRef.current.length);
+    const rawLength = rawTextRef.current.length;
+    const isLastChunkVisible = contentRef.current.length > 0
+      && txtVisibleChunkIndexRef.current === contentRef.current.length - 1;
+    const isAtActualEnd = isLastChunkVisible
+      && offsetY + e.nativeEvent.layoutMeasurement.height >= eventContentHeight - 2;
+    const measuredCharacterOffset = getTxtCharacterOffsetForScroll(offsetY);
+    const characterOffset = isAtActualEnd
+      ? rawLength
+      : measuredCharacterOffset ?? currentTxtCharOffsetRef.current;
     currentTxtCharOffsetRef.current = characterOffset;
+    const clamped = rawLength > 0
+      ? Math.min(1, Math.max(0, characterOffset / rawLength))
+      : 0;
 
     progressRef.current = clamped;
     const now = Date.now();
@@ -1459,6 +1535,7 @@ useEffect(() => {
 
   const handleTxtTextLayout = (chunkIndex: number, lines: any[]) => {
     recordTxtLineMetrics(chunkIndex, lines);
+    completeTxtNavigationRef.current(chunkIndex);
   };
 
   const handleSearchResultSelect = (result: ReaderSearchResult) => {
@@ -2416,6 +2493,7 @@ useEffect(() => {
             var fallbackMeasuredPageCounts = {};
             var fallbackTextLengths = {};
             var fallbackCharsPerPage = 500;
+            var fallbackPaginationReady = false;
             var fallbackScrollBound = false;
             var pendingFallbackSeek = null;
             var pendingFallbackRestore = false;
@@ -2452,10 +2530,8 @@ useEffect(() => {
               var counts = [];
               var total = 0;
               for (var index = 0; index < spineCount; index++) {
-                var count = fallbackMeasuredPageCounts[index]
-                  ? fallbackPageCounts[index]
-                  : Math.max(1, fallbackPageCounts[index]
-                    || Math.ceil((fallbackTextLengths[index] || 0) / fallbackCharsPerPage));
+                var count = Math.max(1, fallbackPageCounts[index]
+                  || Math.ceil((fallbackTextLengths[index] || 0) / fallbackCharsPerPage));
                 counts.push(count);
                 total += count;
               }
@@ -2486,22 +2562,20 @@ useEffect(() => {
             function seekFallbackPercent(percent) {
               var paging = getFallbackPagination();
               var p = Math.max(0, Math.min(1, percent));
-              var targetPageIndex = Math.max(0, Math.min(
-                paging.total - 1,
-                Math.round(p * (paging.total - 1))
-              ));
+              var targetPosition = p * paging.total;
               var before = 0;
               var sectionIndex = 0;
               for (var index = 0; index < paging.counts.length; index++) {
-                if (targetPageIndex < before + paging.counts[index]) {
+                var sectionEnd = before + paging.counts[index];
+                if (targetPosition <= sectionEnd || index === paging.counts.length - 1) {
                   sectionIndex = index;
                   break;
                 }
                 before += paging.counts[index];
               }
               var sectionPages = Math.max(1, paging.counts[sectionIndex] || 1);
-              var withinPageIndex = Math.max(0, Math.min(sectionPages - 1, targetPageIndex - before));
-              var withinRatio = sectionPages > 1 ? withinPageIndex / (sectionPages - 1) : 0;
+              var withinRatio = Math.max(0, Math.min(1, (targetPosition - before) / sectionPages));
+              var targetPage = Math.min(paging.total, Math.floor(targetPosition) + 1);
               pendingFallbackSeek = {
                 sectionIndex: sectionIndex,
                 withinRatio: withinRatio
@@ -2509,15 +2583,15 @@ useEffect(() => {
               totalLocations = paging.total;
               window.ReactNativeWebView.postMessage(JSON.stringify({
                 type: "seekState",
-                current: targetPageIndex + 1,
+                current: targetPage,
                 total: paging.total,
-                percent: paging.total > 1 ? (targetPageIndex / (paging.total - 1)) * 100 : 0
+                percent: p * 100
               }));
               hideBookCover();
               sendLog('🔍 fallback 슬라이더 이동: ' + Math.round(p * 100) + '%'
-                + ' page=' + (targetPageIndex + 1) + '/' + paging.total
+                + ' page=' + targetPage + '/' + paging.total
                 + ' section=' + sectionIndex
-                + ' within=' + (withinPageIndex + 1) + '/' + sectionPages);
+                + ' within=' + Math.round(withinRatio * 100) + '%');
               if (sectionIndex === lastDisplayedSectionIndex && isFallbackVisible()) {
                 applyPendingFallbackSeek();
                 return Promise.resolve(true);
@@ -2608,33 +2682,30 @@ useEffect(() => {
               var viewportHeight = Math.max(1, fallbackSectionEl.clientHeight);
               var currentSectionPages = Math.max(1, Math.ceil(fallbackSectionEl.scrollHeight / viewportHeight));
               var currentTextLength = String(fallbackSectionEl.innerText || '').replace(/\\s+/g, '').trim().length;
-              if (currentTextLength > 100 && currentSectionPages > 1) {
-                fallbackCharsPerPage = Math.max(250, Math.min(900, currentTextLength / currentSectionPages));
+              if (!fallbackPaginationReady) {
+                if (currentTextLength > 100 && currentSectionPages > 1) {
+                  fallbackCharsPerPage = Math.max(250, Math.min(900, currentTextLength / currentSectionPages));
+                }
+                fallbackPageCounts[lastDisplayedSectionIndex] = currentSectionPages;
+                fallbackMeasuredPageCounts[lastDisplayedSectionIndex] = true;
               }
-              fallbackPageCounts[lastDisplayedSectionIndex] = currentSectionPages;
-              fallbackMeasuredPageCounts[lastDisplayedSectionIndex] = true;
 
-              var total = 0;
+              var paging = getFallbackPagination();
+              var total = paging.total;
               var before = 0;
               for (var pageIndex = 0; pageIndex < spineCount; pageIndex++) {
-                var count = fallbackMeasuredPageCounts[pageIndex]
-                  ? fallbackPageCounts[pageIndex]
-                  : Math.max(1, Math.ceil((fallbackTextLengths[pageIndex] || 0) / fallbackCharsPerPage));
-                if (pageIndex < lastDisplayedSectionIndex) before += count;
-                total += count;
+                if (pageIndex < lastDisplayedSectionIndex) before += paging.counts[pageIndex] || 1;
               }
-              var within = Math.min(
-                currentSectionPages,
-                Math.max(1, Math.floor(fallbackSectionEl.scrollTop / viewportHeight) + 1)
-              );
-              var current = before + within;
-              var percent = total > 1 ? ((current - 1) / (total - 1)) * 100 : 0;
               var maxScroll = Math.max(0, fallbackSectionEl.scrollHeight - fallbackSectionEl.clientHeight);
               var withinRatio = maxScroll > 0 ? fallbackSectionEl.scrollTop / maxScroll : 0;
+              var fixedSectionPages = Math.max(1, paging.counts[lastDisplayedSectionIndex] || 1);
+              var absolutePosition = before + withinRatio * fixedSectionPages;
+              var current = Math.min(total, Math.floor(absolutePosition) + 1);
+              var percent = total > 0 ? (absolutePosition / total) * 100 : 0;
               var fallbackLocation = 'readme-fallback:' + lastDisplayedSectionIndex + ':' + withinRatio.toFixed(6);
               var fallbackVisibleText = getFallbackVisibleText();
               totalLocations = total;
-              reportNavigationReady('fallback');
+              if (fallbackPaginationReady) reportNavigationReady('fallback');
               window.ReactNativeWebView.postMessage(JSON.stringify({
                 type: "locationsReady",
                 current: current,
@@ -2651,7 +2722,7 @@ useEffect(() => {
               }));
               sendLog('📄 fallback paging current=' + current + '/' + total
                 + ' section=' + lastDisplayedSectionIndex
-                + ' within=' + within + '/' + currentSectionPages
+                + ' within=' + Math.round(withinRatio * 100) + '%/' + fixedSectionPages
                 + ' charsPerPage=' + Math.round(fallbackCharsPerPage)
                 + ' visibleTxt=' + fallbackVisibleText.slice(0, 35));
             }
@@ -2688,7 +2759,11 @@ useEffect(() => {
                   var spineCount = book.spine && book.spine.spineItems ? book.spine.spineItems.length : 1;
                   // fixed-layout/특수 EPUB은 locations가 1개만 생성된다. 이 경우 spine을 페이지로 사용한다.
                   totalLocations = generatedCount <= 1 ? Math.max(1, spineCount) : generatedCount;
-                  reportNavigationReady(generatedCount <= 1 ? 'fallback' : 'locations');
+                  if (generatedCount > 1) {
+                    reportNavigationReady('locations');
+                  } else if (fallbackPaginationReady) {
+                    reportNavigationReady('fallback');
+                  }
                   sendLog("📚 페이지 기준=" + (generatedCount <= 1 ? 'spine' : 'locations')
                     + " generated=" + generatedCount + " spine=" + spineCount);
                   reportLocationsReady();
@@ -3608,13 +3683,39 @@ useEffect(() => {
             }
 
             function estimateFallbackPageCounts() {
-              if (!rawZipPromise || !book.spine || !book.spine.spineItems) return;
+              var spineItems = book.spine && book.spine.spineItems ? book.spine.spineItems : [];
+              var finalizeFallbackPagination = function(reason) {
+                for (var index = 0; index < Math.max(1, spineItems.length); index++) {
+                  if (!fallbackPageCounts[index]) {
+                    fallbackPageCounts[index] = Math.max(
+                      1,
+                      Math.ceil((fallbackTextLengths[index] || 0) / fallbackCharsPerPage)
+                    );
+                  }
+                }
+                fallbackPaginationReady = true;
+                var paging = getFallbackPagination();
+                totalLocations = paging.total;
+                sendLog('📚 fallback 전체 범위 고정=' + paging.total
+                  + ' reason=' + reason
+                  + ' chars=' + JSON.stringify(fallbackTextLengths));
+                if (isFallbackVisible()) {
+                  reportFallbackPaging();
+                } else if (locationsReady && Math.max(1, book.locations.length()) <= 1) {
+                  reportNavigationReady('fallback');
+                  reportLocationsReady();
+                }
+              };
+
+              if (!rawZipPromise || spineItems.length === 0) {
+                finalizeFallbackPagination('archive-unavailable');
+                return;
+              }
               rawZipPromise.then(function(zip) {
-                if (!zip) return;
+                if (!zip) throw new Error('EPUB archive를 읽을 수 없음');
                 var packagePath = book.packaging && book.packaging.path ? String(book.packaging.path) : '';
                 var packageDir = packagePath.replace(/[^/]+$/, '');
-                var items = book.spine.spineItems;
-                return Promise.all(items.map(function(section, index) {
+                return Promise.all(spineItems.map(function(section, index) {
                   var file = findArchiveFile(zip, packageDir + section.href) || findArchiveFile(zip, section.href);
                   if (!file) return Promise.resolve();
                   return file.async('text').then(function(rawHtml) {
@@ -3640,18 +3741,10 @@ useEffect(() => {
                   });
                 }));
               }).then(function() {
-                var estimatedTotal = 0;
-                Object.keys(fallbackPageCounts).forEach(function(key) {
-                  estimatedTotal += fallbackPageCounts[key] || 1;
-                });
-                if (estimatedTotal > 0) {
-                  totalLocations = estimatedTotal;
-                  sendLog('📚 fallback 전체 페이지 추정=' + estimatedTotal
-                    + ' chars=' + JSON.stringify(fallbackTextLengths));
-                  if (isFallbackVisible()) reportFallbackPaging();
-                }
+                finalizeFallbackPagination('spine-scan-complete');
               }).catch(function(e) {
                 sendLog('⚠️ fallback 페이지 추정 실패: ' + e.message);
+                finalizeFallbackPagination('spine-scan-failed');
               });
             }
 
@@ -4607,28 +4700,17 @@ useEffect(() => {
                     }));
                     rendition.display(seekTargetCfi).then(function() {
                       requestAnimationFrame(function() {
-                        requestAnimationFrame(function() {
-                          setTimeout(function() {
-                            if (activeSeekTargetCfi !== seekTargetCfi) return;
-                            alignCfiInViewport(seekTargetCfi, 0.5);
-                            setTimeout(function() {
-                              if (activeSeekTargetCfi !== seekTargetCfi) return;
-                              alignCfiInViewport(seekTargetCfi, 0.5);
-                              lastCenterCfi = '';
-                              updateCenterText();
-                              // 화면 중앙에 맞춘 목표 CFI를 확정값으로 사용한다.
-                              lastCenterCfi = seekTargetCfi;
-                              isChapterLoading = false;
-                              isSeeking = false;
-                              activeSeekTargetCfi = '';
-                              try {
-                                var loc = rendition.currentLocation();
-                                if (loc) safeReport(loc, false);
-                              } catch(e) {}
-                              reportSectionState();
-                            }, 180);
-                          }, 80);
-                        });
+                        if (activeSeekTargetCfi !== seekTargetCfi) return;
+                        lastCenterCfi = seekTargetCfi;
+                        updateCenterText();
+                        isChapterLoading = false;
+                        isSeeking = false;
+                        activeSeekTargetCfi = '';
+                        try {
+                          var loc = rendition.currentLocation();
+                          if (loc) safeReport(loc, false);
+                        } catch(e) {}
+                        reportSectionState();
                       });
                     }).catch(function() {
                       if (activeSeekTargetCfi === seekTargetCfi) {
@@ -5300,6 +5382,7 @@ useEffect(() => {
               CellRendererComponent={renderTxtCell}
               onViewableItemsChanged={onTxtViewableItemsChangedRef.current}
               viewabilityConfig={txtViewabilityConfigRef.current}
+              getItemLayout={(_data, index) => getTxtEstimatedItemLayout(index)}
               initialNumToRender={2}
               maxToRenderPerBatch={2}
               updateCellsBatchingPeriod={40}
@@ -5310,6 +5393,13 @@ useEffect(() => {
               onScroll={handleScroll}
               onScrollEndDrag={(e) => updateTxtScrollState(e, true)}
               onMomentumScrollEnd={(e) => updateTxtScrollState(e, true)}
+              onScrollToIndexFailed={(info) => {
+                const pending = pendingTxtNavigationRef.current;
+                if (!pending || pending.chunkIndex !== info.index || !scrollRef.current) return;
+
+                const measuredOffset = getTxtEstimatedItemLayout(info.index).offset;
+                scrollRef.current.scrollToOffset({ offset: measuredOffset, animated: false });
+              }}
               onContentSizeChange={(_width, height) => {
                 const measuredHeight = Math.max(1, height);
                 txtContentHeightRef.current = measuredHeight;
@@ -5335,6 +5425,9 @@ useEffect(() => {
                 if (touch.maxMove > 8) touch.didScroll = true;
               }}
               onScrollBeginDrag={() => {
+                txtNavigationIdRef.current += 1;
+                pendingTxtNavigationRef.current = null;
+                isTxtProgrammaticNavigationRef.current = false;
                 if (touchStartPos.current.active) {
                   touchStartPos.current.didScroll = true;
                 }
