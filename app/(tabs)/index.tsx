@@ -3,8 +3,10 @@ import * as DocumentPicker from "expo-document-picker";
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Buffer } from "buffer";
+import { File as ExpoFile, type FileHandle } from "expo-file-system";
 import * as FileSystem from "expo-file-system/legacy";
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
+import { readExternalTextFile } from "external-file-info";
 import { htmlToText } from "html-to-text";
 import JSZip from "jszip";
 import { Plus } from "lucide-react-native";
@@ -50,12 +52,23 @@ import { useUser } from "../../contexts/UserContext";
 
 const MANAGED_FILE_DIRECTORY = "library-files";
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
+const TXT_PREVIEW_SAMPLE_BYTES = 64 * 1024;
 
-// Home 화면이 이동 과정에서 다시 마운트되어도 같은 이름의 외부 파일 등록은 한 번만 진행한다.
+// Home 화면이 이동 과정에서 다시 마운트되어도 같은 외부 파일 등록은 한 번만 진행한다.
 const activeExternalRegistrations = new Set<string>();
 
-const getExternalRegistrationKey = (name: string) =>
-  `root:${name.trim().toLocaleLowerCase()}`;
+const getExternalRegistrationKey = (name: string, uri: string) =>
+  `root:${name.trim().toLocaleLowerCase()}:${uri}`;
+
+function readFilePrefix(uri: string, byteCount: number): Buffer {
+  let handle: FileHandle | null = null;
+  try {
+    handle = new ExpoFile(uri).open();
+    return Buffer.from(handle.readBytes(byteCount));
+  } finally {
+    handle?.close();
+  }
+}
 
 async function createManagedFileUri(displayName: string): Promise<string> {
   const documentDirectory = FileSystem.documentDirectory;
@@ -183,6 +196,7 @@ export default function Home() {
     targetFolder?: string;
     openAfterSave: boolean;
     externalRegistrationKey?: string;
+    operationId: number;
   } | null>(null);
 
   // 페이지네이션 (추가 페이지 로딩용)
@@ -201,6 +215,9 @@ export default function Home() {
   const locateRequestIdRef = useRef(0);
   const processedLocateFileIdRef = useRef("");
   const pendingExternalRegistrationRef = useRef<string | null>(null);
+  const fileRegistrationOperationIdRef = useRef(0);
+  const fileRegistrationAbortRef = useRef<AbortController | null>(null);
+  const filePreviewRequestIdRef = useRef(0);
 
   // 정렬
   const [sortOption, setSortOption] = useState<SortOption>("date-desc");
@@ -437,15 +454,37 @@ export default function Home() {
   // -------------------------------------------------------
   // 외부 파일 열기 (Open With) 처리
   // -------------------------------------------------------
+  const beginFileRegistrationOperation = () => {
+    fileRegistrationAbortRef.current?.abort();
+    const operationId = fileRegistrationOperationIdRef.current + 1;
+    fileRegistrationOperationIdRef.current = operationId;
+    fileRegistrationAbortRef.current = new AbortController();
+
+    const previousRegistrationKey = pendingExternalRegistrationRef.current;
+    if (previousRegistrationKey) {
+      activeExternalRegistrations.delete(previousRegistrationKey);
+      pendingExternalRegistrationRef.current = null;
+    }
+    setDuplicateModalVisible(false);
+    setDuplicateFileName("");
+    setPendingFile(null);
+    setPendingFileAction(null);
+    return operationId;
+  };
+
+  const isCurrentFileRegistration = (operationId: number) =>
+    fileRegistrationOperationIdRef.current === operationId;
+
   useEffect(() => {
     if (!incomingFile || isUserLoading) return;
 
     setIncomingFile(null); // 중복 처리 방지
     
     const { uri, name } = incomingFile;
+    const operationId = beginFileRegistrationOperation();
 
     // 외부 파일 열기에서는 사용자가 이미 파일을 선택했으므로 원본/수신 파일명으로 자동 등록
-    processExternalFile({ uri, name });
+    processExternalFile({ uri, name }, operationId);
   }, [incomingFile, isUserLoading]);
 
   useEffect(() => () => {
@@ -453,12 +492,17 @@ export default function Home() {
     if (registrationKey) {
       activeExternalRegistrations.delete(registrationKey);
     }
+    fileRegistrationAbortRef.current?.abort();
   }, []);
   
   // 외부 파일 실제 처리
-  const processExternalFile = async (file: { uri: string; name: string }) => {
+  const processExternalFile = async (
+    file: { uri: string; name: string },
+    operationId: number,
+  ) => {
     const { uri, name } = file;
-    const registrationKey = getExternalRegistrationKey(name);
+    const registrationKey = getExternalRegistrationKey(name, uri);
+    if (!isCurrentFileRegistration(operationId)) return;
     if (activeExternalRegistrations.has(registrationKey)) {
       console.log('↩️ 이미 진행 중인 외부 파일 등록 무시:', name);
       return;
@@ -471,10 +515,11 @@ export default function Home() {
       // 중복 체크 (root 폴더 기준)
       const checkRes = await authenticatedFetch(
         `${BASE_URL}/files/check?title=${encodeURIComponent(name)}&path=root`,
-        {},
+        { signal: fileRegistrationAbortRef.current?.signal },
         deviceId ?? undefined
       );
       const { exists } = await checkRes.json();
+      if (!isCurrentFileRegistration(operationId)) return;
 
       if (exists) {
         waitingForDuplicateConfirmation = true;
@@ -485,20 +530,22 @@ export default function Home() {
           targetFolder: 'root',
           openAfterSave: true,
           externalRegistrationKey: registrationKey,
+          operationId,
         });
         setDuplicateModalVisible(true);
         return;
       }
 
       // 새 파일 → root에 추가 후 바로 reader로 이동
-      const saved = await addFileToSystem({ uri, name }, 'root');
-      if (saved) {
+      const saved = await addFileToSystem({ uri, name }, 'root', operationId);
+      if (saved && isCurrentFileRegistration(operationId)) {
         router.push({
           pathname: '/reader',
           params: { fileId: saved.id, uri: saved.uri, name: saved.title, type: saved.type },
         });
       }
     } catch (e) {
+      if (!isCurrentFileRegistration(operationId)) return;
       console.error('❌ 외부 파일 처리 실패:', e);
     } finally {
       if (!waitingForDuplicateConfirmation) {
@@ -743,7 +790,7 @@ export default function Home() {
   // -----------------------------
   // 파일 저장
   // -----------------------------
-  async function saveFileToServer(fileData: any) {
+  async function saveFileToServer(fileData: any, signal?: AbortSignal) {
     try {
       // 실기기에서는 외부 파일 처리/등록이 UserContext의 deviceId 상태 갱신보다 먼저
       // 시작될 수 있으므로 저장 직전에 영속 deviceId를 직접 확보한다.
@@ -760,6 +807,7 @@ export default function Home() {
       
       const response = await authenticatedFetch(`${BASE_URL}/files`, {
         method: "POST",
+        signal,
         headers: {
           "Content-Type": "application/json",
         },
@@ -778,6 +826,7 @@ export default function Home() {
       console.log('✅ 서버 응답 파싱 완료:', { id: saved?.id, title: saved?.title });
       return saved;
     } catch (error) {
+      if (signal?.aborted) return null;
       console.error("❌ saveFileToServer 에러:", error);
       return null;
     }
@@ -888,16 +937,18 @@ export default function Home() {
       const file = res.assets[0];
       console.log('✅ 파일 선택됨:', { name: file.name, uri: file.uri });
 
+      const operationId = beginFileRegistrationOperation();
       setIsUploading(true);
       try {
         // 🔵 서버 API로 중복 체크
         console.log('🔎 중복 체크 중:', file.name);
         const checkRes = await authenticatedFetch(
           `${BASE_URL}/files/check?title=${encodeURIComponent(file.name)}&path=${currentFolder}`,
-          {},
+          { signal: fileRegistrationAbortRef.current?.signal },
           deviceId ?? undefined
         );
         const { exists } = await checkRes.json();
+        if (!isCurrentFileRegistration(operationId)) return;
         
         console.log('✓ 중복 체크 완료:', { exists, fileName: file.name });
         
@@ -907,20 +958,21 @@ export default function Home() {
           setIsUploading(false);
           setDuplicateFileName(file.name);
           setPendingFile(file);
-          setPendingFileAction(null);
+          setPendingFileAction({ openAfterSave: false, operationId });
           setDuplicateModalVisible(true);
           return;
         }
 
         // 중복이 아니면 바로 추가
         console.log('➕ 새 파일 추가 시작');
-        await addFileToSystem(file);
+        await addFileToSystem(file, undefined, operationId);
         console.log('✅ 파일 추가 완료');
       } catch (e) {
+        if (!isCurrentFileRegistration(operationId)) return;
         console.error('❌ 파일 추가 중 오류:', e);
         Alert.alert('파일 추가 실패', String(e));
       } finally {
-        setIsUploading(false);
+        if (isCurrentFileRegistration(operationId)) setIsUploading(false);
       }
     } catch (e) {
       console.error('❌ pickFile 오류:', e);
@@ -929,42 +981,51 @@ export default function Home() {
   };
 
   // 실제 파일 추가 로직을 별도 함수로 분리 (isUploading은 호출자가 관리)
-  const addFileToSystem = async (file: any, targetFolder?: string) => {
+  const addFileToSystem = async (
+    file: any,
+    targetFolder?: string,
+    operationId = fileRegistrationOperationIdRef.current,
+  ) => {
     console.log('📝 addFileToSystem 호출:', { fileName: file.name, uri: file.uri, targetFolder, currentFolder });
+    if (!isCurrentFileRegistration(operationId)) return null;
     setIsUploading(true);
+    let managedPath = "";
+    let savedToServer = false;
     
     try {
       // 화면에는 원본 파일명을 유지하고, 실제 파일은 충돌 없는 이름으로 저장한다.
       const displayName = file.name;
       const title = displayName;
 
-      const newPath = await createManagedFileUri(displayName);
-      console.log('📂 파일 복사 시작:', { displayName, title, targetPath: newPath });
+      managedPath = await createManagedFileUri(displayName);
+      console.log('📂 파일 복사 시작:', { displayName, title, targetPath: managedPath });
 
       // 앱 전용 영구 폴더로 복사한 URI를 서버에도 저장한다.
       await FileSystem.copyAsync({
         from: file.uri,
-        to: newPath,
+        to: managedPath,
       });
+      if (!isCurrentFileRegistration(operationId)) {
+        await FileSystem.deleteAsync(managedPath, { idempotent: true });
+        return null;
+      }
       
-      console.log('✅ 파일 복사 완료:', newPath);
+      console.log('✅ 파일 복사 완료:', managedPath);
 
       let preview = "";
 
       try {
         if (displayName.toLowerCase().endsWith(".epub")) {
           console.log('📖 EPUB 미리보기 추출 중...');
-          preview = await extractEpubPreview(newPath);
+          preview = await extractEpubPreview(
+            managedPath,
+            () => isCurrentFileRegistration(operationId),
+          );
           preview = createPreviewText(preview);
           console.log('✅ EPUB 미리보기 완료:', preview);
         } else {
           console.log('📄 TXT 미리보기 추출 중...');
-          // Base64로 읽고 자동 인코딩 감지
-          const base64 = await FileSystem.readAsStringAsync(newPath, { 
-            encoding: FileSystem.EncodingType.Base64 
-          });
-          
-          const buffer = Buffer.from(base64, 'base64');
+          const buffer = readFilePrefix(managedPath, TXT_PREVIEW_SAMPLE_BYTES);
           const text = decodeTextSafe(buffer);
           
           // 줄바꿈을 공백으로, 연속 공백을 하나로 압축
@@ -978,6 +1039,10 @@ export default function Home() {
         console.log("⚠️ 미리보기 추출 실패:", e);
         preview = "(미리보기를 불러올 수 없습니다)";
       }
+      if (!isCurrentFileRegistration(operationId)) {
+        await FileSystem.deleteAsync(managedPath, { idempotent: true });
+        return null;
+      }
 
       
       // 백엔드에 보낼 파일 정보
@@ -989,7 +1054,7 @@ export default function Home() {
         preview,
         date: new Date().toISOString(),
         rating: 0,
-        uri: newPath,
+        uri: managedPath,
         path: folderPath,
         // saveFileToServer에서 저장 직전 영속 deviceId로 확정한다.
         deviceId: deviceId,
@@ -998,13 +1063,21 @@ export default function Home() {
       console.log('💾 서버에 파일 저장 중:', { title, path: folderPath, type: fileType });
 
       // 1) 서버에 저장 요청
-      const saved = await saveFileToServer(newFile);
+      const saved = await saveFileToServer(
+        newFile,
+        fileRegistrationAbortRef.current?.signal,
+      );
       
       if (!saved) {
+        if (!isCurrentFileRegistration(operationId)) {
+          await FileSystem.deleteAsync(managedPath, { idempotent: true }).catch(() => {});
+          return null;
+        }
         console.error('❌ 서버 저장 실패:', saved);
-        setIsUploading(false);
         return null;
       }
+      savedToServer = true;
+      if (!isCurrentFileRegistration(operationId)) return null;
       
       console.log('✅ 서버 저장 완료:', saved.id);
 
@@ -1021,24 +1094,30 @@ export default function Home() {
         refetchFiles();
       }
 
-      setIsUploading(false);
       return saved;
     } catch (e) {
+      if (!savedToServer && managedPath) {
+        await FileSystem.deleteAsync(managedPath, { idempotent: true }).catch(() => {});
+      }
+      if (!isCurrentFileRegistration(operationId)) return null;
       console.error('❌ addFileToSystem 오류:', e);
-      setIsUploading(false);
       Alert.alert('파일 추가 실패', String(e));
       return null;
+    } finally {
+      if (isCurrentFileRegistration(operationId)) setIsUploading(false);
     }
   };
 
-  const extractEpubPreview = async (newPath: any, progress: number = 0) => {
+  const extractEpubPreview = async (
+    newPath: string,
+    isCurrentOperation: () => boolean,
+  ) => {
     try {
-      // 1) base64로 읽기 (zip 해석용)
-      const base64 = await FileSystem.readAsStringAsync(newPath, {
-        encoding: FileSystem.EncodingType.Base64
-      });
-
-      const zip = await JSZip.loadAsync(base64, { base64: true });
+      // Base64 문자열 변환 없이 ZIP 바이트를 직접 열어 메모리 복사와 디코딩 비용을 줄인다.
+      const archiveBytes = await new ExpoFile(newPath).bytes();
+      if (!isCurrentOperation()) return "";
+      const zip = await JSZip.loadAsync(archiveBytes);
+      if (!isCurrentOperation()) return "";
 
       // 2) .opf 파일 찾기 (epub 메타데이터)
       let opfPath = Object.keys(zip.files).find((p) => p.endsWith(".opf"));
@@ -1060,9 +1139,9 @@ export default function Home() {
         'bookinfo', 'writer', 'reader', 'split_000',
       ];
 
-      // ★ 본문 챕터 수집: 실제 텍스트가 있는 챕터만
-      const bodyChapters: string[] = [];
+      // 등록 미리보기는 첫 본문만 필요하므로 유효한 챕터를 찾는 즉시 종료한다.
       for (const idref of spineIdrefs) {
+        if (!isCurrentOperation()) return "";
         const r1 = new RegExp(`<(?:\\w+:)?item\\b[^>]*\\bid="${idref}"[^>]*href="([^"]+)"`, "i");
         const r2 = new RegExp(`<(?:\\w+:)?item\\b[^>]*href="([^"]+)"[^>]*\\bid="${idref}"`, "i");
         const m = opfText.match(r1) ?? opfText.match(r2);
@@ -1074,18 +1153,22 @@ export default function Home() {
         const file = zip.files[fullPath] ?? zip.files[href];
         if (!file) continue;
         
-        // ★ 각 챕터의 텍스트 양 확인
         try {
           const chapterContent = await file.async("text");
+          if (!isCurrentOperation()) return "";
           const plain = htmlToText(chapterContent, {
             wordwrap: false,
-            selectors: [{ selector: 'img', format: 'skip' }], // 이미지 건너뛰기
+            selectors: [
+              { selector: 'img', format: 'skip' },
+              { selector: 'figure', format: 'skip' },
+              { selector: 'picture', format: 'skip' },
+              { selector: 'svg', format: 'skip' },
+            ],
           });
           const cleanedText = plain.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
           
-          // 텍스트가 50글자 이상 있어야 본문으로 간주
           if (cleanedText.length >= 50) {
-            bodyChapters.push(href);
+            return createPreviewText(cleanedText);
           }
         } catch (e) {
           // 읽기 실패한 챕터는 스킵
@@ -1093,43 +1176,7 @@ export default function Home() {
         }
       }
 
-      if (bodyChapters.length === 0) return "(본문을 찾을 수 없습니다)";
-
-      // 4) progress 비율로 챕터 선택
-      const chapterIndex = Math.min(
-        Math.floor(progress * bodyChapters.length),
-        bodyChapters.length - 1
-      );
-      const targetHref = bodyChapters[chapterIndex];
-      console.log(`📖 progress:${progress} → 챕터 ${chapterIndex + 1}/${bodyChapters.length} (${targetHref})`);
-
-      const fullPath = baseDir + targetHref;
-      const chapterFile = zip.files[fullPath] ?? zip.files[targetHref] ??
-        Object.values(zip.files).find(f => f.name.endsWith(targetHref.split("/").pop()!));
-      if (!chapterFile) return "(본문 파일을 찾을 수 없습니다)";
-
-      const chapterText = await chapterFile.async("text");
-
-      // 5) HTML → 텍스트 변환 (이미지/사진 건너뛰기)
-      const plain = htmlToText(chapterText, {
-        wordwrap: false,
-        selectors: [
-          { selector: 'img', format: 'skip' },     // 이미지 건너뛰기
-          { selector: 'figure', format: 'skip' },  // figure (캡션 포함) 건너뛰기
-          { selector: 'picture', format: 'skip' }, // picture 건너뛰기
-          { selector: 'svg', format: 'skip' },     // SVG 그래픽 건너뛰기
-        ],
-      });
-      const cleanedText = plain.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
-
-      if (!cleanedText) return "(본문 텍스트가 비어있습니다)";
-
-      // 챕터 내 progress 위치 계산
-      const chapterProgress = (progress * bodyChapters.length) - chapterIndex;
-      const startPos = Math.floor(cleanedText.length * chapterProgress);
-      const sliced = cleanedText.slice(startPos, startPos + 100);
-
-      return sliced + (startPos + 100 < cleanedText.length ? "..." : "");
+      return "(본문을 찾을 수 없습니다)";
 
     } catch (e) {
       console.log("EPUB 미리보기 실패:", e);
@@ -1141,9 +1188,13 @@ export default function Home() {
   // 파일 카드 클릭 기능
   // -----------------------------
   const handleFilePress = async (file : any) => {
+    const previewRequestId = filePreviewRequestIdRef.current + 1;
+    filePreviewRequestIdRef.current = previewRequestId;
+
     // 1) 서버에서 진행도 가져오기
     const res = await authenticatedFetch(`${BASE_URL}/files/${file.id}`, {}, deviceId ?? undefined);
     const info = await res.json();
+    if (filePreviewRequestIdRef.current !== previewRequestId) return;
     const isTxtFile = String(file.type || "").toUpperCase() === "TXT"
       || String(file.title || "").toLowerCase().endsWith(".txt");
     let localTxtPosition: {
@@ -1157,6 +1208,7 @@ export default function Home() {
         const serializedPosition = await AsyncStorage.getItem(
           `${TXT_LOCAL_PROGRESS_KEY_PREFIX}${file.id}`,
         );
+        if (filePreviewRequestIdRef.current !== previewRequestId) return;
         localTxtPosition = serializedPosition ? JSON.parse(serializedPosition) : null;
       } catch (error) {
         console.log("TXT 로컬 미리보기 위치 불러오기 실패:", error);
@@ -1181,16 +1233,25 @@ export default function Home() {
     setSelectedFile(file);
     setLastProgress(effectiveProgress);
 
-    // 서버에 저장된 readingPreview 사용 (없으면 파일에서 직접 추출)
-    let preview = isTxtFile ? "" : (info.readingPreview || "");
+    // reader가 마지막 저장 시 만든 미리보기를 파일 종류와 관계없이 우선 사용한다.
+    const savedReadingPreview = createPreviewText(info.readingPreview || "");
+    let preview = savedReadingPreview
+      || createPreviewText(info.preview || file.preview || "")
+      || "미리보기를 불러오는 중...";
+    setPreviewText(preview);
+    setPreviewModalVisible(true);
 
-    if (!preview) {
-      // TXT 미리보기: progress 위치의 줄을 보여줌
-      const base64 = await FileSystem.readAsStringAsync(file.uri, { 
-        encoding: FileSystem.EncodingType.Base64 
-      });
-      const buffer = Buffer.from(base64, 'base64');
-      const decodedContent = decodeTextSafe(buffer);
+    // 구형 저장 데이터처럼 readingPreview가 없는 TXT만 원문에서 정확한 위치를 보완한다.
+    if (isTxtFile && !savedReadingPreview) {
+      let decodedContent = await readExternalTextFile(file.uri);
+      if (filePreviewRequestIdRef.current !== previewRequestId) return;
+      if (decodedContent == null) {
+        const base64 = await FileSystem.readAsStringAsync(file.uri, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+        if (filePreviewRequestIdRef.current !== previewRequestId) return;
+        decodedContent = decodeTextSafe(Buffer.from(base64, 'base64'));
+      }
       // reader는 CRLF를 LF로 정규화한 문자열 좌표를 저장하므로 동일한 본문을 사용한다.
       // 원본 CRLF 문자열에 저장 좌표를 적용하면 줄 수만큼 미리보기가 위로 어긋난다.
       const localContent = decodedContent.includes('\r')
@@ -1209,10 +1270,9 @@ export default function Home() {
           )
         : Math.floor(effectiveProgress * localContent.length);
       preview = createPreviewAroundOffset(localContent, characterOffset);
+      if (filePreviewRequestIdRef.current !== previewRequestId) return;
+      setPreviewText(preview);
     }
-
-    setPreviewText(preview);
-    setPreviewModalVisible(true);
   };
 
   const handleLongPress = (item: FileItem) => {
@@ -1747,7 +1807,10 @@ export default function Home() {
       file={selectedFile}
       previewText={previewText}
       lastProgress={lastProgress}
-      onClose={() => setPreviewModalVisible(false)}
+      onClose={() => {
+        filePreviewRequestIdRef.current += 1;
+        setPreviewModalVisible(false);
+      }}
     />
 
     {/* 파일생성 모달 */}
@@ -1887,9 +1950,17 @@ export default function Home() {
         setPendingFileAction(null);
 
         try {
-          if (file) {
-            const saved = await addFileToSystem(file, action?.targetFolder);
-            if (saved && action?.openAfterSave) {
+          if (file && action && isCurrentFileRegistration(action.operationId)) {
+            const saved = await addFileToSystem(
+              file,
+              action.targetFolder,
+              action.operationId,
+            );
+            if (
+              saved
+              && action.openAfterSave
+              && isCurrentFileRegistration(action.operationId)
+            ) {
               router.replace({
                 pathname: '/reader',
                 params: {

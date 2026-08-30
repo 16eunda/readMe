@@ -8,7 +8,7 @@ import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from "expo-rou
 import { readExternalTextFile } from "external-file-info";
 import iconv from 'iconv-lite';
 import { Search, X } from "lucide-react-native";
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   AppState,
@@ -318,6 +318,7 @@ export default function ReaderScreen() {
   const [epubLoadKey, setEpubLoadKey] = useState("");
   const epubLoadRetryRef = useRef(0);
   const webViewRef = useRef<WebView>(null);
+  const epubOpenStartedAtRef = useRef(0);
   const epubTouchStartRef = useRef({
     x: 0,
     y: 0,
@@ -654,10 +655,16 @@ export default function ReaderScreen() {
         };
 
         if (isEpubFile) {
+          epubOpenStartedAtRef.current = Date.now();
+          console.log("⏱️ EPUB [0ms] 파일 열기 시작:", fileName);
           // 큰 EPUB은 base64를 거대한 WebView HTML에 포함하지 않고 파일 URI로 직접 연다.
           try {
             const info = await FileSystem.getInfoAsync(decoded);
             const fileSize = info.exists && typeof info.size === "number" ? info.size : 0;
+            console.log(
+              `⏱️ EPUB [${Date.now() - epubOpenStartedAtRef.current}ms] 파일 정보 조회 완료`,
+              `${(fileSize / 1024 / 1024).toFixed(1)}MB`,
+            );
             if (fileSize >= 5 * 1024 * 1024) {
               console.log("✅ 대용량 EPUB 파일 URI 직접 로드:", (fileSize / 1024 / 1024).toFixed(1), "MB");
               if (!active) return;
@@ -872,6 +879,11 @@ export default function ReaderScreen() {
         lastAnchorRatioRef.current = fileInfo.anchorRatio;
         console.log("✅ [복원] 서버 anchorRatio 로드:", fileInfo.anchorRatio);
       }
+      if (epubOpenStartedAtRef.current > 0) {
+        console.log(
+          `⏱️ EPUB [${Date.now() - epubOpenStartedAtRef.current}ms] 이어읽기 정보 조회 완료`,
+        );
+      }
       setFileInfoLoaded(true); // 서버 응답 완료
     } catch (e) {
       if (!active) return;
@@ -1005,7 +1017,13 @@ useEffect(() => {
     epubStartedCfiRef.current = cfiToUse;
     // CFI가 있으면 복원 중 오버레이 표시
     if (cfiToUse) setEpubRestoring(true);
-    console.log("📤 themeAndStart 전송 - CFI:", cfiToUse, "/ initialCfi:", initialCfi, "/ resetProgress:", resetProgress, "/ anchorRatio:", lastAnchorRatioRef.current);
+    console.log(
+      `⏱️ EPUB [${Date.now() - epubOpenStartedAtRef.current}ms] themeAndStart 전송`,
+      "CFI:", cfiToUse,
+      "/ initialCfi:", initialCfi,
+      "/ resetProgress:", resetProgress,
+      "/ anchorRatio:", lastAnchorRatioRef.current,
+    );
     webViewRef.current.postMessage(JSON.stringify({
       type: "themeAndStart",
       bgColor: settings.bgColor,
@@ -1613,9 +1631,19 @@ useEffect(() => {
         setEpubRestoring(false);
       } else if (data.type === "ready") {
         // EPUB 쪽 준비 완료
-        console.log("✅ EPUB 준비 완료");
+        console.log(
+          `⏱️ EPUB [${Date.now() - epubOpenStartedAtRef.current}ms] book.ready 수신`,
+        );
         setEpubReady(true);
         setEpubError(null);
+      } else if (data.type === "performance") {
+        const totalElapsed = epubOpenStartedAtRef.current > 0
+          ? Date.now() - epubOpenStartedAtRef.current
+          : 0;
+        console.log(
+          `⏱️ EPUB [전체 ${totalElapsed}ms / WebView ${Math.round(Number(data.elapsedMs) || 0)}ms] ${String(data.stage || "unknown")}`,
+          data.detail || "",
+        );
       } else if (data.type === "locationsReady") {
         // CFI 보고와 별개로 locations 계산 완료 즉시 총 페이지 표시 갱신
         const nextCurrent = Math.max(1, Number(data.current) || 1);
@@ -1677,10 +1705,11 @@ useEffect(() => {
   };
 
   // ===================== EPUB용 HTML =====================
-  const epubHtml = `
+  const epubHtml = useMemo(() => `
   <html>
     <head>
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+      <script>window.__readmeEpubBootStartedAt = performance.now();</script>
       <!-- JSZip을 먼저 로드 (epub.js가 의존) -->
       <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
       <!-- epub.js 로드 -->
@@ -1920,6 +1949,19 @@ useEffect(() => {
               // 무시
             }
           }
+
+          var epubBootStartedAt = window.__readmeEpubBootStartedAt || performance.now();
+          var firstContentRendered = false;
+          function reportPerformance(stage, detail) {
+            try {
+              window.ReactNativeWebView.postMessage(JSON.stringify({
+                type: "performance",
+                stage: stage,
+                detail: detail || "",
+                elapsedMs: performance.now() - epubBootStartedAt
+              }));
+            } catch(e) {}
+          }
           
           var loadingEl = document.getElementById('loading');
           var errorEl = document.getElementById('error');
@@ -2056,6 +2098,7 @@ useEffect(() => {
             }
 
             sendLog("✅ 라이브러리 로드 완료: JSZip, ePub.js");
+            reportPerformance("라이브러리 로드 완료");
 
             var directFileUri = ${JSON.stringify(decodeURI(String(uri || "")))};
             var useDirectFile = "${epubBase64}" === "__FILE_URI__";
@@ -2069,38 +2112,14 @@ useEffect(() => {
 
             var book;
             var rawZipPromise = null;
+            var archiveBytes = null;
             var archiveDecodedLength = 0;
             if (useDirectFile) {
               sendLog("📂 대용량 EPUB 파일 URI 직접 초기화: " + directFileUri);
               book = ePub(directFileUri, { openAs: "epub" });
-              // epub.js가 일부 비표준 이미지 XHTML을 빈 화면으로 렌더링할 때를 대비해
-              // 직접 파일도 백그라운드에서 ZIP fallback을 준비한다.
-              rawZipPromise = fetch(directFileUri).then(function(response) {
-                // file:// 응답은 Android WebView에서 status=0, ok=false여도 정상 데이터가 온다.
-                if (!response.ok && response.status !== 0) {
-                  throw new Error('직접 EPUB ZIP 읽기 실패: ' + response.status);
-                }
-                return response.arrayBuffer();
-              }).then(function(buffer) {
-                archiveDecodedLength = buffer.byteLength || 0;
-                sendLog('📦 직접 EPUB ZIP fallback 준비 완료 bytes=' + archiveDecodedLength);
-                return JSZip.loadAsync(buffer);
-              }).catch(function(error) {
-                sendLog('⚠️ 직접 EPUB ZIP fallback 준비 실패: ' + error.message);
-                return Promise.resolve(book.ready).then(function() {
-                  var archiveZip = book.archive && book.archive.zip;
-                  if (archiveZip && archiveZip.files) {
-                    sendLog('📦 epub.js archive ZIP fallback 사용');
-                    return archiveZip;
-                  }
-                  throw error;
-                });
-              }).catch(function(error) {
-                sendLog('⚠️ 직접 EPUB ZIP fallback 사용 불가: ' + error.message);
-                return null;
-              });
             } else {
               sendLog("📦 base64 디코딩 시작, 길이: " + base64Data.length);
+              reportPerformance("base64 디코딩 시작");
               var padding = base64Data.slice(-2) === '==' ? 2 : (base64Data.slice(-1) === '=' ? 1 : 0);
               var decodedLength = Math.floor(base64Data.length * 3 / 4) - padding;
               archiveDecodedLength = decodedLength;
@@ -2114,8 +2133,45 @@ useEffect(() => {
                 }
               }
               base64Data = '';
-              rawZipPromise = JSZip.loadAsync(bytes);
+              archiveBytes = bytes;
+              reportPerformance("base64 디코딩 완료", "bytes=" + decodedLength);
               book = ePub(bytes.buffer);
+            }
+            reportPerformance("EPUB 객체 생성 완료", useDirectFile ? "file-uri" : "array-buffer");
+
+            // 정상 EPUB은 epub.js가 이미 연 archive만 사용한다. 전체 파일 재읽기와
+            // 별도 JSZip 파싱은 빈 XHTML 복구가 실제로 필요할 때에만 수행한다.
+            function getRawZip() {
+              if (rawZipPromise) return rawZipPromise;
+              reportPerformance("ZIP fallback 준비 시작");
+              rawZipPromise = Promise.resolve(book.ready).then(function() {
+                var archiveZip = book.archive && book.archive.zip;
+                if (archiveZip && archiveZip.files) {
+                  sendLog('📦 epub.js archive ZIP 재사용');
+                  return archiveZip;
+                }
+                if (archiveBytes) {
+                  return JSZip.loadAsync(archiveBytes);
+                }
+                if (!useDirectFile) return null;
+                return fetch(directFileUri).then(function(response) {
+                  // file:// 응답은 Android WebView에서 status=0, ok=false여도 정상 데이터가 온다.
+                  if (!response.ok && response.status !== 0) {
+                    throw new Error('직접 EPUB ZIP 읽기 실패: ' + response.status);
+                  }
+                  return response.arrayBuffer();
+                }).then(function(buffer) {
+                  archiveDecodedLength = buffer.byteLength || archiveDecodedLength;
+                  return JSZip.loadAsync(buffer);
+                });
+              }).then(function(zip) {
+                reportPerformance("ZIP fallback 준비 완료");
+                return zip;
+              }).catch(function(error) {
+                sendLog('⚠️ EPUB ZIP fallback 사용 불가: ' + error.message);
+                return null;
+              });
+              return rawZipPromise;
             }
             
             sendLog("📚 EPUB 초기화 중...");
@@ -2485,6 +2541,7 @@ useEffect(() => {
             var fallbackTextLengths = {};
             var fallbackCharsPerPage = 500;
             var fallbackPaginationReady = false;
+            var fallbackPaginationStarted = false;
             var fallbackScrollBound = false;
             var pendingFallbackSeek = null;
             var pendingFallbackRestore = false;
@@ -2743,8 +2800,10 @@ useEffect(() => {
                 sendLog("📚 locations.generate 지연 시작 break=" + locationBreakSize
                   + " estimatedText=" + estimatedTextLength
                   + " archiveBytes=" + archiveDecodedLength);
+                reportPerformance("locations 생성 시작", "break=" + locationBreakSize);
                 book.locations.generate(locationBreakSize).then(function() {
                   sendLog("📚 locations.generate 완료");
+                  reportPerformance("locations 생성 완료", "count=" + Math.max(1, book.locations.length()));
                   locationsReady = true;
                   var generatedCount = Math.max(1, book.locations.length());
                   var spineCount = book.spine && book.spine.spineItems ? book.spine.spineItems.length : 1;
@@ -2752,8 +2811,10 @@ useEffect(() => {
                   totalLocations = generatedCount <= 1 ? Math.max(1, spineCount) : generatedCount;
                   if (generatedCount > 1) {
                     reportNavigationReady('locations');
-                  } else if (fallbackPaginationReady) {
-                    reportNavigationReady('fallback');
+                  } else {
+                    // locations를 만들 수 없는 fixed-layout/특수 EPUB만 전체 fallback 범위를 계산한다.
+                    estimateFallbackPageCounts();
+                    if (fallbackPaginationReady) reportNavigationReady('fallback');
                   }
                   sendLog("📚 페이지 기준=" + (generatedCount <= 1 ? 'spine' : 'locations')
                     + " generated=" + generatedCount + " spine=" + spineCount);
@@ -3592,17 +3653,13 @@ useEffect(() => {
             // 빠른 시작: 우선 렌더링 준비를 알리고, locations는 백그라운드에서 생성
             book.ready.then(function () {
               sendLog("📚 book.ready 완료");
+              reportPerformance("book.ready 완료");
 
               // 준비 완료 알림(빠른 시작)
               window.ReactNativeWebView.postMessage(JSON.stringify({
                 type: "ready"
               }));
               sendLog("📚 빠른 시작 준비 완료, themeAndStart 대기 중...");
-
-              // 이어읽기로 중간 위치에서 시작해도 뒤로 이동하면 실제 표지를 표시할 수 있도록
-              // 표지를 렌더링과 별개로 미리 준비한다.
-              preloadBookCover();
-              estimateFallbackPageCounts();
             }).catch(function(err) {
               showError("EPUB 파일을 로드할 수 없습니다: " + err.message);
             });
@@ -3674,6 +3731,9 @@ useEffect(() => {
             }
 
             function estimateFallbackPageCounts() {
+              if (fallbackPaginationReady || fallbackPaginationStarted) return;
+              fallbackPaginationStarted = true;
+              reportPerformance("fallback 전체 페이지 계산 시작");
               var spineItems = book.spine && book.spine.spineItems ? book.spine.spineItems : [];
               var finalizeFallbackPagination = function(reason) {
                 for (var index = 0; index < Math.max(1, spineItems.length); index++) {
@@ -3685,6 +3745,7 @@ useEffect(() => {
                   }
                 }
                 fallbackPaginationReady = true;
+                reportPerformance("fallback 전체 페이지 계산 완료", reason);
                 var paging = getFallbackPagination();
                 totalLocations = paging.total;
                 sendLog('📚 fallback 전체 범위 고정=' + paging.total
@@ -3698,11 +3759,11 @@ useEffect(() => {
                 }
               };
 
-              if (!rawZipPromise || spineItems.length === 0) {
+              if (spineItems.length === 0) {
                 finalizeFallbackPagination('archive-unavailable');
                 return;
               }
-              rawZipPromise.then(function(zip) {
+              getRawZip().then(function(zip) {
                 if (!zip) throw new Error('EPUB archive를 읽을 수 없음');
                 var packagePath = book.packaging && book.packaging.path ? String(book.packaging.path) : '';
                 var packageDir = packagePath.replace(/[^/]+$/, '');
@@ -3943,7 +4004,7 @@ useEffect(() => {
             }
 
             function recoverEmptyRenderedSection(section, renderedContents, forceRecovery) {
-              if (!rawZipPromise || !section || !renderedContents || !renderedContents.document) {
+              if (!section || !renderedContents || !renderedContents.document) {
                 return Promise.resolve(false);
               }
               var recoveryGeneration = ++fallbackRecoveryGeneration;
@@ -3957,7 +4018,7 @@ useEffect(() => {
                 return Promise.resolve(false);
               }
 
-              return rawZipPromise.then(function(zip) {
+              return getRawZip().then(function(zip) {
                 if (!zip) throw new Error('ZIP fallback을 사용할 수 없음');
                 var packagePath = book.packaging && book.packaging.path ? String(book.packaging.path) : '';
                 var packageDir = packagePath.replace(/[^/]+$/, '');
@@ -4124,6 +4185,7 @@ useEffect(() => {
                     sendLog('🎨 fallback CSS 적용 styles=' + parsedStyles.length
                       + ' bodyClass=' + (bodyClass || '없음')
                       + ' proseNormalize=' + shouldNormalizeFallbackProse);
+                    estimateFallbackPageCounts();
                     requestAnimationFrame(function() {
                       setTimeout(function() {
                         if (!applyPendingFallbackSeek()) reportFallbackPaging();
@@ -4148,6 +4210,13 @@ useEffect(() => {
             var chapterLoadTimer = null;
             rendition.on("rendered", function(section) {
               loadingEl.style.display = 'none';
+              if (!firstContentRendered) {
+                firstContentRendered = true;
+                reportPerformance("첫 본문 rendered", section && section.href ? section.href : "");
+                requestAnimationFrame(function() {
+                  reportPerformance("첫 본문 paint");
+                });
+              }
               if (section && typeof section.index === 'number') {
                 lastDisplayedSectionIndex = section.index;
                 sendLog('✅ rendered spine index=' + section.index + ' href=' + (section.href || ''));
@@ -4726,6 +4795,7 @@ useEffect(() => {
                   document.documentElement.style.background = currentTheme.bgColor;
                   document.body.style.background = currentTheme.bgColor;
                   sendLog("📖 themeAndStart 수신 - CFI=" + (data.cfi || '없음(처음부터)') + " anchorRatio=" + (data.anchorRatio || 0.5));
+                  reportPerformance("themeAndStart 수신", data.cfi ? "이어읽기" : "처음부터");
                   var savedAnchorRatio = (typeof data.anchorRatio === 'number') ? data.anchorRatio : 0.5;
                   if (typeof data.cfi === 'string' && data.cfi.indexOf('readme-fallback:') === 0) {
                     var fallbackParts = data.cfi.split(':');
@@ -4745,6 +4815,7 @@ useEffect(() => {
                       hideBookCover();
                       sendLog('➡️ [fallback 복원] section=' + pendingFallbackSeek.sectionIndex
                         + ' within=' + Math.round(pendingFallbackSeek.withinRatio * 100) + '%');
+                      reportPerformance("fallback 이어읽기 display 요청");
                       displaySectionByIndex(pendingFallbackSeek.sectionIndex).then(function(moved) {
                         if (!moved) {
                           pendingFallbackRestore = false;
@@ -4755,6 +4826,7 @@ useEffect(() => {
                   } else if (data.cfi) {
                     var targetCfi = data.cfi;
                     sendLog("➡️ [복원] display(cfi) 호출: " + targetCfi);
+                    reportPerformance("이어읽기 display 요청");
                     rendition.display(targetCfi).then(function() {
 
                       // CFI를 저장 당시의 화면 내 상대 위치(anchorRatio)에 정렬하는 함수
@@ -4864,6 +4936,7 @@ useEffect(() => {
                   } else {
                     coverDismissed = false;
                     coverShouldShowWhenLoaded = true;
+                    reportPerformance("첫 화면 display 요청");
                     rendition.display().then(function() {
                       setTimeout(function() {
                         reportSectionState();
@@ -4932,7 +5005,12 @@ useEffect(() => {
       </script>
     </body>
   </html>
-  `;
+  `, [epubBase64, uri]);
+
+  const epubSource = useMemo(() => ({
+    html: epubHtml,
+    baseUrl: decodeURI(String(uri || "")).replace(/[^/]+$/, ""),
+  }), [epubHtml, uri]);
 
   const title = String(name || "").replace(/\.[^.]+$/, ""); // 확장자 제거
   const hasActiveSearchHighlight = isEpub
@@ -5170,10 +5248,7 @@ useEffect(() => {
                 key={epubLoadKey}
                 ref={webViewRef}
                 originWhitelist={["*"]}
-                source={{
-                  html: epubHtml,
-                  baseUrl: decodeURI(String(uri || "")).replace(/[^/]+$/, ""),
-                }}
+                source={epubSource}
                 onMessage={handleWebViewMessage}
                 style={{ flex: 1 }}
                 javaScriptEnabled={true}
@@ -5190,12 +5265,18 @@ useEffect(() => {
                 androidLayerType="hardware"
                 pointerEvents="auto"
                 onLoadStart={() => {
-                  console.log("🌐 EPUB WebView 로드 시작:", epubLoadKey);
+                  console.log(
+                    `⏱️ EPUB [${Date.now() - epubOpenStartedAtRef.current}ms] WebView 로드 시작`,
+                    epubLoadKey,
+                  );
                   setEpubNavigationReady(false);
                   setEpubNavigationError(false);
                 }}
                 onLoadEnd={() => {
-                  console.log("🌐 EPUB WebView 로드 완료:", epubLoadKey);
+                  console.log(
+                    `⏱️ EPUB [${Date.now() - epubOpenStartedAtRef.current}ms] WebView loadEnd`,
+                    epubLoadKey,
+                  );
                 }}
                 onRenderProcessGone={(event) => {
                   console.warn("❌ EPUB WebView 렌더 프로세스 종료:", event.nativeEvent);

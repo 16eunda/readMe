@@ -1,6 +1,7 @@
 import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { File as ExpoFile, type FileHandle } from 'expo-file-system';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Linking from 'expo-linking';
 import { Stack, useRouter } from 'expo-router';
@@ -27,15 +28,23 @@ const getSupportedFileNameFromUrl = (url: string) => {
 };
 
 const getFileExtensionFromUri = async (uri: string) => {
+  let handle: FileHandle | null = null;
   try {
-    const base64Start = await FileSystem.readAsStringAsync(uri, {
-      encoding: FileSystem.EncodingType.Base64,
-    });
-    return base64Start.startsWith('UEsD') || base64Start.startsWith('UEs') ? '.epub' : '.txt';
-  } catch (e) {
-    const info = await FileSystem.getInfoAsync(uri).catch(() => null);
-    const fileSize = info && 'size' in info ? ((info as any).size ?? 0) : 0;
-    return fileSize > 1024 * 100 ? '.epub' : '.txt';
+    handle = new ExpoFile(uri).open();
+    const signature = handle.readBytes(4);
+    const isZip = signature.length >= 4
+      && signature[0] === 0x50
+      && signature[1] === 0x4b
+      && (
+        (signature[2] === 0x03 && signature[3] === 0x04)
+        || (signature[2] === 0x05 && signature[3] === 0x06)
+        || (signature[2] === 0x07 && signature[3] === 0x08)
+      );
+    return isZip ? '.epub' : '.txt';
+  } catch {
+    return '.txt';
+  } finally {
+    handle?.close();
   }
 };
 
@@ -66,6 +75,7 @@ function AppContent() {
   const router = useRouter();
   const processingUrlsRef = useRef(new Set<string>());
   const lastIncomingUrlRef = useRef<{ url: string; handledAt: number } | null>(null);
+  const incomingOperationIdRef = useRef(0);
   const didReadInitialUrlRef = useRef(false);
   const { setIncomingFile } = useUser();
 
@@ -134,6 +144,8 @@ function AppContent() {
       }
 
       processingUrlsRef.current.add(normalizedUrl);
+      const operationId = incomingOperationIdRef.current + 1;
+      incomingOperationIdRef.current = operationId;
 
       let name = 'unknown';
       let finalUri = '';
@@ -143,23 +155,23 @@ function AppContent() {
         
         if (normalizedUrl.startsWith('content://')) {
           // content URI는 제공자에 따라 원본 파일명이 없을 수 있으므로 먼저 복사 후 타입을 판별한다.
-          const tempName = 'temp_' + Date.now();
+          const tempName = `incoming_${operationId}_${Date.now()}.tmp`;
           const tempUri = cacheDir + tempName;
+          const displayNamePromise = getExternalFileDisplayName(normalizedUrl);
           
-          // 캐시에 임시 복사
-          await FileSystem.copyAsync({ from: normalizedUrl, to: tempUri });
+          // 파일명 조회와 원본 복사는 서로 독립적이므로 동시에 진행한다.
+          const [, displayName] = await Promise.all([
+            FileSystem.copyAsync({ from: normalizedUrl, to: tempUri }),
+            displayNamePromise,
+          ]);
           console.log('✅ 임시 복사 완료:', tempUri);
 
-          const ext = await getFileExtensionFromUri(tempUri);
-          const displayName = await getExternalFileDisplayName(normalizedUrl);
+          const displayExtension = displayName?.match(/\.(txt|epub)$/i)?.[0]?.toLowerCase();
+          const ext = displayExtension || await getFileExtensionFromUri(tempUri);
           name = makeExternalFileName(normalizedUrl, ext, displayName);
-          finalUri = cacheDir + name;
+          finalUri = `${cacheDir}incoming_${operationId}_${Date.now()}${ext}`;
           
-          // 임시 파일을 최종 이름으로 이동
-          const existingInfo = await FileSystem.getInfoAsync(finalUri);
-          if (existingInfo.exists) {
-            await FileSystem.deleteAsync(finalUri, { idempotent: true });
-          }
+          // 각 선택마다 고유한 캐시 경로를 사용해 동시에 들어온 파일이 서로 덮어쓰지 않게 한다.
           await FileSystem.moveAsync({ from: tempUri, to: finalUri });
           console.log('✅ 파일명 판별 완료:', name);
         } else {
@@ -173,15 +185,18 @@ function AppContent() {
           }
           name = urlName;
           
-          finalUri = cacheDir + name;
+          const ext = urlName.slice(urlName.lastIndexOf('.')).toLowerCase();
+          finalUri = `${cacheDir}incoming_${operationId}_${Date.now()}${ext}`;
           
           // 캐시에 복사
-          const existingInfo = await FileSystem.getInfoAsync(finalUri);
-          if (existingInfo.exists) {
-            await FileSystem.deleteAsync(finalUri, { idempotent: true });
-          }
           await FileSystem.copyAsync({ from: normalizedUrl, to: finalUri });
           console.log('✅ 파일 복사 완료:', finalUri);
+        }
+
+        if (incomingOperationIdRef.current !== operationId) {
+          await FileSystem.deleteAsync(finalUri, { idempotent: true }).catch(() => {});
+          console.log('↩️ 더 최신 파일이 선택되어 이전 외부 파일 결과 폐기:', name);
+          return;
         }
 
         console.log('📂 외부 파일 수신 완료:', name);
