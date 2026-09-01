@@ -73,7 +73,17 @@ export default function FileCard({ item, isSelectMode, isSelected, isLocated, on
         </Text>
 
         {!isSelectMode && (
-          <TouchableOpacity onPress={() => onOptionsPress?.(item)}>
+          <TouchableOpacity
+            style={styles.optionsButton}
+            hitSlop={{ top: 8, right: 8, bottom: 8, left: 8 }}
+            pressRetentionOffset={{ top: 12, right: 12, bottom: 12, left: 12 }}
+            onPress={(event) => {
+              event.stopPropagation();
+              onOptionsPress?.(item);
+            }}
+            accessibilityRole="button"
+            accessibilityLabel={`${item.title} 파일 메뉴`}
+          >
             <Ionicons name="ellipsis-vertical" size={18} color="#555" />
           </TouchableOpacity>
         )}
@@ -168,6 +178,15 @@ const styles = StyleSheet.create({
 
   titleWithCheck: {
     marginRight: 36,
+  },
+
+  optionsButton: {
+    width: 44,
+    height: 44,
+    alignItems: "center",
+    justifyContent: "center",
+    marginVertical: -10,
+    marginRight: -10,
   },
 
   date: {

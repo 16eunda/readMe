@@ -1429,13 +1429,16 @@ useEffect(() => {
     }
     lastTxtScrollUiUpdateAtRef.current = now;
 
-    setProgress(clamped);
-
     const pages = Math.max(1, txtTotalPagesRef.current);
-    setCurrentPage(Math.min(
-      pages,
-      Math.max(1, Math.floor(clamped * pages) + 1),
-    ));
+    // 컨트롤이 숨겨진 동안에는 ref만 갱신한다. 보이지 않는 slider/page UI 때문에
+    // Reader 전체가 스크롤 중 반복 렌더링되지 않도록 한다.
+    if (showUI) {
+      setProgress(clamped);
+      setCurrentPage(Math.min(
+        pages,
+        Math.max(1, Math.floor(clamped * pages) + 1),
+      ));
+    }
 
     // readingPreview: 현재 청크 안의 위치를 기준으로 화면 근처 텍스트를 저장
     if (!skipPreview) {
@@ -1452,6 +1455,18 @@ useEffect(() => {
     }
     updateTxtScrollState(e);
   };
+
+  useEffect(() => {
+    if (isEpub || !showUI) return;
+    const currentProgress = Math.min(1, Math.max(0, progressRef.current));
+    const pages = Math.max(1, txtTotalPagesRef.current);
+    setProgress(currentProgress);
+    setTotalPages(pages);
+    setCurrentPage(Math.min(
+      pages,
+      Math.max(1, Math.floor(currentProgress * pages) + 1),
+    ));
+  }, [isEpub, showUI]);
 
   // txt 슬라이더로 위치 이동
   const handleSeekText = (value: number) => {
@@ -2536,6 +2551,10 @@ useEffect(() => {
             var locationsReady = false;
             var totalLocations = 1;
             var locationsGenerationStarted = false;
+            var locationsGenerationRequested = false;
+            var locationsIdleTimer = null;
+            var locationsEarliestStartAt = 0;
+            var lastContentScrollAt = 0;
             var fallbackPageCounts = {};
             var fallbackMeasuredPageCounts = {};
             var fallbackTextLengths = {};
@@ -2775,68 +2794,93 @@ useEffect(() => {
                 + ' visibleTxt=' + fallbackVisibleText.slice(0, 35));
             }
 
-            function scheduleLocationsGeneration() {
+            function startLocationsGeneration() {
               if (locationsGenerationStarted) return;
               locationsGenerationStarted = true;
+              clearTimeout(locationsIdleTimer);
               // 슬라이더는 생성된 location 중 가장 가까운 곳으로 이동한다.
               // 작은/중간 EPUB은 location을 촘촘히 만들어 눈에 보이는 스냅을 줄이고,
               // 대용량 EPUB은 초기 로딩 속도를 위해 성긴 간격을 유지한다.
-              setTimeout(function() {
-                var estimatedTextLength = 0;
-                Object.keys(fallbackTextLengths).forEach(function(key) {
-                  estimatedTextLength += fallbackTextLengths[key] || 0;
-                });
-                var locationBreakSize;
-                if (useDirectFile || archiveDecodedLength >= 5 * 1024 * 1024) {
-                  locationBreakSize = 1000;
-                } else if (estimatedTextLength > 0) {
-                  // 최대 약 1,200개 location, 최소 180자 간격
-                  locationBreakSize = Math.max(180, Math.min(1000, Math.ceil(estimatedTextLength / 1200)));
-                } else if (archiveDecodedLength > 0 && archiveDecodedLength <= 2 * 1024 * 1024) {
-                  locationBreakSize = 250;
+              var estimatedTextLength = 0;
+              Object.keys(fallbackTextLengths).forEach(function(key) {
+                estimatedTextLength += fallbackTextLengths[key] || 0;
+              });
+              var locationBreakSize;
+              if (useDirectFile || archiveDecodedLength >= 5 * 1024 * 1024) {
+                locationBreakSize = 1000;
+              } else if (estimatedTextLength > 0) {
+                // 최대 약 1,200개 location, 최소 180자 간격
+                locationBreakSize = Math.max(180, Math.min(1000, Math.ceil(estimatedTextLength / 1200)));
+              } else if (archiveDecodedLength > 0 && archiveDecodedLength <= 2 * 1024 * 1024) {
+                locationBreakSize = 250;
+              } else {
+                locationBreakSize = 500;
+              }
+              sendLog("📚 reader idle 후 locations.generate 시작 break=" + locationBreakSize
+                + " estimatedText=" + estimatedTextLength
+                + " archiveBytes=" + archiveDecodedLength);
+              reportPerformance("locations 생성 시작", "break=" + locationBreakSize);
+              book.locations.generate(locationBreakSize).then(function() {
+                sendLog("📚 locations.generate 완료");
+                reportPerformance("locations 생성 완료", "count=" + Math.max(1, book.locations.length()));
+                locationsReady = true;
+                var generatedCount = Math.max(1, book.locations.length());
+                var spineCount = book.spine && book.spine.spineItems ? book.spine.spineItems.length : 1;
+                // fixed-layout/특수 EPUB은 locations가 1개만 생성된다. 이 경우 spine을 페이지로 사용한다.
+                totalLocations = generatedCount <= 1 ? Math.max(1, spineCount) : generatedCount;
+                if (generatedCount > 1) {
+                  reportNavigationReady('locations');
                 } else {
-                  locationBreakSize = 500;
+                  // locations를 만들 수 없는 fixed-layout/특수 EPUB만 전체 fallback 범위를 계산한다.
+                  estimateFallbackPageCounts();
+                  if (fallbackPaginationReady) reportNavigationReady('fallback');
                 }
-                sendLog("📚 locations.generate 지연 시작 break=" + locationBreakSize
-                  + " estimatedText=" + estimatedTextLength
-                  + " archiveBytes=" + archiveDecodedLength);
-                reportPerformance("locations 생성 시작", "break=" + locationBreakSize);
-                book.locations.generate(locationBreakSize).then(function() {
-                  sendLog("📚 locations.generate 완료");
-                  reportPerformance("locations 생성 완료", "count=" + Math.max(1, book.locations.length()));
-                  locationsReady = true;
-                  var generatedCount = Math.max(1, book.locations.length());
-                  var spineCount = book.spine && book.spine.spineItems ? book.spine.spineItems.length : 1;
-                  // fixed-layout/특수 EPUB은 locations가 1개만 생성된다. 이 경우 spine을 페이지로 사용한다.
-                  totalLocations = generatedCount <= 1 ? Math.max(1, spineCount) : generatedCount;
-                  if (generatedCount > 1) {
-                    reportNavigationReady('locations');
-                  } else {
-                    // locations를 만들 수 없는 fixed-layout/특수 EPUB만 전체 fallback 범위를 계산한다.
-                    estimateFallbackPageCounts();
-                    if (fallbackPaginationReady) reportNavigationReady('fallback');
+                sendLog("📚 페이지 기준=" + (generatedCount <= 1 ? 'spine' : 'locations')
+                  + " generated=" + generatedCount + " spine=" + spineCount);
+                reportLocationsReady();
+                setTimeout(function() {
+                  try {
+                    reportLocationsReady();
+                    updateCenterText();
+                    var loc = rendition.currentLocation();
+                    if (loc) safeReport(loc, false);
+                  } catch(e) {
+                    sendLog("⚠️ 초기 위치 보고 실패: " + e.message);
                   }
-                  sendLog("📚 페이지 기준=" + (generatedCount <= 1 ? 'spine' : 'locations')
-                    + " generated=" + generatedCount + " spine=" + spineCount);
-                  reportLocationsReady();
-                  setTimeout(function() {
-                    try {
-                      reportLocationsReady();
-                      updateCenterText();
-                      var loc = rendition.currentLocation();
-                      if (loc) safeReport(loc, false);
-                    } catch(e) {
-                      sendLog("⚠️ 초기 위치 보고 실패: " + e.message);
-                    }
-                  }, 120);
-                }).catch(function(err) {
-                  sendLog("⚠️ locations.generate 실패, 본문 읽기 계속: " + err.message);
-                  window.ReactNativeWebView.postMessage(JSON.stringify({
-                    type: "navigationError",
-                    message: err.message
-                  }));
-                });
-              }, 2500);
+                }, 120);
+              }).catch(function(err) {
+                sendLog("⚠️ locations.generate 실패, 본문 읽기 계속: " + err.message);
+                window.ReactNativeWebView.postMessage(JSON.stringify({
+                  type: "navigationError",
+                  message: err.message
+                }));
+              });
+            }
+
+            function queueLocationsGenerationWhenIdle() {
+              if (!locationsGenerationRequested || locationsGenerationStarted) return;
+              clearTimeout(locationsIdleTimer);
+              var now = Date.now();
+              var earliestWait = Math.max(0, locationsEarliestStartAt - now);
+              var scrollIdleWait = lastContentScrollAt > 0
+                ? Math.max(0, 700 - (now - lastContentScrollAt))
+                : 0;
+              var wait = Math.max(earliestWait, scrollIdleWait, contentTouchActive ? 120 : 0);
+              locationsIdleTimer = setTimeout(function() {
+                if (contentTouchActive || (lastContentScrollAt > 0 && Date.now() - lastContentScrollAt < 700)) {
+                  queueLocationsGenerationWhenIdle();
+                  return;
+                }
+                startLocationsGeneration();
+              }, wait);
+            }
+
+            function scheduleLocationsGeneration() {
+              if (locationsGenerationRequested || locationsGenerationStarted) return;
+              locationsGenerationRequested = true;
+              // 첫 본문 표시 직후에는 시작하지 않고, 기존과 같은 최소 대기 이후 reader가 idle일 때 실행한다.
+              locationsEarliestStartAt = Date.now() + 2500;
+              queueLocationsGenerationWhenIdle();
             }
 
             // 화면 중앙 텍스트를 스크롤할 때마다 로컬에 저장 (API 호출 없음)
@@ -3541,6 +3585,8 @@ useEffect(() => {
 
             var scrollReportTimer = null;
             function onContainerScroll() {
+              lastContentScrollAt = Date.now();
+              queueLocationsGenerationWhenIdle();
               if (contentTouchActive) contentScrolledDuringTouch = true;
               if (isSeeking || isChapterLoading) return;
               clearTimeout(centerTextTimer);
@@ -4205,6 +4251,31 @@ useEffect(() => {
               });
             }
 
+            function recoverRenderedImagesAfterSettlement(section, renderedContents, renderedImages) {
+              var finished = false;
+              var checkImages = function() {
+                if (finished || !section || section.index !== lastDisplayedSectionIndex) return;
+                var pendingImages = renderedImages.filter(function(img) { return !img.complete; });
+                if (pendingImages.length > 0) return;
+                finished = true;
+                var loadedImages = renderedImages.filter(function(img) { return img.naturalWidth > 0; });
+                if (loadedImages.length > 0) {
+                  hideFallbackSection('EPUB 이미지 로드 완료', false);
+                  applyPendingSectionEdge(false);
+                  return;
+                }
+                sendLog('⚠️ EPUB 이미지 로드 종료 후 유효 이미지 없음 - fallback 복구 index=' + section.index);
+                recoverEmptyRenderedSection(section, renderedContents, true);
+              };
+
+              renderedImages.forEach(function(img) {
+                if (img.complete) return;
+                img.addEventListener('load', checkImages, { once: true });
+                img.addEventListener('error', checkImages, { once: true });
+              });
+              checkImages();
+            }
+
             // rendered 이벤트: container scroll 리스너 등록
             var containerScrollBound = false;
             var chapterLoadTimer = null;
@@ -4240,7 +4311,13 @@ useEffect(() => {
                     ? Array.prototype.slice.call(renderedDoc.querySelectorAll('img'))
                     : [];
                   var loadedImageCount = renderedImages.filter(function(img) { return img.naturalWidth > 0; }).length;
-                  if (renderedBody && (renderedBody.scrollHeight === 0
+                  var pendingImageCount = renderedImages.filter(function(img) { return !img.complete; }).length;
+                  if (renderedImages.length > 0 && loadedImageCount === 0 && pendingImageCount > 0) {
+                    // 느린 이미지 로드를 실패로 오판해 정상 iframe을 fallback DOM으로 교체하지 않는다.
+                    sendLog('⏳ EPUB 이미지 로딩 대기 index=' + lastDisplayedSectionIndex
+                      + ' pending=' + pendingImageCount);
+                    recoverRenderedImagesAfterSettlement(section, renderedContents, renderedImages);
+                  } else if (renderedBody && (renderedBody.scrollHeight === 0
                     || (renderedImages.length > 0 && loadedImageCount === 0))) {
                     recoverEmptyRenderedSection(
                       section,
@@ -5459,7 +5536,7 @@ useEffect(() => {
               maxToRenderPerBatch={2}
               updateCellsBatchingPeriod={40}
               windowSize={5}
-              removeClippedSubviews={Platform.OS === "android"}
+              removeClippedSubviews={false}
               style={{ flex: 1, backgroundColor: settings.bgColor }}
               contentContainerStyle={{ paddingHorizontal: settings.sidePadding, paddingBottom: 40 }}
               onScroll={handleScroll}
@@ -5475,7 +5552,11 @@ useEffect(() => {
               onContentSizeChange={(_width, height) => {
                 const measuredHeight = Math.max(1, height);
                 txtContentHeightRef.current = measuredHeight;
-                setTxtContentHeight(measuredHeight);
+                // state는 최초 복원 준비 신호로만 필요하다. 이후 가상 셀 측정 변화는
+                // ref에만 반영해 Reader 전체 재렌더와 셀 재부착을 만들지 않는다.
+                setTxtContentHeight((currentHeight) => (
+                  currentHeight > 1 ? currentHeight : measuredHeight
+                ));
               }}
               scrollEventThrottle={16}
               onLayout={(e) => { const h = e.nativeEvent.layout.height; setViewHeight(h); viewHeightRef.current = h; }}
