@@ -13,6 +13,7 @@ import {
   View,
 } from 'react-native';
 import { useUser } from '../contexts/UserContext';
+import { isGooglePlayInstall } from '../modules/external-file-info/src';
 import { authenticatedFetch, BASE_URL } from '../utils/api';
 
 // ✅ Google Play Console에서 등록한 구독 상품 ID와 일치해야 함
@@ -22,7 +23,7 @@ const PRODUCT_IDS = {
 };
 
 // Expo Go / 에뮬레이터에서는 IAP 불가 → 빌드된 APK에서만 동작
-const IS_IAP_AVAILABLE = !__DEV__;
+const IS_NATIVE_IAP_BUILD = !__DEV__;
 
 const FEATURES = [
   { emoji: '🤖', text: 'AI 독서 추천 무제한' },
@@ -64,23 +65,38 @@ export default function SubscriptionScreen() {
   const { isPremium, user, checkSubscription } = useUser();
   const [selectedPlan, setSelectedPlan] = useState<'monthly' | 'yearly'>('yearly');
   const [isLoading, setIsLoading] = useState(false);
+  const [iapReady, setIapReady] = useState(false);
 
   // IAP 초기화 및 결제 리스너 등록
   useEffect(() => {
     let purchaseListener: any;
+    let connectedIap: typeof import('react-native-iap') | null = null;
+    let active = true;
 
     const setup = async () => {
-      if (!IS_IAP_AVAILABLE) {
+      if (!IS_NATIVE_IAP_BUILD) {
         console.log('ℹ️ IAP는 빌드된 APK에서만 동작합니다 (Expo Go 불가)');
         return;
       }
       try {
+        if (Platform.OS === 'android' && !(await isGooglePlayInstall())) {
+          console.log('ℹ️ Google Play 설치 앱이 아니므로 Billing 초기화를 건너뜁니다.');
+          return;
+        }
+
         const iap = await import('react-native-iap');
         await iap.initConnection();
+        connectedIap = iap;
         await iap.fetchProducts({
           skus: Object.values(PRODUCT_IDS),
           type: 'subs',
         });
+        if (!active) {
+          await iap.endConnection();
+          connectedIap = null;
+          return;
+        }
+        setIapReady(true);
 
         // 결제 완료 리스너
         purchaseListener = iap.purchaseUpdatedListener(async (purchase: any) => {
@@ -118,11 +134,22 @@ export default function SubscriptionScreen() {
         });
       } catch (e) {
         console.log('IAP 초기화 실패 (에뮬레이터/Expo Go에서는 정상):', e);
+        if (active) setIapReady(false);
+        if (connectedIap) {
+          await connectedIap.endConnection().catch(() => {});
+          connectedIap = null;
+        }
       }
     };
 
-    setup();
-    return () => purchaseListener?.remove();
+    void setup();
+    return () => {
+      active = false;
+      purchaseListener?.remove();
+      if (connectedIap) {
+        void connectedIap.endConnection().catch(() => {});
+      }
+    };
   }, []);
 
   const handleSubscribe = async () => {
@@ -131,8 +158,11 @@ export default function SubscriptionScreen() {
       return;
     }
 
-    if (!IS_IAP_AVAILABLE) {
-      Alert.alert('알림', '결제는 설치된 앱(APK)에서만 가능합니다.\nExpo Go에서는 테스트할 수 없어요.');
+    if (!iapReady) {
+      const message = Platform.OS === 'android'
+        ? 'Google Play에서 설치한 최신 앱과 활성화된 Google Play 스토어가 필요합니다.'
+        : '결제 서비스를 준비하지 못했습니다. 잠시 후 다시 시도해주세요.';
+      Alert.alert('결제를 사용할 수 없어요', message);
       return;
     }
 

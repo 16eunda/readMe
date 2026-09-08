@@ -13,6 +13,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { UserProvider, useUser } from '../contexts/UserContext';
 import { getExternalFileDisplayName } from '../modules/external-file-info/src';
+import { flushActiveReaderSession } from '../utils/readerLifecycle';
 
 const ACTIVE_READER_SESSION_KEY = '@active_reader_session';
 
@@ -151,6 +152,10 @@ function AppContent() {
       let finalUri = '';
 
       try {
+        // Reader가 열린 상태에서 새 파일이 들어오면 기존 파일 위치를 먼저 확정한다.
+        await flushActiveReaderSession('external-file');
+        if (incomingOperationIdRef.current !== operationId) return;
+
         const cacheDir = FileSystem.cacheDirectory ?? '';
         
         if (normalizedUrl.startsWith('content://')) {

@@ -52,6 +52,7 @@ import { useUser } from "../../contexts/UserContext";
 
 const MANAGED_FILE_DIRECTORY = "library-files";
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
+const READER_LOCAL_PROGRESS_KEY_PREFIX = "@reader_position:";
 const TXT_PREVIEW_SAMPLE_BYTES = 64 * 1024;
 
 // Home 화면이 이동 과정에서 다시 마운트되어도 같은 외부 파일 등록은 한 번만 진행한다.
@@ -1201,21 +1202,41 @@ export default function Home() {
       progress?: number;
       characterOffset?: number;
       previewCharacterOffset?: number;
+      updatedAt?: number;
+    } | null = null;
+    let localReaderPosition: {
+      uri?: string;
+      progress?: number;
+      readingPreview?: string;
+      updatedAt?: number;
     } | null = null;
 
-    if (isTxtFile) {
-      try {
+    try {
+      const serializedReaderPosition = await AsyncStorage.getItem(
+        `${READER_LOCAL_PROGRESS_KEY_PREFIX}${file.id}`,
+      );
+      if (filePreviewRequestIdRef.current !== previewRequestId) return;
+      localReaderPosition = serializedReaderPosition ? JSON.parse(serializedReaderPosition) : null;
+      if (localReaderPosition?.uri !== String(file.uri || "")) {
+        localReaderPosition = null;
+      }
+
+      if (isTxtFile) {
         const serializedPosition = await AsyncStorage.getItem(
           `${TXT_LOCAL_PROGRESS_KEY_PREFIX}${file.id}`,
         );
         if (filePreviewRequestIdRef.current !== previewRequestId) return;
         localTxtPosition = serializedPosition ? JSON.parse(serializedPosition) : null;
-      } catch (error) {
-        console.log("TXT 로컬 미리보기 위치 불러오기 실패:", error);
       }
+    } catch (error) {
+      console.log("로컬 미리보기 위치 불러오기 실패:", error);
     }
 
-    const localProgress = Number(localTxtPosition?.progress);
+    const latestLocalPosition = (Number(localReaderPosition?.updatedAt) || 0)
+      >= (Number(localTxtPosition?.updatedAt) || 0)
+      ? localReaderPosition
+      : localTxtPosition;
+    const localProgress = Number(latestLocalPosition?.progress);
     const effectiveProgress = Number.isFinite(localProgress) && localProgress > 0
       ? localProgress
       : Number(info.progress) || 0;
@@ -1234,7 +1255,9 @@ export default function Home() {
     setLastProgress(effectiveProgress);
 
     // reader가 마지막 저장 시 만든 미리보기를 파일 종류와 관계없이 우선 사용한다.
-    const savedReadingPreview = createPreviewText(info.readingPreview || "");
+    const savedReadingPreview = createPreviewText(
+      localReaderPosition?.readingPreview || info.readingPreview || "",
+    );
     let preview = savedReadingPreview
       || createPreviewText(info.preview || file.preview || "")
       || "미리보기를 불러오는 중...";

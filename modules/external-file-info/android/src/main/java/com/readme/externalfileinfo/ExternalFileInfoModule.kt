@@ -1,6 +1,7 @@
 package com.readme.externalfileinfo
 
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import expo.modules.kotlin.exception.Exceptions
 import expo.modules.kotlin.modules.Module
@@ -47,6 +48,24 @@ class ExternalFileInfoModule : Module() {
           reader.readText()
         }
       } ?: throw IllegalArgumentException("파일을 열 수 없습니다.")
+    }
+
+    AsyncFunction("isGooglePlayInstallAsync") {
+      val context = appContext.reactContext ?: throw Exceptions.ReactContextLost()
+      val packageManager = context.packageManager
+      val installerPackage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        runCatching {
+          packageManager.getInstallSourceInfo(context.packageName).installingPackageName
+        }.getOrNull()
+      } else {
+        @Suppress("DEPRECATION")
+        packageManager.getInstallerPackageName(context.packageName)
+      }
+      val playStoreEnabled = runCatching {
+        packageManager.getApplicationInfo("com.android.vending", 0).enabled
+      }.getOrDefault(false)
+
+      installerPackage == "com.android.vending" && playStoreEnabled
     }
   }
 

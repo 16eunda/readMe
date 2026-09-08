@@ -12,6 +12,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import {
   ActivityIndicator,
   AppState,
+  BackHandler,
   FlatList,
   NativeScrollEvent,
   NativeSyntheticEvent,
@@ -29,6 +30,13 @@ import { WebView } from "react-native-webview";
 import ReaderSearchModal, { ReaderSearchResult } from "../components/ReaderSearchModal";
 import { authenticatedFetch, BASE_URL } from "../utils/api";
 import { createPreviewAroundOffset, createPreviewText } from "../utils/preview";
+import {
+  enqueueReaderWrite,
+  hasSupersedingReaderSession,
+  ReaderFlushReason,
+  registerActiveReaderSession,
+  waitForReaderWrites,
+} from "../utils/readerLifecycle";
 
 // 여러 인코딩 시도 방식 (효율적인 순서)
 function decodeTextSafe(buffer: Buffer): string {
@@ -156,7 +164,24 @@ const TXT_SEARCH_SCAN_CHUNK_SIZE = 250000;
 const READER_SEARCH_RESULT_LIMIT = 100;
 const TXT_SCROLL_UI_UPDATE_INTERVAL_MS = 100;
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
+const READER_LOCAL_PROGRESS_KEY_PREFIX = "@reader_position:";
+const EPUB_LOCATIONS_CACHE_KEY_PREFIX = "@reader_epub_locations:";
 const ACTIVE_READER_SESSION_KEY = "@active_reader_session";
+
+interface LocalReaderPosition {
+  uri?: string;
+  format?: "EPUB" | "TXT";
+  progress?: number;
+  epubCfi?: string;
+  anchorRatio?: number;
+  readingPreview?: string;
+  characterOffset?: number;
+  previewCharacterOffset?: number;
+  lineTopInset?: number;
+  scrollY?: number;
+  layoutSignature?: string;
+  updatedAt?: number;
+}
 
 function escapeSearchPattern(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -213,6 +238,7 @@ export default function ReaderScreen() {
   );
   const { width: windowWidth } = useWindowDimensions();
   const readerSessionIdRef = useRef(`${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const flushReaderSessionRef = useRef<(reason: ReaderFlushReason) => Promise<void>>(async () => {});
 
   useFocusEffect(
     useCallback(() => {
@@ -229,9 +255,15 @@ export default function ReaderScreen() {
         name: normalizedName,
         type: normalizedType,
       });
+      const unregisterReaderSession = registerActiveReaderSession({
+        sessionId: readerSessionIdRef.current,
+        fileId: normalizedFileId,
+        flush: (reason) => flushReaderSessionRef.current(reason),
+      });
       AsyncStorage.setItem(ACTIVE_READER_SESSION_KEY, serializedSession).catch(() => {});
 
       return () => {
+        unregisterReaderSession();
         AsyncStorage.getItem(ACTIVE_READER_SESSION_KEY)
           .then((currentSession) => {
             if (currentSession === serializedSession) {
@@ -269,7 +301,6 @@ export default function ReaderScreen() {
   const scrollRef = useRef<FlatList<TxtRenderChunk>>(null);
   const [viewHeight, setViewHeight] = useState(1);
   const [txtContentHeight, setTxtContentHeight] = useState(1);
-  const [txtLayoutEstimateReady, setTxtLayoutEstimateReady] = useState(false);
   const viewHeightRef = useRef(1);
   const txtContentHeightRef = useRef(1);
   const hasResumedRef = useRef(false); // TXT 이어읽기 한 번만 실행
@@ -329,6 +360,7 @@ export default function ReaderScreen() {
   const epubTouchMaxMoveRef = useRef(0);
   const lastEpubWebToggleAtRef = useRef(0);
   const [lastCfi, setLastCfi] = useState<string | null>(null);     // 마지막 위치
+  const lastCfiRef = useRef<string | null>(null);
   const lastAnchorRatioRef = useRef<number>(0.5); // 저장 당시 CFI의 화면 내 위치 비율 (re-render 불필요)
   const [initialCfi, setInitialCfi] = useState<string | null>(null); // 서버에서 받은 CFI
   const [fileInfoLoaded, setFileInfoLoaded] = useState(false); // 서버 파일 정보 로딩 완료 여부
@@ -349,6 +381,11 @@ export default function ReaderScreen() {
   });
   const lastWebPercentRef = useRef<number | null>(null);
   const lastWebLogAtRef = useRef<number>(0);
+  const pendingEpubLocationRequestRef = useRef<{
+    promise: Promise<void>;
+    resolve: () => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
 
   // ===== 리더 설정 =====
   const [settings, setSettings] = useState<ReaderSettings>(DEFAULT_SETTINGS);
@@ -529,7 +566,6 @@ export default function ReaderScreen() {
     txtPaginationSamplesRef.current = {};
     txtPaginationLockedRef.current = false;
     txtTotalPagesRef.current = 1;
-    setTxtLayoutEstimateReady(false);
     setTotalPages(1);
   }, [
     content.length,
@@ -589,6 +625,7 @@ export default function ReaderScreen() {
     pendingTxtNavigationRef.current = null;
     isTxtProgrammaticNavigationRef.current = false;
     setLastCfi(null);
+    lastCfiRef.current = null;
     lastWebPercentRef.current = null;
     epubStartedRef.current = false;
     epubStartedCfiRef.current = null;
@@ -710,7 +747,6 @@ export default function ReaderScreen() {
           txtPaginationSamplesRef.current = {};
           txtPaginationLockedRef.current = false;
           txtTotalPagesRef.current = 1;
-          setTxtLayoutEstimateReady(false);
           setTxtSearchTarget(null);
           currentReadingPreviewRef.current = "";
 
@@ -737,7 +773,6 @@ export default function ReaderScreen() {
           txtPaginationSamplesRef.current = {};
           txtPaginationLockedRef.current = false;
           txtTotalPagesRef.current = 1;
-          setTxtLayoutEstimateReady(false);
           currentReadingPreviewRef.current = "";
           setContent(chunks);
           contentRef.current = chunks;
@@ -792,6 +827,39 @@ export default function ReaderScreen() {
   const initialTxtLineTopInsetRef = useRef(0);
   const initialTxtScrollYRef = useRef<number | null>(null);
   const initialTxtLayoutSignatureRef = useRef<string | null>(null);
+  const [initialEpubLocationsCache, setInitialEpubLocationsCache] = useState<string | null>(null);
+  const [epubLocationsCacheLoaded, setEpubLocationsCacheLoaded] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const currentFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId ?? "");
+    const currentUri = Array.isArray(uri) ? String(uri[0] ?? "") : String(uri ?? "");
+    const storageKey = `${EPUB_LOCATIONS_CACHE_KEY_PREFIX}${currentFileId}`;
+
+    setInitialEpubLocationsCache(null);
+    setEpubLocationsCacheLoaded(false);
+
+    const loadCache = async () => {
+      try {
+        await waitForReaderWrites(`epub-cache:${currentFileId}`);
+        const serialized = await AsyncStorage.getItem(storageKey);
+        if (!active || !serialized) return;
+        const cached = JSON.parse(serialized);
+        if (cached?.uri === currentUri && typeof cached?.locations === "string") {
+          setInitialEpubLocationsCache(cached.locations);
+        }
+      } catch (error) {
+        console.log("EPUB 위치 인덱스 캐시 불러오기 실패:", error);
+      } finally {
+        if (active) setEpubLocationsCacheLoaded(true);
+      }
+    };
+
+    void loadCache();
+    return () => {
+      active = false;
+    };
+  }, [fileId, uri]);
 
   useEffect(() => {
   let active = true;
@@ -811,24 +879,36 @@ export default function ReaderScreen() {
     const currentFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId ?? "");
     const localProgressKey = `${TXT_LOCAL_PROGRESS_KEY_PREFIX}${currentFileId}`;
     const shouldResetProgress = resetProgress === "true";
-    let localPosition: {
-      progress?: number;
-      characterOffset?: number;
-      lineTopInset?: number;
-      scrollY?: number;
-      layoutSignature?: string;
-    } | null = null;
+    const readerLocalProgressKey = `${READER_LOCAL_PROGRESS_KEY_PREFIX}${currentFileId}`;
+    let localPosition: LocalReaderPosition | null = null;
+    let readerLocalPosition: LocalReaderPosition | null = null;
 
     try {
       if (shouldResetProgress) {
-        await AsyncStorage.removeItem(localProgressKey);
+        await AsyncStorage.multiRemove([localProgressKey, readerLocalProgressKey]);
       } else {
-        const savedLocalPosition = await AsyncStorage.getItem(localProgressKey);
+        await Promise.all([
+          waitForReaderWrites(`txt-local:${currentFileId}`),
+          waitForReaderWrites(`reader-local:${currentFileId}`),
+        ]);
+        const [savedLocalPosition, savedReaderPosition] = await Promise.all([
+          AsyncStorage.getItem(localProgressKey),
+          AsyncStorage.getItem(readerLocalProgressKey),
+        ]);
         localPosition = savedLocalPosition ? JSON.parse(savedLocalPosition) : null;
+        readerLocalPosition = savedReaderPosition ? JSON.parse(savedReaderPosition) : null;
+        const currentUri = String(Array.isArray(uri) ? uri[0] : uri);
+        if (readerLocalPosition?.uri !== currentUri) {
+          readerLocalPosition = null;
+        }
       }
     } catch (localError) {
-      console.log("TXT 로컬 이어읽기 위치 불러오기 실패:", localError);
+      console.log("로컬 이어읽기 위치 불러오기 실패:", localError);
     }
+
+    const latestLocalPosition = (Number(readerLocalPosition?.updatedAt) || 0) >= (Number(localPosition?.updatedAt) || 0)
+      ? readerLocalPosition
+      : localPosition;
 
     try {
       console.log("🔍 서버에서 파일 정보 불러오는 중...", fileId);
@@ -838,25 +918,29 @@ export default function ReaderScreen() {
       console.log("📚 서버에서 받은 데이터:", fileInfo);
 
       const serverProgress = Number(fileInfo.progress) || 0;
-      const localProgress = Number(localPosition?.progress) || 0;
+      const localProgress = Number(latestLocalPosition?.progress) || 0;
       const restoredProgress = localProgress > 0 ? localProgress : serverProgress;
+      const restoredReadingPreview = readerLocalPosition?.readingPreview || fileInfo.readingPreview;
+      if (typeof restoredReadingPreview === "string" && restoredReadingPreview.trim()) {
+        currentReadingPreviewRef.current = createPreviewText(restoredReadingPreview);
+      }
 
       if (!shouldResetProgress && restoredProgress > 0) {
         console.log("✅ 저장된 progress 발견:", restoredProgress, localProgress > 0 ? "(기기 저장값)" : "(서버 저장값)");
         setProgress(restoredProgress);
         setInitialProgress(restoredProgress);
         initialProgressRef.current = restoredProgress;
-        if (Number.isFinite(localPosition?.characterOffset)) {
-          initialTxtCharOffsetRef.current = Math.max(0, Number(localPosition?.characterOffset));
+        if (Number.isFinite(latestLocalPosition?.characterOffset)) {
+          initialTxtCharOffsetRef.current = Math.max(0, Number(latestLocalPosition?.characterOffset));
         }
-        if (Number.isFinite(localPosition?.lineTopInset)) {
-          initialTxtLineTopInsetRef.current = Math.max(0, Number(localPosition?.lineTopInset));
+        if (Number.isFinite(latestLocalPosition?.lineTopInset)) {
+          initialTxtLineTopInsetRef.current = Math.max(0, Number(latestLocalPosition?.lineTopInset));
         }
-        if (Number.isFinite(localPosition?.scrollY)) {
-          initialTxtScrollYRef.current = Math.max(0, Number(localPosition?.scrollY));
+        if (Number.isFinite(latestLocalPosition?.scrollY)) {
+          initialTxtScrollYRef.current = Math.max(0, Number(latestLocalPosition?.scrollY));
         }
-        if (typeof localPosition?.layoutSignature === "string") {
-          initialTxtLayoutSignatureRef.current = localPosition.layoutSignature;
+        if (typeof latestLocalPosition?.layoutSignature === "string") {
+          initialTxtLayoutSignatureRef.current = latestLocalPosition.layoutSignature;
         }
       } else if (shouldResetProgress) {
         console.log("↩️ 처음으로 열기 - 저장된 progress/CFI 복원 생략");
@@ -865,9 +949,15 @@ export default function ReaderScreen() {
       }
 
       // ⭐ EPUB 이어 읽기: 저장된 CFI 있으면 기억 (문자열인지 반드시 확인)
-      if (!shouldResetProgress && fileInfo.epubCfi && typeof fileInfo.epubCfi === 'string') {
-        setInitialCfi(fileInfo.epubCfi);
-        console.log("✅ [복원] 서버 CFI 로드:", fileInfo.epubCfi.slice(0, 80), "| progress:", fileInfo.progress);
+      const localEpubCfi = readerLocalPosition?.uri === String(Array.isArray(uri) ? uri[0] : uri)
+        && typeof readerLocalPosition?.epubCfi === "string"
+        ? readerLocalPosition.epubCfi
+        : null;
+      if (!shouldResetProgress && (localEpubCfi || (fileInfo.epubCfi && typeof fileInfo.epubCfi === 'string'))) {
+        const restoredCfi = localEpubCfi || fileInfo.epubCfi;
+        setInitialCfi(restoredCfi);
+        lastCfiRef.current = restoredCfi;
+        console.log(`✅ [복원] ${localEpubCfi ? "로컬" : "서버"} CFI 로드:`, restoredCfi.slice(0, 80));
       } else if (!shouldResetProgress && fileInfo.epubCfi) {
         console.log("⚠️ CFI가 문자열이 아님, 무시:", typeof fileInfo.epubCfi);
       } else if (!shouldResetProgress) {
@@ -875,9 +965,12 @@ export default function ReaderScreen() {
       }
 
       // ⭐ anchorRatio 복원: 저장 당시 CFI의 화면 내 위치 비율
-      if (!shouldResetProgress && typeof fileInfo.anchorRatio === 'number' && fileInfo.anchorRatio > 0) {
-        lastAnchorRatioRef.current = fileInfo.anchorRatio;
-        console.log("✅ [복원] 서버 anchorRatio 로드:", fileInfo.anchorRatio);
+      const restoredAnchorRatio = localEpubCfi && typeof readerLocalPosition?.anchorRatio === "number"
+        ? readerLocalPosition.anchorRatio
+        : fileInfo.anchorRatio;
+      if (!shouldResetProgress && typeof restoredAnchorRatio === 'number' && restoredAnchorRatio > 0) {
+        lastAnchorRatioRef.current = restoredAnchorRatio;
+        console.log("✅ [복원] anchorRatio 로드:", restoredAnchorRatio);
       }
       if (epubOpenStartedAtRef.current > 0) {
         console.log(
@@ -888,22 +981,34 @@ export default function ReaderScreen() {
     } catch (e) {
       if (!active) return;
       console.log("진행도 불러오기 실패:", e);
-      const localProgress = Number(localPosition?.progress) || 0;
+      const localProgress = Number(latestLocalPosition?.progress) || 0;
       if (!shouldResetProgress && localProgress > 0) {
         setProgress(localProgress);
         setInitialProgress(localProgress);
         initialProgressRef.current = localProgress;
-        if (Number.isFinite(localPosition?.characterOffset)) {
-          initialTxtCharOffsetRef.current = Math.max(0, Number(localPosition?.characterOffset));
+        if (Number.isFinite(latestLocalPosition?.characterOffset)) {
+          initialTxtCharOffsetRef.current = Math.max(0, Number(latestLocalPosition?.characterOffset));
         }
-        if (Number.isFinite(localPosition?.lineTopInset)) {
-          initialTxtLineTopInsetRef.current = Math.max(0, Number(localPosition?.lineTopInset));
+        if (Number.isFinite(latestLocalPosition?.lineTopInset)) {
+          initialTxtLineTopInsetRef.current = Math.max(0, Number(latestLocalPosition?.lineTopInset));
         }
-        if (Number.isFinite(localPosition?.scrollY)) {
-          initialTxtScrollYRef.current = Math.max(0, Number(localPosition?.scrollY));
+        if (Number.isFinite(latestLocalPosition?.scrollY)) {
+          initialTxtScrollYRef.current = Math.max(0, Number(latestLocalPosition?.scrollY));
         }
-        if (typeof localPosition?.layoutSignature === "string") {
-          initialTxtLayoutSignatureRef.current = localPosition.layoutSignature;
+        if (typeof latestLocalPosition?.layoutSignature === "string") {
+          initialTxtLayoutSignatureRef.current = latestLocalPosition.layoutSignature;
+        }
+      }
+      if (!shouldResetProgress && readerLocalPosition?.uri === String(Array.isArray(uri) ? uri[0] : uri)) {
+        if (typeof readerLocalPosition.epubCfi === "string") {
+          setInitialCfi(readerLocalPosition.epubCfi);
+          lastCfiRef.current = readerLocalPosition.epubCfi;
+        }
+        if (typeof readerLocalPosition.anchorRatio === "number" && readerLocalPosition.anchorRatio > 0) {
+          lastAnchorRatioRef.current = readerLocalPosition.anchorRatio;
+        }
+        if (typeof readerLocalPosition.readingPreview === "string") {
+          currentReadingPreviewRef.current = createPreviewText(readerLocalPosition.readingPreview);
         }
       }
       setFileInfoLoaded(true); // 실패해도 EPUB 시작은 해야 함
@@ -914,7 +1019,7 @@ export default function ReaderScreen() {
   return () => {
     active = false;
   };
-}, [fileId, BASE_URL, resetProgress]);
+}, [fileId, BASE_URL, resetProgress, uri]);
 
 // TXT 본문과 저장 위치가 준비되면 문자 오프셋을 기준으로 이어읽기한다.
 useEffect(() => {
@@ -1004,7 +1109,7 @@ useEffect(() => {
   }, [uri]);
 
   useEffect(() => {
-    if (!isEpub || !epubReady || !fileInfoLoaded || !webViewRef.current) return;
+    if (!isEpub || !epubReady || !fileInfoLoaded || !epubLocationsCacheLoaded || !webViewRef.current) return;
     const cfiToUse = resetProgress === "true" ? null : (initialCfi || null);
 
     // 이미 시작했고 같은 CFI로 시작했다면 스킵
@@ -1034,8 +1139,17 @@ useEffect(() => {
       sidePadding: settings.sidePadding,
       cfi: resetProgress === "true" ? null : (initialCfi || null),
       anchorRatio: resetProgress === "true" ? 0.5 : (lastAnchorRatioRef.current || 0.5),
+      locationsCache: initialEpubLocationsCache,
     }));
-  }, [isEpub, epubReady, fileInfoLoaded, initialCfi, resetProgress]);
+  }, [
+    epubLocationsCacheLoaded,
+    epubReady,
+    fileInfoLoaded,
+    initialCfi,
+    initialEpubLocationsCache,
+    isEpub,
+    resetProgress,
+  ]);
 
 
   // ===================== TXT 쪽 진행도 계산 =====================
@@ -1084,7 +1198,6 @@ useEffect(() => {
           );
           txtPaginationLockedRef.current = true;
           txtTotalPagesRef.current = pages;
-          setTxtLayoutEstimateReady(true);
           setTotalPages(pages);
           setCurrentPage(Math.min(
             pages,
@@ -1374,11 +1487,11 @@ useEffect(() => {
 
   const persistTxtProgressLocally = () => {
     const currentFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId ?? "");
-    if (!currentFileId || rawTextRef.current.length === 0 || progressRef.current <= 0) return;
+    if (!currentFileId || rawTextRef.current.length === 0 || progressRef.current <= 0) {
+      return Promise.resolve();
+    }
 
-    AsyncStorage.setItem(
-      `${TXT_LOCAL_PROGRESS_KEY_PREFIX}${currentFileId}`,
-      JSON.stringify({
+    const serializedPosition = JSON.stringify({
         progress: progressRef.current,
         characterOffset: currentTxtCharOffsetRef.current,
         previewCharacterOffset: currentTxtPreviewCharOffsetRef.current,
@@ -1387,8 +1500,12 @@ useEffect(() => {
         contentHeight: txtContentHeightRef.current,
         layoutSignature: txtLayoutSignature,
         updatedAt: Date.now(),
-      }),
-    ).catch((error) => console.log("TXT 로컬 이어읽기 위치 저장 실패:", error));
+      });
+
+    return enqueueReaderWrite(`txt-local:${currentFileId}`, () => AsyncStorage.setItem(
+      `${TXT_LOCAL_PROGRESS_KEY_PREFIX}${currentFileId}`,
+      serializedPosition,
+    )).catch((error) => console.log("TXT 로컬 이어읽기 위치 저장 실패:", error));
   };
 
   const updateTxtScrollState = (
@@ -1484,6 +1601,7 @@ useEffect(() => {
       if (!epubNavigationReady) return;
       const requested = Math.min(1, Math.max(0, value));
       // WebView 정밀 이동이 끝나기 전에도 사용자가 놓은 위치를 즉시 유지한다.
+      progressRef.current = requested;
       setProgress(requested);
       setCurrentPage(Math.min(
         Math.max(1, totalPages),
@@ -1624,6 +1742,7 @@ useEffect(() => {
           }
         }
         lastWebPercentRef.current = nextPercent;
+        progressRef.current = nextPercent / 100;
 
         setCurrentPage(Math.max(1, Number(current) || 1));
         // locations 계산 후에는 늦게 도착한 total=1 메시지가 실제 총 페이지를 덮지 못하게 한다.
@@ -1633,12 +1752,19 @@ useEffect(() => {
 
         if (cfi) {
           console.log("💾 [RN] CFI 저장:", cfi.slice(0, 80), "| pct:", nextPercent.toFixed(1), "| anchor:", anchorRatio);
+          lastCfiRef.current = cfi;
           setLastCfi(cfi);
           if (typeof anchorRatio === 'number') lastAnchorRatioRef.current = anchorRatio;
         }
         if (visibleText) {
           currentReadingPreviewRef.current = createPreviewText(visibleText);
-          lastProgressUpdateAtRef.current = Date.now(); // 최신 preview 도착 시간 기록
+        }
+        lastProgressUpdateAtRef.current = Date.now();
+        const pendingLocationRequest = pendingEpubLocationRequestRef.current;
+        if (pendingLocationRequest) {
+          clearTimeout(pendingLocationRequest.timer);
+          pendingEpubLocationRequestRef.current = null;
+          pendingLocationRequest.resolve();
         }
       } else if (data.type === "restored") {
         // 복원 스크롤 완료 → 로딩 오버레이 제거
@@ -1667,6 +1793,16 @@ useEffect(() => {
         setCurrentPage(nextCurrent);
         setTotalPages(nextTotal);
         setEpubLocationsReady(true);
+      } else if (data.type === "locationsCache") {
+        const locations = typeof data.locations === "string" ? data.locations : "";
+        const currentFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId ?? "");
+        const currentUri = Array.isArray(uri) ? String(uri[0] ?? "") : String(uri ?? "");
+        if (locations && currentFileId) {
+          void enqueueReaderWrite(`epub-cache:${currentFileId}`, () => AsyncStorage.setItem(
+            `${EPUB_LOCATIONS_CACHE_KEY_PREFIX}${currentFileId}`,
+            JSON.stringify({ uri: currentUri, locations, updatedAt: Date.now() }),
+          )).catch((error) => console.log("EPUB 위치 인덱스 캐시 저장 실패:", error));
+        }
       } else if (data.type === "seekState") {
         // 슬라이더를 놓은 즉시 목표 페이지/퍼센트를 반영하고 WebView의 정밀 이동을 기다린다.
         const nextTotal = Math.max(1, Number(data.total) || 1);
@@ -1674,6 +1810,7 @@ useEffect(() => {
         const nextPercent = Math.min(100, Math.max(0, Number(data.percent) || 0));
         setCurrentPage(nextCurrent);
         setTotalPages(nextTotal);
+        progressRef.current = nextPercent / 100;
         setProgress(nextPercent / 100);
         lastWebPercentRef.current = nextPercent;
       } else if (data.type === "navigationReady") {
@@ -2795,7 +2932,7 @@ useEffect(() => {
             }
 
             function startLocationsGeneration() {
-              if (locationsGenerationStarted) return;
+              if (locationsReady || locationsGenerationStarted) return;
               locationsGenerationStarted = true;
               clearTimeout(locationsIdleTimer);
               // 슬라이더는 생성된 location 중 가장 가까운 곳으로 이동한다.
@@ -2830,6 +2967,17 @@ useEffect(() => {
                 totalLocations = generatedCount <= 1 ? Math.max(1, spineCount) : generatedCount;
                 if (generatedCount > 1) {
                   reportNavigationReady('locations');
+                  try {
+                    var serializedLocations = book.locations.save();
+                    if (serializedLocations) {
+                      window.ReactNativeWebView.postMessage(JSON.stringify({
+                        type: 'locationsCache',
+                        locations: serializedLocations
+                      }));
+                    }
+                  } catch(cacheError) {
+                    sendLog('⚠️ locations 캐시 직렬화 실패: ' + cacheError.message);
+                  }
                 } else {
                   // locations를 만들 수 없는 fixed-layout/특수 EPUB만 전체 fallback 범위를 계산한다.
                   estimateFallbackPageCounts();
@@ -2858,7 +3006,7 @@ useEffect(() => {
             }
 
             function queueLocationsGenerationWhenIdle() {
-              if (!locationsGenerationRequested || locationsGenerationStarted) return;
+              if (!locationsGenerationRequested || locationsReady || locationsGenerationStarted) return;
               clearTimeout(locationsIdleTimer);
               var now = Date.now();
               var earliestWait = Math.max(0, locationsEarliestStartAt - now);
@@ -2876,7 +3024,7 @@ useEffect(() => {
             }
 
             function scheduleLocationsGeneration() {
-              if (locationsGenerationRequested || locationsGenerationStarted) return;
+              if (locationsReady || locationsGenerationRequested || locationsGenerationStarted) return;
               locationsGenerationRequested = true;
               // 첫 본문 표시 직후에는 시작하지 않고, 기존과 같은 최소 대기 이후 reader가 idle일 때 실행한다.
               locationsEarliestStartAt = Date.now() + 2500;
@@ -4788,7 +4936,7 @@ useEffect(() => {
                 } else if (data.type === "navigateSearchResult") {
                   navigateSearchResult(String(data.cfi || ''));
                 // 저장 직전 최신 CFI 요청
-                } else if (data.type === "getCurrentLocation" && locationsReady) {
+                } else if (data.type === "getCurrentLocation") {
                   try {
                     var loc = rendition.currentLocation();
                     if (loc) safeReport(loc);
@@ -4860,6 +5008,23 @@ useEffect(() => {
                 } else if (data.type === "tryBoundaryTransition") {
                   tryBoundaryTransition(data.direction === 'prev');
                 } else if (data.type === "themeAndStart") {
+                  if (!locationsReady && typeof data.locationsCache === 'string' && data.locationsCache.length > 0) {
+                    try {
+                      book.locations.load(data.locationsCache);
+                      var cachedLocationCount = Math.max(1, book.locations.length());
+                      if (cachedLocationCount > 1) {
+                        locationsReady = true;
+                        locationsGenerationRequested = true;
+                        locationsGenerationStarted = true;
+                        totalLocations = cachedLocationCount;
+                        reportNavigationReady('locations-cache');
+                        reportLocationsReady();
+                        sendLog('✅ locations 캐시 복원 count=' + cachedLocationCount);
+                      }
+                    } catch(cacheError) {
+                      sendLog('⚠️ locations 캐시 복원 실패: ' + cacheError.message);
+                    }
+                  }
                   // 테마 설정 후 display 시작 (훅이 각 챕터에 CSS 주입 → 챕터 이동 정상화)
                   currentTheme = {
                     bgColor: data.bgColor || '#f5f0e6',
@@ -5066,7 +5231,7 @@ useEffect(() => {
 
             // 뒤로가기 시 현재 CFI + 중앙 텍스트 즉시 전송
             document.addEventListener('visibilitychange', function() {
-              if (document.hidden && locationsReady) {
+              if (document.hidden) {
                 try {
                   updateCenterText(); // 숨겨지기 직전 마지막으로 갱신
                   var loc = rendition.currentLocation();
@@ -5095,11 +5260,17 @@ useEffect(() => {
     : txtSearchTarget !== null;
 
   // ===================== 진행도 자동 저장 =====================
-  // unmount 시점에 최신 progress를 저장하기 위해 useRef 사용
-  const lastCfiRef = useRef(lastCfi);
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastSavedProgressRef = useRef<number>(0); // 마지막으로 저장한 progress
-  const progressSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const lastSavedPositionSignatureRef = useRef("");
+  const lastQueuedPositionSignatureRef = useRef("");
+  const exitFlushCompletedRef = useRef(false);
+  const exitInProgressRef = useRef(false);
+
+  useEffect(() => {
+    lastSavedPositionSignatureRef.current = "";
+    lastQueuedPositionSignatureRef.current = "";
+    exitFlushCompletedRef.current = false;
+    exitInProgressRef.current = false;
+  }, [fileId]);
 
   useEffect(() => {
     progressRef.current = progress;
@@ -5109,12 +5280,52 @@ useEffect(() => {
     lastCfiRef.current = lastCfi;
   }, [lastCfi]);
 
+  const requestCurrentEpubLocation = () => {
+    if (!isEpub || !epubReady || !webViewRef.current) return Promise.resolve();
+    if (pendingEpubLocationRequestRef.current) {
+      return pendingEpubLocationRequestRef.current.promise;
+    }
+
+    let resolveRequest = () => {};
+    const promise = new Promise<void>((resolve) => {
+      resolveRequest = resolve;
+    });
+    const finish = () => {
+      const pending = pendingEpubLocationRequestRef.current;
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingEpubLocationRequestRef.current = null;
+      pending.resolve();
+    };
+    const timer = setTimeout(finish, 350);
+    pendingEpubLocationRequestRef.current = {
+      promise,
+      resolve: resolveRequest,
+      timer,
+    };
+
+    try {
+      webViewRef.current.postMessage(JSON.stringify({ type: "getCurrentLocation" }));
+    } catch {
+      finish();
+    }
+    return promise;
+  };
+
   // 서버에 저장하는 함수
-  const saveProgressToServer = async (forceLog = false) => {
+  const saveProgressToServer = async (forceLog = false, refreshEpubLocation = false) => {
     if (!fileId) return;
+    const saveFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId);
+    if (hasSupersedingReaderSession(readerSessionIdRef.current, saveFileId)) return;
+
+    if (refreshEpubLocation) {
+      await requestCurrentEpubLocation();
+    }
+    if (hasSupersedingReaderSession(readerSessionIdRef.current, saveFileId)) return;
 
     const currentProgress = progressRef.current;
     const currentCfi = lastCfiRef.current;
+    const currentAnchorRatio = lastAnchorRatioRef.current;
     
     // 0으로 덮어쓰기 방지
     if (currentProgress === 0 && initialProgressRef.current === 0) {
@@ -5123,11 +5334,6 @@ useEffect(() => {
     }
     if (currentProgress === 0 && initialProgressRef.current > 0) {
       console.log("progress가 0으로 초기화됨. 저장 안 함.");
-      return;
-    }
-
-    // 이전과 같은 값이면 저장 안 함 (중복 방지)
-    if (currentProgress === lastSavedProgressRef.current && !forceLog) {
       return;
     }
 
@@ -5140,8 +5346,31 @@ useEffect(() => {
 
     if (!isEpub) {
       updateTxtReadingPreview(currentScrollYRef.current, currentProgress);
-      persistTxtProgressLocally();
+      await persistTxtProgressLocally();
     }
+    const currentPreview = currentReadingPreviewRef.current;
+
+    const saveUri = Array.isArray(uri) ? String(uri[0] ?? "") : String(uri ?? "");
+    const localPosition: LocalReaderPosition = {
+      uri: saveUri,
+      format: isEpub ? "EPUB" : "TXT",
+      progress: currentProgress,
+      readingPreview: currentReadingPreviewRef.current,
+      updatedAt: Date.now(),
+      ...(isEpub
+        ? { epubCfi: currentCfi || undefined, anchorRatio: currentAnchorRatio }
+        : {
+            characterOffset: currentTxtCharOffsetRef.current,
+            previewCharacterOffset: currentTxtPreviewCharOffsetRef.current,
+            lineTopInset: currentTxtLineTopInsetRef.current,
+            scrollY: currentScrollYRef.current,
+            layoutSignature: txtLayoutSignature,
+          }),
+    };
+    await enqueueReaderWrite(`reader-local:${saveFileId}`, () => AsyncStorage.setItem(
+      `${READER_LOCAL_PROGRESS_KEY_PREFIX}${saveFileId}`,
+      JSON.stringify(localPosition),
+    ));
 
     const body: any = {
       progress: currentProgress,
@@ -5150,24 +5379,38 @@ useEffect(() => {
     };
 
     // 현재 화면에 보이는 텍스트를 readingPreview로 저장
-    if (currentReadingPreviewRef.current) {
-      body.readingPreview = currentReadingPreviewRef.current;
+    if (currentPreview) {
+      body.readingPreview = currentPreview;
     }
 
     if (isEpub && currentCfi) {
       body.epubCfi = currentCfi;
-      body.anchorRatio = lastAnchorRatioRef.current;
+      body.anchorRatio = currentAnchorRatio;
     }
 
-    const saveFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId);
-    const saveRequest = progressSaveQueueRef.current
-      .catch(() => {})
-      .then(async () => {
+    const positionSignature = JSON.stringify({
+      progress: currentProgress,
+      cfi: currentCfi,
+      anchorRatio: currentAnchorRatio,
+      characterOffset: currentTxtCharOffsetRef.current,
+      lineTopInset: currentTxtLineTopInsetRef.current,
+      preview: currentPreview,
+    });
+    if (
+      positionSignature === lastSavedPositionSignatureRef.current
+      || positionSignature === lastQueuedPositionSignatureRef.current
+    ) {
+      await waitForReaderWrites(`server-progress:${saveFileId}`);
+      return;
+    }
+    lastQueuedPositionSignatureRef.current = positionSignature;
+
+    const saveRequest = enqueueReaderWrite(`server-progress:${saveFileId}`, async () => {
         try {
           console.log("📤 [저장 시작]"
             + "\n  progress=" + currentProgress.toFixed(3)
             + "\n  cfi=" + (currentCfi ? currentCfi.slice(0, 80) : '❌없음')
-            + "\n  anchorRatio=" + lastAnchorRatioRef.current.toFixed(3)
+            + "\n  anchorRatio=" + currentAnchorRatio.toFixed(3)
             + "\n  preview=" + (body.readingPreview || '').slice(0, 40)
             + "\n  body=" + JSON.stringify(body).slice(0, 200));
 
@@ -5178,19 +5421,24 @@ useEffect(() => {
           });
 
           if (response.ok) {
-            lastSavedProgressRef.current = currentProgress;
+            lastSavedPositionSignatureRef.current = positionSignature;
             console.log("✅ [저장 성공] progress=" + currentProgress.toFixed(3)
-              + " anchorRatio=" + lastAnchorRatioRef.current.toFixed(3)
+              + " anchorRatio=" + currentAnchorRatio.toFixed(3)
               + " cfi=" + (currentCfi ? currentCfi.slice(0, 60) : '없음'));
           } else {
             const errText = await response.text().catch(() => '');
             console.log("❌ [저장 실패] status=" + response.status + " body=" + errText.slice(0, 100));
+            if (lastQueuedPositionSignatureRef.current === positionSignature) {
+              lastQueuedPositionSignatureRef.current = "";
+            }
           }
         } catch (e) {
           console.log("❌ 진행도 저장 실패:", e);
+          if (lastQueuedPositionSignatureRef.current === positionSignature) {
+            lastQueuedPositionSignatureRef.current = "";
+          }
         }
       });
-    progressSaveQueueRef.current = saveRequest;
     await saveRequest;
   };
 
@@ -5199,52 +5447,51 @@ useEffect(() => {
   useEffect(() => {
     saveProgressRef.current = saveProgressToServer;
   });
+  flushReaderSessionRef.current = async (reason) => {
+    await saveProgressRef.current(true, true);
+    if (reason === "external-file" || reason === "hardware-back" || reason === "reader-exit") {
+      exitFlushCompletedRef.current = true;
+    }
+  };
 
   // unmount 시 저장 (백업)
   useEffect(() => {
     return () => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
+      const pendingLocationRequest = pendingEpubLocationRequestRef.current;
+      if (pendingLocationRequest) {
+        clearTimeout(pendingLocationRequest.timer);
+        pendingEpubLocationRequestRef.current = null;
+        pendingLocationRequest.resolve();
       }
       // 홈 화면에서 즉시 refetch하도록 플래그 저장
       AsyncStorage.setItem('reader_exited', '1').catch(() => {});
-      if (isEpub && webViewRef.current) {
-        webViewRef.current.postMessage(JSON.stringify({ type: 'getCurrentLocation' }));
-        // 최신 preview가 도착했는지 확인하고 동적 대기
-        const now = Date.now();
-        const timeSinceLastUpdate = now - lastProgressUpdateAtRef.current;
-        // 최근 100ms 내 업데이트면 바로 저장, 아니면 최대 700ms 대기
-        const waitTime = timeSinceLastUpdate < 100 ? 50 : Math.min(700, 800 - timeSinceLastUpdate);
-        console.log("💾 [unmount] timeSinceUpdate=" + timeSinceLastUpdate + "ms, waiting " + waitTime + "ms");
-        setTimeout(() => saveProgressRef.current(true), waitTime);
-      } else {
-        saveProgressRef.current(true);
+      if (!exitFlushCompletedRef.current) {
+        void saveProgressRef.current(true, false);
       }
     };
-  }, [isEpub]);
+  }, []);
 
   // 앱이 백그라운드로 전환될 때 저장 (강제종료 대비)
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (nextState) => {
       if (nextState === 'background' || nextState === 'inactive') {
-        if (isEpub && webViewRef.current) {
-          webViewRef.current.postMessage(JSON.stringify({ type: 'getCurrentLocation' }));
-          // 최신 preview가 도착했는지 확인하고 동적 대기
-          const now = Date.now();
-          const timeSinceLastUpdate = now - lastProgressUpdateAtRef.current;
-          // 최근 100ms 내 업데이트면 바로 저장, 아니면 최대 700ms 대기
-          const waitTime = timeSinceLastUpdate < 100 ? 50 : Math.min(700, 800 - timeSinceLastUpdate);
-          console.log("💾 [background] timeSinceUpdate=" + timeSinceLastUpdate + "ms, waiting " + waitTime + "ms");
-          setTimeout(() => saveProgressRef.current(true), waitTime);
-        } else {
-          saveProgressRef.current(true);
-        }
+        void flushReaderSessionRef.current("background");
       }
     });
     return () => subscription.remove();
-  }, [isEpub]);
+  }, []);
 
-  const exitReader = () => {
+  const exitReader = async (reason: "hardware-back" | "reader-exit" = "reader-exit") => {
+    if (exitInProgressRef.current || exitFlushCompletedRef.current) return;
+    exitInProgressRef.current = true;
+    try {
+      await flushReaderSessionRef.current(reason);
+      await AsyncStorage.setItem('reader_exited', '1').catch(() => {});
+    } catch (error) {
+      console.log("Reader 종료 위치 저장 실패:", error);
+    } finally {
+      exitFlushCompletedRef.current = true;
+    }
 
     if (router.canGoBack()) {
       router.back();
@@ -5252,6 +5499,15 @@ useEffect(() => {
       router.replace('/(tabs)');
     }
   };
+
+  useEffect(() => {
+    if (Platform.OS !== "android") return;
+    const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+      void exitReader("hardware-back");
+      return true;
+    });
+    return () => subscription.remove();
+  });
 
   return (
     <View style={styles.root}>
@@ -5261,7 +5517,7 @@ useEffect(() => {
       {/* 에러 시 전체 화면 */}
       {(epubError || txtError) ? (
         <View style={[styles.errorFullScreen, { paddingTop: readerTopInset }]}>
-          <TouchableOpacity style={styles.errorBackTop} onPress={exitReader}>
+          <TouchableOpacity style={styles.errorBackTop} onPress={() => void exitReader()}>
             <Text style={styles.back}>←</Text>
           </TouchableOpacity>
           <View style={styles.errorBody}>
@@ -5274,7 +5530,7 @@ useEffect(() => {
                   ? `${epubError || txtError}\n\n파일이 손상되지 않았다면 다시 열어주세요.`
                   : '파일이 손상됐거나 지원되지 않는 형식이에요.'}
             </Text>
-            <TouchableOpacity style={styles.errorBackBtn} onPress={exitReader}>
+            <TouchableOpacity style={styles.errorBackBtn} onPress={() => void exitReader()}>
               <Text style={styles.errorBackBtnText}>← 돌아가기</Text>
             </TouchableOpacity>
           </View>
@@ -5284,7 +5540,7 @@ useEffect(() => {
       {/* 상단바 */}
       {showUI && (
         <View style={[styles.topBar, { paddingTop: readerTopInset + 8 }]}>
-          <Text style={styles.back} onPress={exitReader}>
+          <Text style={styles.back} onPress={() => void exitReader()}>
             ←
           </Text>
           <Text style={styles.title} numberOfLines={1}>
@@ -5519,7 +5775,7 @@ useEffect(() => {
             ) : txtError ? (
               <View style={styles.errorContainer}>
                 <Text style={styles.errorText}>⚠️ {txtError}</Text>
-                <TouchableOpacity style={styles.errorBackBtn} onPress={exitReader}>
+                <TouchableOpacity style={styles.errorBackBtn} onPress={() => void exitReader()}>
                   <Text style={styles.errorBackBtnText}>← 돌아가기</Text>
                 </TouchableOpacity>
               </View>
@@ -5642,7 +5898,6 @@ useEffect(() => {
                 settings.textColor,
                 settings.lineSpacing,
                 settings.fontFamily,
-                txtLayoutEstimateReady,
               ].join(":")}
             />
             )}
