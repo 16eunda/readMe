@@ -1,16 +1,26 @@
 import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { File as ExpoFile, type FileHandle } from 'expo-file-system';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Linking from 'expo-linking';
 import { Stack, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
+import { Platform } from 'react-native';
 import 'react-native-reanimated';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { UserProvider, useUser } from '../contexts/UserContext';
-import { getExternalFileDisplayName } from '../modules/external-file-info/src';
+import {
+  clearExternalFileIntent,
+  getExternalFileDisplayName,
+  isLaunchedFromHistory,
+} from '../modules/external-file-info/src';
+import { flushActiveReaderSession } from '../utils/readerLifecycle';
+
+const ACTIVE_READER_SESSION_KEY = '@active_reader_session';
 
 export const unstable_settings = {
   anchor: '(tabs)',
@@ -24,15 +34,23 @@ const getSupportedFileNameFromUrl = (url: string) => {
 };
 
 const getFileExtensionFromUri = async (uri: string) => {
+  let handle: FileHandle | null = null;
   try {
-    const base64Start = await FileSystem.readAsStringAsync(uri, {
-      encoding: FileSystem.EncodingType.Base64,
-    });
-    return base64Start.startsWith('UEsD') || base64Start.startsWith('UEs') ? '.epub' : '.txt';
-  } catch (e) {
-    const info = await FileSystem.getInfoAsync(uri).catch(() => null);
-    const fileSize = info && 'size' in info ? ((info as any).size ?? 0) : 0;
-    return fileSize > 1024 * 100 ? '.epub' : '.txt';
+    handle = new ExpoFile(uri).open();
+    const signature = handle.readBytes(4);
+    const isZip = signature.length >= 4
+      && signature[0] === 0x50
+      && signature[1] === 0x4b
+      && (
+        (signature[2] === 0x03 && signature[3] === 0x04)
+        || (signature[2] === 0x05 && signature[3] === 0x06)
+        || (signature[2] === 0x07 && signature[3] === 0x08)
+      );
+    return isZip ? '.epub' : '.txt';
+  } catch {
+    return '.txt';
+  } finally {
+    handle?.close();
   }
 };
 
@@ -61,9 +79,43 @@ const makeExternalFileName = (sourceUrl: string, ext: string, displayName?: stri
 function AppContent() {
   const colorScheme = useColorScheme();
   const router = useRouter();
+  const processingUrlsRef = useRef(new Set<string>());
+  const lastIncomingUrlRef = useRef<{ url: string; handledAt: number } | null>(null);
+  const incomingOperationIdRef = useRef(0);
+  const didReadInitialUrlRef = useRef(false);
   const { setIncomingFile } = useUser();
 
   useEffect(() => {
+    const restoreActiveReader = async () => {
+      try {
+        const serialized = await AsyncStorage.getItem(ACTIVE_READER_SESSION_KEY);
+        if (!serialized) return;
+
+        const session = JSON.parse(serialized);
+        if (!session?.fileId || !session?.uri || !session?.name) {
+          await AsyncStorage.removeItem(ACTIVE_READER_SESSION_KEY);
+          return;
+        }
+        const fileInfo = await FileSystem.getInfoAsync(String(session.uri));
+        if (!fileInfo.exists) {
+          await AsyncStorage.removeItem(ACTIVE_READER_SESSION_KEY);
+          return;
+        }
+
+        router.replace({
+          pathname: '/reader',
+          params: {
+            fileId: String(session.fileId),
+            uri: String(session.uri),
+            name: String(session.name),
+            type: session.type ? String(session.type) : undefined,
+          },
+        });
+      } catch (error) {
+        console.log('활성 리더 세션 복원 실패:', error);
+      }
+    };
+
     const processIncomingUrl = async (url: string | null) => {
       if (!url) return;
 
@@ -88,31 +140,48 @@ function AppContent() {
       const isFileUrl = normalizedUrl.startsWith('file://') || normalizedUrl.startsWith('content://');
       if (!isFileUrl) return;
 
+      const now = Date.now();
+      const lastIncoming = lastIncomingUrlRef.current;
+      const isImmediateDuplicate =
+        lastIncoming?.url === normalizedUrl && now - lastIncoming.handledAt < 5000;
+      if (processingUrlsRef.current.has(normalizedUrl) || isImmediateDuplicate) {
+        console.log('↩️ 이미 처리한 외부 파일 이벤트 무시:', normalizedUrl);
+        return;
+      }
+
+      processingUrlsRef.current.add(normalizedUrl);
+      const operationId = incomingOperationIdRef.current + 1;
+      incomingOperationIdRef.current = operationId;
+
       let name = 'unknown';
       let finalUri = '';
 
       try {
+        // Reader가 열린 상태에서 새 파일이 들어오면 기존 파일 위치를 먼저 확정한다.
+        await flushActiveReaderSession('external-file');
+        if (incomingOperationIdRef.current !== operationId) return;
+
         const cacheDir = FileSystem.cacheDirectory ?? '';
         
         if (normalizedUrl.startsWith('content://')) {
           // content URI는 제공자에 따라 원본 파일명이 없을 수 있으므로 먼저 복사 후 타입을 판별한다.
-          const tempName = 'temp_' + Date.now();
+          const tempName = `incoming_${operationId}_${Date.now()}.tmp`;
           const tempUri = cacheDir + tempName;
+          const displayNamePromise = getExternalFileDisplayName(normalizedUrl);
           
-          // 캐시에 임시 복사
-          await FileSystem.copyAsync({ from: normalizedUrl, to: tempUri });
+          // 파일명 조회와 원본 복사는 서로 독립적이므로 동시에 진행한다.
+          const [, displayName] = await Promise.all([
+            FileSystem.copyAsync({ from: normalizedUrl, to: tempUri }),
+            displayNamePromise,
+          ]);
           console.log('✅ 임시 복사 완료:', tempUri);
 
-          const ext = await getFileExtensionFromUri(tempUri);
-          const displayName = await getExternalFileDisplayName(normalizedUrl);
+          const displayExtension = displayName?.match(/\.(txt|epub)$/i)?.[0]?.toLowerCase();
+          const ext = displayExtension || await getFileExtensionFromUri(tempUri);
           name = makeExternalFileName(normalizedUrl, ext, displayName);
-          finalUri = cacheDir + name;
+          finalUri = `${cacheDir}incoming_${operationId}_${Date.now()}${ext}`;
           
-          // 임시 파일을 최종 이름으로 이동
-          const existingInfo = await FileSystem.getInfoAsync(finalUri);
-          if (existingInfo.exists) {
-            await FileSystem.deleteAsync(finalUri, { idempotent: true });
-          }
+          // 각 선택마다 고유한 캐시 경로를 사용해 동시에 들어온 파일이 서로 덮어쓰지 않게 한다.
           await FileSystem.moveAsync({ from: tempUri, to: finalUri });
           console.log('✅ 파일명 판별 완료:', name);
         } else {
@@ -126,27 +195,50 @@ function AppContent() {
           }
           name = urlName;
           
-          finalUri = cacheDir + name;
+          const ext = urlName.slice(urlName.lastIndexOf('.')).toLowerCase();
+          finalUri = `${cacheDir}incoming_${operationId}_${Date.now()}${ext}`;
           
           // 캐시에 복사
-          const existingInfo = await FileSystem.getInfoAsync(finalUri);
-          if (existingInfo.exists) {
-            await FileSystem.deleteAsync(finalUri, { idempotent: true });
-          }
           await FileSystem.copyAsync({ from: normalizedUrl, to: finalUri });
           console.log('✅ 파일 복사 완료:', finalUri);
         }
 
+        if (incomingOperationIdRef.current !== operationId) {
+          await FileSystem.deleteAsync(finalUri, { idempotent: true }).catch(() => {});
+          console.log('↩️ 더 최신 파일이 선택되어 이전 외부 파일 결과 폐기:', name);
+          return;
+        }
+
         console.log('📂 외부 파일 수신 완료:', name);
+        lastIncomingUrlRef.current = { url: normalizedUrl, handledAt: Date.now() };
+        await clearExternalFileIntent(url);
         setIncomingFile({ uri: finalUri, name });
+        // 리더가 열려 있더라도 중복 확인창과 등록 상태가 보이는 홈으로 이동한다.
         router.replace('/(tabs)' as any);
       } catch (e) {
         console.error('❌ 외부 파일 처리 실패:', e);
+      } finally {
+        processingUrlsRef.current.delete(normalizedUrl);
       }
     };
 
     // 앱이 종료된 상태에서 파일로 열린 경우 (cold start)
-    Linking.getInitialURL().then(processIncomingUrl);
+    // router 객체가 바뀌어 effect가 다시 연결되더라도 cold-start 인텐트는 한 번만 소비한다.
+    if (!didReadInitialUrlRef.current) {
+      didReadInitialUrlRef.current = true;
+      Linking.getInitialURL().then(async (initialUrl) => {
+        const isHistoryRelaunch = Platform.OS === 'android'
+          && await isLaunchedFromHistory();
+        if (initialUrl && !isHistoryRelaunch) {
+          await processIncomingUrl(initialUrl);
+        } else {
+          if (initialUrl && isHistoryRelaunch) {
+            console.log('↩️ 최근 앱에서 재실행된 기존 파일 intent는 다시 등록하지 않음');
+          }
+          await restoreActiveReader();
+        }
+      });
+    }
 
     // 앱이 백그라운드에 있다가 파일로 열린 경우
     const subscription = Linking.addEventListener('url', ({ url }) => {
@@ -154,7 +246,7 @@ function AppContent() {
     });
 
     return () => subscription.remove();
-  }, []);
+  }, [router, setIncomingFile]);
 
   return (
     <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>

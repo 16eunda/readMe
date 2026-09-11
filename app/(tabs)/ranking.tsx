@@ -4,7 +4,7 @@ import { FileRankingDto } from "@/types/file";
 import { getDeviceId } from "@/utils/deviceId";
 import { FontAwesome5 } from "@expo/vector-icons";
 import { router, useFocusEffect } from 'expo-router';
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   NativeScrollEvent,
@@ -19,7 +19,7 @@ import {
 import { useUser } from '../../contexts/UserContext';
 import { authenticatedFetch } from '../../utils/api';
 
-const ITEMS_PER_PAGE = 10;
+const ITEMS_PER_BATCH = 20;
 
 const formatRankingDate = (value: string) => {
   const date = new Date(value);
@@ -35,38 +35,28 @@ export default function RankingScreen() {
   const { isPremium, isLoading: isUserLoading, checkSubscription, markPremiumRequired } = useUser();
   const [period, setPeriod] = useState<"한달" | "올해">("한달");
   const [rankings, setRankings] = useState<FileRankingDto[]>([]);
-  const [displayedItems, setDisplayedItems] = useState(ITEMS_PER_PAGE);
+  const [displayedItems, setDisplayedItems] = useState(ITEMS_PER_BATCH);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestIdRef = useRef(0);
+  const revealStartedAtRef = useRef<number | null>(null);
 
-  // 클라이언트 사이드 통계 계산
-  const stats = useMemo(() => {
-    if (rankings.length === 0) return null;
-    const totalReadCount = rankings.reduce((sum, r) => sum + r.readCount, 0);
-    const ratedBooks = rankings.filter(r => r.rating > 0);
-    const avgRating = ratedBooks.length > 0
-      ? ratedBooks.reduce((sum, r) => sum + r.rating, 0) / ratedBooks.length
-      : 0;
-    const completedCount = rankings.filter(r => r.progress >= 0.95).length;
-    return {
-      totalReadCount,
-      avgRating: Math.round(avgRating * 10) / 10,
-      completedCount,
-    };
-  }, [rankings]);
-
-
-  const fetchRankings = async (showLoading = true) => {
+  const fetchRankings = useCallback(async (showLoading = true) => {
     if (isUserLoading) return;
+    const requestId = ++requestIdRef.current;
+    const startedAt = Date.now();
     if (showLoading) setLoading(true);
     setError(null);
     try {
       const deviceId = await getDeviceId();
+      const requestStartedAt = Date.now();
       const endpoint = period === "한달"
         ? `${API_BASE_URL}/ranking/month`
         : `${API_BASE_URL}/ranking/year`;
       const response = await authenticatedFetch(endpoint, {}, deviceId);
+      const responseAt = Date.now();
+      if (requestId !== requestIdRef.current) return;
       if (response.status === 403) {
         const text = await response.text().catch(() => "");
         if (text.includes("PREMIUM_REQUIRED")) {
@@ -78,15 +68,30 @@ export default function RankingScreen() {
       }
       if (!response.ok) throw new Error(`서버 오류: ${response.status}`);
       const data: FileRankingDto[] = await response.json();
+      const parsedAt = Date.now();
+      if (requestId !== requestIdRef.current) return;
       setRankings(data);
-      setDisplayedItems(ITEMS_PER_PAGE);
+      setDisplayedItems(ITEMS_PER_BATCH);
+      requestAnimationFrame(() => {
+        console.log("⏱️ Ranking 로딩", {
+          deviceIdMs: requestStartedAt - startedAt,
+          apiMs: responseAt - requestStartedAt,
+          parseMs: parsedAt - responseAt,
+          firstRenderMs: Date.now() - parsedAt,
+          totalMs: Date.now() - startedAt,
+          itemCount: data.length,
+        });
+      });
     } catch (err) {
+      if (requestId !== requestIdRef.current) return;
       setError(err instanceof Error ? err.message : "랭킹을 불러오는데 실패했습니다");
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (requestId === requestIdRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
-  };
+  }, [isUserLoading, markPremiumRequired, period]);
 
   useFocusEffect(
     useCallback(() => {
@@ -105,25 +110,38 @@ export default function RankingScreen() {
       });
       return () => {
         active = false;
+        requestIdRef.current += 1;
       };
-    }, [period, isPremium, isUserLoading, checkSubscription])
+    }, [checkSubscription, fetchRankings, isUserLoading, period])
   );
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
     fetchRankings(false);
-  }, [period, isUserLoading]);
+  }, [fetchRankings]);
 
-  const handleScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+  const handleScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
     const { layoutMeasurement, contentOffset, contentSize } = event.nativeEvent;
-    const paddingToBottom = 20;
-    
-    if (layoutMeasurement.height + contentOffset.y >= contentSize.height - paddingToBottom) {
-      if (displayedItems < rankings.length) {
-        setDisplayedItems(prev => Math.min(prev + ITEMS_PER_PAGE, rankings.length));
-      }
+    const distanceFromEnd = contentSize.height - layoutMeasurement.height - contentOffset.y;
+
+    if (distanceFromEnd <= layoutMeasurement.height && displayedItems < rankings.length) {
+      if (revealStartedAtRef.current != null) return;
+      revealStartedAtRef.current = Date.now();
+      setDisplayedItems(prev => Math.min(prev + ITEMS_PER_BATCH, rankings.length));
     }
-  };
+  }, [displayedItems, rankings.length]);
+
+  useEffect(() => {
+    if (revealStartedAtRef.current == null) return;
+    requestAnimationFrame(() => {
+      if (revealStartedAtRef.current == null) return;
+      console.log("⏱️ Ranking 다음 묶음 표시", {
+        displayedItems,
+        renderMs: Date.now() - revealStartedAtRef.current,
+      });
+      revealStartedAtRef.current = null;
+    });
+  }, [displayedItems]);
 
   const renderStars = (rating: number) => {
     return Array.from({ length: 5 }, (_, i) => (
@@ -155,7 +173,7 @@ export default function RankingScreen() {
       style={styles.container} 
       showsVerticalScrollIndicator={false}
       onScroll={handleScroll}
-      scrollEventThrottle={400}
+      scrollEventThrottle={100}
       refreshControl={
         <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
       }
@@ -267,16 +285,6 @@ export default function RankingScreen() {
           <Text style={styles.readCount}>{item.readCount}회</Text>
         </TouchableOpacity>
       ))}
-
-      {/* 더 보기 로딩 */}
-      {!loading && visibleRankings.length < rankings.length && (
-        <View style={styles.loadMoreContainer}>
-          <ActivityIndicator size="small" color="#999" />
-          <Text style={styles.loadMoreText}>
-            {displayedItems} / {rankings.length}
-          </Text>
-        </View>
-      )}
 
       {visibleRankings.length > 0 && (
         <View style={styles.bottomPadding} />
@@ -415,18 +423,6 @@ const styles = StyleSheet.create({
     color: "#999",
   },
 
-  /* 무한 스크롤 */
-  loadMoreContainer: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 20,
-    gap: 8,
-  },
-  loadMoreText: {
-    fontSize: 13,
-    color: "#999",
-  },
   bottomPadding: {
     height: 40,
   },

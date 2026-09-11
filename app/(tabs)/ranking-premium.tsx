@@ -4,7 +4,7 @@ import { FileRankingDto } from "@/types/file";
 import { getDeviceId } from "@/utils/deviceId";
 import { FontAwesome5 } from "@expo/vector-icons";
 import { router, useFocusEffect } from "expo-router";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   NativeScrollEvent,
@@ -21,7 +21,7 @@ import { useUser } from "../../contexts/UserContext";
 import { authenticatedFetch } from "../../utils/api";
 
 const PURPLE = "#7C3AED";
-const ITEMS_PER_PAGE = 10;
+const ITEMS_PER_BATCH = 20;
 
 export default function RankingPremiumScreen() {
   const { isLoading: isUserLoading, checkSubscription, markPremiumRequired } = useUser();
@@ -31,10 +31,12 @@ export default function RankingPremiumScreen() {
   const [selectedYear, setSelectedYear] = useState(now.getFullYear());
   const [selectedMonth, setSelectedMonth] = useState(now.getMonth() + 1);
   const [rankings, setRankings] = useState<FileRankingDto[]>([]);
-  const [displayedItems, setDisplayedItems] = useState(ITEMS_PER_PAGE);
+  const [displayedItems, setDisplayedItems] = useState(ITEMS_PER_BATCH);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestIdRef = useRef(0);
+  const revealStartedAtRef = useRef<number | null>(null);
 
   // 클라이언트 통계 계산
   const stats = useMemo(() => {
@@ -53,17 +55,22 @@ export default function RankingPremiumScreen() {
     };
   }, [rankings]);
 
-  const fetchRankings = async (showLoading = true) => {
+  const fetchRankings = useCallback(async (showLoading = true) => {
     if (isUserLoading) return;
+    const requestId = ++requestIdRef.current;
+    const startedAt = Date.now();
     if (showLoading) setLoading(true);
     setError(null);
     try {
       const deviceId = await getDeviceId();
+      const requestStartedAt = Date.now();
       const endpoint =
         period === "한달"
           ? `${API_BASE_URL}/ranking/month?year=${selectedYear}&month=${selectedMonth}`
           : `${API_BASE_URL}/ranking/year?year=${selectedYear}`;
       const response = await authenticatedFetch(endpoint, {}, deviceId);
+      const responseAt = Date.now();
+      if (requestId !== requestIdRef.current) return;
       if (response.status === 403) {
         const text = await response.text().catch(() => "");
         if (text.includes("PREMIUM_REQUIRED")) {
@@ -75,17 +82,32 @@ export default function RankingPremiumScreen() {
       }
       if (!response.ok) throw new Error(`서버 오류: ${response.status}`);
       const data: FileRankingDto[] = await response.json();
+      const parsedAt = Date.now();
+      if (requestId !== requestIdRef.current) return;
       setRankings(data);
-      setDisplayedItems(ITEMS_PER_PAGE);
+      setDisplayedItems(ITEMS_PER_BATCH);
+      requestAnimationFrame(() => {
+        console.log("⏱️ Premium Ranking 로딩", {
+          deviceIdMs: requestStartedAt - startedAt,
+          apiMs: responseAt - requestStartedAt,
+          parseMs: parsedAt - responseAt,
+          firstRenderMs: Date.now() - parsedAt,
+          totalMs: Date.now() - startedAt,
+          itemCount: data.length,
+        });
+      });
     } catch (err) {
+      if (requestId !== requestIdRef.current) return;
       setError(
         err instanceof Error ? err.message : "랭킹을 불러오는데 실패했습니다"
       );
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (requestId === requestIdRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
-  };
+  }, [isUserLoading, markPremiumRequired, period, selectedMonth, selectedYear]);
 
   useFocusEffect(
     useCallback(() => {
@@ -104,25 +126,39 @@ export default function RankingPremiumScreen() {
       });
       return () => {
         active = false;
+        requestIdRef.current += 1;
       };
-    }, [period, selectedYear, selectedMonth, isUserLoading, checkSubscription])
+    }, [checkSubscription, fetchRankings, isUserLoading])
   );
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
     fetchRankings(false);
-  }, [period, selectedYear, selectedMonth, isUserLoading]);
+  }, [fetchRankings]);
 
-  const handleScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+  const handleScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
     const { layoutMeasurement, contentOffset, contentSize } = event.nativeEvent;
-    if (layoutMeasurement.height + contentOffset.y >= contentSize.height - 20) {
-      if (displayedItems < rankings.length) {
-        setDisplayedItems((prev) =>
-          Math.min(prev + ITEMS_PER_PAGE, rankings.length)
-        );
-      }
+    const distanceFromEnd = contentSize.height - layoutMeasurement.height - contentOffset.y;
+    if (distanceFromEnd <= layoutMeasurement.height && displayedItems < rankings.length) {
+      if (revealStartedAtRef.current != null) return;
+      revealStartedAtRef.current = Date.now();
+      setDisplayedItems((prev) =>
+        Math.min(prev + ITEMS_PER_BATCH, rankings.length)
+      );
     }
-  };
+  }, [displayedItems, rankings.length]);
+
+  useEffect(() => {
+    if (revealStartedAtRef.current == null) return;
+    requestAnimationFrame(() => {
+      if (revealStartedAtRef.current == null) return;
+      console.log("⏱️ Premium Ranking 다음 묶음 표시", {
+        displayedItems,
+        renderMs: Date.now() - revealStartedAtRef.current,
+      });
+      revealStartedAtRef.current = null;
+    });
+  }, [displayedItems]);
 
   const renderStars = (rating: number) =>
     Array.from({ length: 5 }, (_, i) => (
@@ -193,7 +229,7 @@ export default function RankingPremiumScreen() {
         style={styles.container}
         showsVerticalScrollIndicator={false}
         onScroll={handleScroll}
-        scrollEventThrottle={400}
+        scrollEventThrottle={100}
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
         }
@@ -344,16 +380,6 @@ export default function RankingPremiumScreen() {
             </TouchableOpacity>
           ))}
 
-        {/* 무한 스크롤 로딩 */}
-        {!loading && visibleRankings.length < rankings.length && (
-          <View style={styles.loadMoreContainer}>
-            <ActivityIndicator size="small" color="#999" />
-            <Text style={styles.loadMoreText}>
-              {displayedItems} / {rankings.length}
-            </Text>
-          </View>
-        )}
-
         <View style={{ height: 40 }} />
       </ScrollView>
     </SafeAreaView>
@@ -477,12 +503,4 @@ const styles = StyleSheet.create({
   emptyText: { fontSize: 48, marginBottom: 12 },
   emptySubText: { fontSize: 15, color: "#999" },
 
-  loadMoreContainer: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 16,
-    gap: 8,
-  },
-  loadMoreText: { fontSize: 13, color: "#999" },
 });
