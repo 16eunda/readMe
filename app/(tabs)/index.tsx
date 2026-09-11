@@ -50,8 +50,12 @@ import FolderRenameModal from "../../components/FolderRenameModal";
 import PreviewModal from "../../components/PreviewModal";
 import SortModal, { SortOption } from "../../components/SortModal";
 import { useUser } from "../../contexts/UserContext";
+import { flushActiveReaderSession } from "../../utils/readerLifecycle";
 
 const MANAGED_FILE_DIRECTORY = "library-files";
+
+// 선택한 파일을 앱 저장소로 복사해 둔 상태
+type PreparedPick = { file: any; managedPath: string; exists: boolean };
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
 const READER_LOCAL_PROGRESS_KEY_PREFIX = "@reader_position:";
 const TXT_PREVIEW_SAMPLE_BYTES = 64 * 1024;
@@ -61,6 +65,17 @@ const activeExternalRegistrations = new Set<string>();
 
 const getExternalRegistrationKey = (name: string, uri: string) =>
   `root:${name.trim().toLocaleLowerCase()}:${uri}`;
+
+// 지원 형식 판정. 확장자가 없는 파일은 기존대로 TXT로 취급한다.
+function getFileExtension(name: string) {
+  const index = String(name || "").lastIndexOf(".");
+  return index > 0 ? String(name).slice(index).toLowerCase() : "";
+}
+
+function isSupportedFileName(name: string) {
+  const extension = getFileExtension(name);
+  return extension === "" || extension === ".txt" || extension === ".epub";
+}
 
 function readFilePrefix(uri: string, byteCount: number): Buffer {
   let handle: FileHandle | null = null;
@@ -200,6 +215,16 @@ export default function Home() {
     externalRegistrationKey?: string;
     operationId: number;
   } | null>(null);
+  // 여러 개 등록에서 발견된 중복 파일들은 한 번만 모아서 묻는다.
+  const [pendingDuplicateFiles, setPendingDuplicateFiles] = useState<PreparedPick[]>([]);
+  // 팝업 대기 중인 복사본. 새 등록이 시작되면 정리해 앱 저장소에 남지 않게 한다.
+  const pendingPreparedPicksRef = useRef<PreparedPick[]>([]);
+  const [pendingBatchSummary, setPendingBatchSummary] = useState<{
+    newFiles: PreparedPick[];
+    failed: string[];
+    unsupported: string[];
+    total: number;
+  } | null>(null);
 
   // 페이지네이션 (추가 페이지 로딩용)
   const [currentPage, setCurrentPage] = useState(0);
@@ -235,6 +260,10 @@ export default function Home() {
 
   // 파일 등록 중 로딩
   const [isUploading, setIsUploading] = useState(false);
+  // 여러 개를 등록하는 중일 때만 진행 상황을 표시한다.
+  const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null);
+  // 여러 개 등록 중에는 파일별 오버레이 토글과 개별 실패 알림을 묶어서 처리한다.
+  const batchRegistrationRef = useRef(false);
 
   // 파일 삭제 중 로딩
   const [isDeleting, setIsDeleting] = useState(false);
@@ -494,8 +523,16 @@ export default function Home() {
     setDuplicateFileName("");
     setPendingFile(null);
     setPendingFileAction(null);
+    setPendingDuplicateFiles([]);
+    setPendingBatchSummary(null);
+
+    const abandoned = pendingPreparedPicksRef.current;
+    pendingPreparedPicksRef.current = [];
+    if (abandoned.length > 0) void discardPreparedPicksRef.current(abandoned);
     return operationId;
   };
+
+  const discardPreparedPicksRef = useRef<(items: PreparedPick[]) => Promise<void>>(async () => {});
 
   const isCurrentFileRegistration = (operationId: number) =>
     fileRegistrationOperationIdRef.current === operationId;
@@ -950,59 +987,209 @@ export default function Home() {
       const res = await DocumentPicker.getDocumentAsync({
         type: ["text/plain", "application/epub+zip"],
         copyToCacheDirectory: true, // ★ 반드시 추가
+        multiple: true,             // 여러 개 선택 허용 (1개만 골라도 동일 흐름)
       });
-      
+
       console.log('📋 DocumentPicker 결과:', { canceled: res.canceled, assets: res.assets?.length });
-      
+
+      // 취소하면 아무 상태도 건드리지 않는다.
       if (res.canceled) {
         console.log('❌ 파일 선택 취소됨');
         return;
       }
 
-      const file = res.assets[0];
-      console.log('✅ 파일 선택됨:', { name: file.name, uri: file.uri });
+      const picked = Array.isArray(res.assets) ? res.assets.filter(Boolean) : [];
+      if (picked.length === 0) {
+        console.log('❌ 선택된 파일 없음');
+        return;
+      }
+
+      // 지원하지 않는 형식은 제외하되, 나머지 등록은 그대로 진행한다.
+      const supported = picked.filter((item: any) => isSupportedFileName(item?.name ?? ""));
+      const unsupported = picked
+        .filter((item: any) => !isSupportedFileName(item?.name ?? ""))
+        .map((item: any) => String(item?.name ?? ""));
+
+      if (supported.length === 0) {
+        Alert.alert(
+          '지원하지 않는 파일',
+          `EPUB 또는 TXT 파일만 등록할 수 있습니다.\n\n${unsupported.join('\n')}`,
+        );
+        return;
+      }
+
+      console.log('✅ 파일 선택됨:', supported.map((item: any) => item.name));
+
+      // 읽던 중이던 Reader가 있다면 최신 위치를 먼저 확정 저장한 뒤 등록을 시작한다.
+      await flushActiveReaderSession('background');
 
       const operationId = beginFileRegistrationOperation();
-      setIsUploading(true);
-      try {
-        // 🔵 서버 API로 중복 체크
-        console.log('🔎 중복 체크 중:', file.name);
-        const checkRes = await authenticatedFetch(
-          `${BASE_URL}/files/check?title=${encodeURIComponent(file.name)}&path=${currentFolder}`,
-          { signal: fileRegistrationAbortRef.current?.signal },
-          deviceId ?? undefined
-        );
-        const { exists } = await checkRes.json();
-        if (!isCurrentFileRegistration(operationId)) return;
-        
-        console.log('✓ 중복 체크 완료:', { exists, fileName: file.name });
-        
-        if (exists) {
-          // 중복 파일일 경우 모달 표시 (로딩 끄고)
-          console.log('⚠️ 중복 파일 발견, 모달 표시');
-          setIsUploading(false);
-          setDuplicateFileName(file.name);
-          setPendingFile(file);
-          setPendingFileAction({ openAfterSave: false, operationId });
-          setDuplicateModalVisible(true);
-          return;
-        }
-
-        // 중복이 아니면 바로 추가
-        console.log('➕ 새 파일 추가 시작');
-        await addFileToSystem(file, undefined, operationId);
-        console.log('✅ 파일 추가 완료');
-      } catch (e) {
-        if (!isCurrentFileRegistration(operationId)) return;
-        console.error('❌ 파일 추가 중 오류:', e);
-        Alert.alert('파일 추가 실패', String(e));
-      } finally {
-        if (isCurrentFileRegistration(operationId)) setIsUploading(false);
-      }
+      await registerPickedFiles(supported, unsupported, operationId);
     } catch (e) {
       console.error('❌ pickFile 오류:', e);
       Alert.alert('오류', String(e));
     }
+  };
+
+  // 1단계: 선택한 파일들을 앱 저장소로 먼저 복사하고 중복 여부를 확인한다.
+  // 파일 선택기가 넘겨주는 캐시 복사본은 수십 초 안에 시스템이 지울 수 있으므로,
+  // 중복 확인 팝업을 띄우기 전에 우리 저장소로 옮겨 둬야 안전하다.
+  const registerPickedFiles = async (
+    files: any[],
+    unsupported: string[],
+    operationId: number,
+  ) => {
+    setUploadProgress(files.length > 1 ? { done: 0, total: files.length } : null);
+    setIsUploading(true);
+
+    const prepared: PreparedPick[] = [];
+    const failed: string[] = [];
+
+    try {
+      for (let index = 0; index < files.length; index += 1) {
+        if (!isCurrentFileRegistration(operationId)) {
+          await discardPreparedPicks(prepared);
+          return;
+        }
+
+        const file = files[index];
+        if (files.length > 1) setUploadProgress({ done: index, total: files.length });
+
+        // 파일 단위로 독립 처리한다. 하나가 실패해도 나머지는 계속 진행한다.
+        let managedPath = "";
+        try {
+          managedPath = await createManagedFileUri(file.name);
+          await FileSystem.copyAsync({ from: file.uri, to: managedPath });
+
+          console.log('🔎 중복 체크 중:', file.name);
+          const checkRes = await authenticatedFetch(
+            `${BASE_URL}/files/check?title=${encodeURIComponent(file.name)}&path=${currentFolder}`,
+            { signal: fileRegistrationAbortRef.current?.signal },
+            deviceId ?? undefined
+          );
+          const checkJson = await checkRes.json();
+          prepared.push({ file, managedPath, exists: Boolean(checkJson?.exists) });
+        } catch (e) {
+          if (managedPath) {
+            await FileSystem.deleteAsync(managedPath, { idempotent: true }).catch(() => {});
+          }
+          if (!isCurrentFileRegistration(operationId)) {
+            await discardPreparedPicks(prepared);
+            return;
+          }
+          console.error('❌ 파일 준비 실패:', file.name, e);
+          if (files.length === 1) Alert.alert('파일 추가 실패', String(e));
+          failed.push(file.name);
+        }
+      }
+    } finally {
+      // 중복을 물어보는 동안에는 기존 단일 등록과 동일하게 오버레이를 내린다.
+      if (isCurrentFileRegistration(operationId) && prepared.some((item) => item.exists)) {
+        setIsUploading(false);
+        setUploadProgress(null);
+      }
+    }
+
+    if (!isCurrentFileRegistration(operationId)) {
+      await discardPreparedPicks(prepared);
+      return;
+    }
+
+    const newFiles = prepared.filter((item) => !item.exists);
+    const duplicates = prepared.filter((item) => item.exists);
+
+    if (duplicates.length > 0) {
+      setDuplicateFileName(duplicates[0].file.name);
+      setPendingDuplicateFiles(duplicates);
+      pendingPreparedPicksRef.current = [...newFiles, ...duplicates];
+      setPendingFile(null);
+      setPendingFileAction({ openAfterSave: false, operationId });
+      setPendingBatchSummary({ newFiles, failed, unsupported, total: files.length });
+      setDuplicateModalVisible(true);
+      return;
+    }
+
+    const result = await registerFilesSequentially(newFiles, operationId);
+    if (!isCurrentFileRegistration(operationId)) return;
+    reportRegistrationSummary({
+      added: result.added,
+      failed: [...failed, ...result.failed],
+      skipped: [],
+      unsupported,
+      total: files.length,
+    });
+  };
+
+  // 등록하지 않기로 한 복사본은 앱 저장소에 남기지 않는다.
+  const discardPreparedPicks = async (items: PreparedPick[]) => {
+    for (const item of items) {
+      await FileSystem.deleteAsync(item.managedPath, { idempotent: true }).catch(() => {});
+    }
+  };
+  discardPreparedPicksRef.current = discardPreparedPicks;
+
+  // 2단계: 실제 등록(미리보기 추출 + 서버 저장)은 한 개씩 순차로 한다.
+  // 대용량 EPUB 파싱(JSZip)이 겹치면 메모리가 급증하므로 병렬로 돌리지 않는다.
+  const registerFilesSequentially = async (items: PreparedPick[], operationId: number) => {
+    const added: string[] = [];
+    const failed: string[] = [];
+    if (items.length === 0) return { added, failed };
+
+    const isBatch = items.length > 1;
+    batchRegistrationRef.current = isBatch;
+    setUploadProgress(isBatch ? { done: 0, total: items.length } : null);
+    setIsUploading(true);
+
+    try {
+      for (let index = 0; index < items.length; index += 1) {
+        if (!isCurrentFileRegistration(operationId)) return { added, failed };
+        if (isBatch) setUploadProgress({ done: index, total: items.length });
+
+        const item = items[index];
+        const saved = await addFileToSystem(
+          item.file,
+          undefined,
+          operationId,
+          item.managedPath,
+        );
+        if (!isCurrentFileRegistration(operationId)) return { added, failed };
+        if (saved) added.push(item.file.name);
+        else failed.push(item.file.name);
+      }
+      if (isBatch) setUploadProgress({ done: items.length, total: items.length });
+    } finally {
+      // 등록 도중 사용자가 다시 "+"를 눌러 새 작업이 시작됐다면
+      // 이 작업의 뒷정리가 새 작업의 상태를 덮어쓰지 않게 한다.
+      if (isCurrentFileRegistration(operationId)) {
+        batchRegistrationRef.current = false;
+        setIsUploading(false);
+        setUploadProgress(null);
+      }
+    }
+
+    return { added, failed };
+  };
+
+  // 등록 결과 안내. 파일 하나만 문제없이 등록한 경우에는 기존처럼 조용히 끝낸다.
+  const reportRegistrationSummary = (result: {
+    added: string[];
+    failed: string[];
+    skipped: string[];
+    unsupported: string[];
+    total: number;
+  }) => {
+    const { added, failed, skipped, unsupported, total } = result;
+    // 지원 파일을 하나만 고른 경우는 기존 단일 등록 흐름 그대로(개별 알림/모달)로 끝낸다.
+    if (total <= 1 && unsupported.length === 0) return;
+
+    const lines = [`${added.length}개 등록`];
+    if (skipped.length > 0) lines.push(`중복 ${skipped.length}개 제외`);
+    if (failed.length > 0) lines.push(`실패 ${failed.length}개: ${failed.join(', ')}`);
+    if (unsupported.length > 0) {
+      lines.push(`지원하지 않는 형식 ${unsupported.length}개: ${unsupported.join(', ')}`);
+    }
+
+    Alert.alert('파일 등록 결과', lines.join('\n'));
   };
 
   // 실제 파일 추가 로직을 별도 함수로 분리 (isUploading은 호출자가 관리)
@@ -1010,10 +1197,12 @@ export default function Home() {
     file: any,
     targetFolder?: string,
     operationId = fileRegistrationOperationIdRef.current,
+    preparedPath?: string,
   ) => {
     console.log('📝 addFileToSystem 호출:', { fileName: file.name, uri: file.uri, targetFolder, currentFolder });
     if (!isCurrentFileRegistration(operationId)) return null;
-    setIsUploading(true);
+    // 여러 개 등록 중에는 호출자(루프)가 오버레이를 관리한다.
+    if (!batchRegistrationRef.current) setIsUploading(true);
     let managedPath = "";
     let savedToServer = false;
     
@@ -1022,14 +1211,20 @@ export default function Home() {
       const displayName = file.name;
       const title = displayName;
 
-      managedPath = await createManagedFileUri(displayName);
-      console.log('📂 파일 복사 시작:', { displayName, title, targetPath: managedPath });
+      // 이미 앱 저장소로 복사해 둔 파일이면 다시 복사하지 않는다.
+      if (preparedPath) {
+        managedPath = preparedPath;
+        console.log('📂 복사된 파일 사용:', { displayName, title, targetPath: managedPath });
+      } else {
+        managedPath = await createManagedFileUri(displayName);
+        console.log('📂 파일 복사 시작:', { displayName, title, targetPath: managedPath });
 
-      // 앱 전용 영구 폴더로 복사한 URI를 서버에도 저장한다.
-      await FileSystem.copyAsync({
-        from: file.uri,
-        to: managedPath,
-      });
+        // 앱 전용 영구 폴더로 복사한 URI를 서버에도 저장한다.
+        await FileSystem.copyAsync({
+          from: file.uri,
+          to: managedPath,
+        });
+      }
       if (!isCurrentFileRegistration(operationId)) {
         await FileSystem.deleteAsync(managedPath, { idempotent: true });
         return null;
@@ -1126,10 +1321,13 @@ export default function Home() {
       }
       if (!isCurrentFileRegistration(operationId)) return null;
       console.error('❌ addFileToSystem 오류:', e);
-      Alert.alert('파일 추가 실패', String(e));
+      // 여러 개 등록 중에는 파일마다 알림을 띄우지 않고 마지막 요약에서 한 번에 알린다.
+      if (!batchRegistrationRef.current) Alert.alert('파일 추가 실패', String(e));
       return null;
     } finally {
-      if (isCurrentFileRegistration(operationId)) setIsUploading(false);
+      if (!batchRegistrationRef.current && isCurrentFileRegistration(operationId)) {
+        setIsUploading(false);
+      }
     }
   };
 
@@ -1985,12 +2183,36 @@ export default function Home() {
     <DuplicateConfirmModal
       visible={duplicateModalVisible}
       fileName={duplicateFileName}
+      fileNames={pendingDuplicateFiles.map((item) => String(item.file?.name ?? ""))}
       onConfirm={async () => {
         const file = pendingFile;
         const action = pendingFileAction;
+        const duplicateFiles = pendingDuplicateFiles;
+        const batchSummary = pendingBatchSummary;
         setDuplicateModalVisible(false);
         setPendingFile(null);
         setPendingFileAction(null);
+        setPendingDuplicateFiles([]);
+        setPendingBatchSummary(null);
+        pendingPreparedPicksRef.current = [];
+
+        // 파일 선택에서 모아둔 중복 파일들: 확인하면 신규 파일과 함께 순차 등록한다.
+        if (duplicateFiles.length > 0 && action) {
+          if (!isCurrentFileRegistration(action.operationId)) return;
+          const result = await registerFilesSequentially(
+            [...(batchSummary?.newFiles ?? []), ...duplicateFiles],
+            action.operationId,
+          );
+          if (!isCurrentFileRegistration(action.operationId)) return;
+          reportRegistrationSummary({
+            added: result.added,
+            failed: [...(batchSummary?.failed ?? []), ...result.failed],
+            skipped: [],
+            unsupported: batchSummary?.unsupported ?? [],
+            total: batchSummary?.total ?? duplicateFiles.length,
+          });
+          return;
+        }
 
         try {
           if (file && action && isCurrentFileRegistration(action.operationId)) {
@@ -2032,9 +2254,35 @@ export default function Home() {
             pendingExternalRegistrationRef.current = null;
           }
         }
+        const duplicateFiles = pendingDuplicateFiles;
+        const batchSummary = pendingBatchSummary;
+        const pendingAction = pendingFileAction;
         setDuplicateModalVisible(false);
         setPendingFile(null);
         setPendingFileAction(null);
+        setPendingDuplicateFiles([]);
+        setPendingBatchSummary(null);
+        pendingPreparedPicksRef.current = [];
+
+        // 중복만 건너뛰고 나머지 신규 파일은 그대로 등록한다.
+        if (duplicateFiles.length > 0 && pendingAction) {
+          void (async () => {
+            // 추가하지 않기로 한 중복 파일의 복사본은 지운다.
+            await discardPreparedPicks(duplicateFiles);
+            const result = await registerFilesSequentially(
+              batchSummary?.newFiles ?? [],
+              pendingAction.operationId,
+            );
+            if (!isCurrentFileRegistration(pendingAction.operationId)) return;
+            reportRegistrationSummary({
+              added: result.added,
+              failed: [...(batchSummary?.failed ?? []), ...result.failed],
+              skipped: duplicateFiles.map((item) => String(item.file?.name ?? "")),
+              unsupported: batchSummary?.unsupported ?? [],
+              total: batchSummary?.total ?? duplicateFiles.length,
+            });
+          })();
+        }
       }}
     />
 
@@ -2219,7 +2467,11 @@ export default function Home() {
           minWidth: 200,
         }}>
           <ActivityIndicator size="large" color="#4A90E2" />
-          <Text style={{ fontSize: 16, fontWeight: "600", color: "#333" }}>파일 등록 중...</Text>
+          <Text style={{ fontSize: 16, fontWeight: "600", color: "#333" }}>
+            {uploadProgress
+              ? `파일 등록 중... (${Math.min(uploadProgress.done + 1, uploadProgress.total)} / ${uploadProgress.total})`
+              : "파일 등록 중..."}
+          </Text>
           <Text style={{ fontSize: 13, color: "#888", textAlign: "center" }}>잠시만 기다려 주세요</Text>
         </View>
       </View>
