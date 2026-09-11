@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  BackHandler,
   FlatList,
   Modal,
   RefreshControl,
@@ -340,7 +341,7 @@ export default function Home() {
       ? [...locationPageFiles, ...extraFiles]
       : [...page0Files, ...extraFiles];
   const folders: any[] = foldersData ?? [];
-  const allFolders: any[] = allFoldersData ?? [];
+  const allFolders: any[] = useMemo(() => allFoldersData ?? [], [allFoldersData]);
 
   // hasMore 동기화 (queryFn 바깥에서 side effect 처리)
   useEffect(() => {
@@ -393,6 +394,29 @@ export default function Home() {
     console.log("🗺️ 최종 경로:", path.map(p => p.name).join(" > "));
     return path;
   }, [currentFolder, allFolders]);
+
+  const moveToFolder = useCallback((folderId: string | number, locateId = "") => {
+    router.setParams({
+      folder: String(folderId || "root"),
+      locateFileId: locateId,
+    });
+  }, [router]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (currentFolder === "root") return;
+
+      const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+        const current = allFolders.find(
+          (candidate) => String(candidate.id) === currentFolder,
+        );
+        moveToFolder(current?.path || "root");
+        return true;
+      });
+
+      return () => subscription.remove();
+    }, [allFolders, currentFolder, moveToFolder]),
+  );
 
   // ========== 4. 모든 useEffect ==========
   useEffect(() => {
@@ -1567,11 +1591,7 @@ export default function Home() {
               <View key={item.id} style={{ flexDirection: "row", alignItems: "center" }}>
                 <TouchableOpacity
                   onPress={() => {
-                    if (item.id === "root") {
-                      router.push({ pathname: "/" });
-                    } else {
-                      router.push({ pathname: "/", params: { folder: item.id } });
-                    }
+                    moveToFolder(item.id);
                   }}
                   style={{ flexDirection: "row", alignItems: "center" }}
                 >
@@ -1638,7 +1658,7 @@ export default function Home() {
                   if (isSelectMode) {
                     toggleSelectFolder(folder.id);
                   } else {
-                    router.push({ pathname: "/", params: { folder: String(folder.id) } });
+                    moveToFolder(folder.id);
                   }
                 }}
                 onLongPress={() => {
@@ -2067,13 +2087,7 @@ export default function Home() {
         setIsSearching(false);
         
         // 파일이 있는 폴더로 이동한 뒤, 대상 파일이 포함된 페이지까지 불러와 카드로 스크롤한다.
-        router.push({
-          pathname: "/",
-          params: {
-            folder: selectedFile.path || "root",
-            locateFileId: String(selectedFile.id),
-          },
-        });
+        moveToFolder(selectedFile.path || "root", String(selectedFile.id));
       }}
       onClose={() => setFileOptionsVisible(false)}
     />

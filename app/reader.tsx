@@ -20,6 +20,7 @@ import {
   Pressable,
   StatusBar,
   StyleSheet,
+  Switch,
   Text,
   TouchableOpacity,
   useWindowDimensions,
@@ -99,6 +100,7 @@ interface ReaderSettings {
   bgColor: string;
   textColor: string;
   fontFamily: string;
+  usePublisherFont: boolean;
   brightness: number;
   lineSpacing: number;   // 줄 간격 배수 (1.2 ~ 2.5)
   sidePadding: number;  // 좌우 여백 px (8 ~ 60)
@@ -118,6 +120,7 @@ interface TxtPendingNavigation {
   localOffset: number;
   lineTopInset: number;
   viewPosition: number;
+  attempts: number;
 }
 
 interface TxtRenderChunk {
@@ -141,6 +144,7 @@ const DEFAULT_SETTINGS: ReaderSettings = {
   bgColor: "#f5f0e6",
   textColor: "#333333",
   fontFamily: "default",
+  usePublisherFont: false,
   brightness: 1.0,
   lineSpacing: 1.9,
   sidePadding: 24,
@@ -163,6 +167,11 @@ const TXT_RENDER_CHUNK_SIZE = 4000;
 const TXT_SEARCH_SCAN_CHUNK_SIZE = 250000;
 const READER_SEARCH_RESULT_LIMIT = 100;
 const TXT_SCROLL_UI_UPDATE_INTERVAL_MS = 100;
+// 목표 구간이 렌더될 때까지 측정값 기반으로 다시 시도하는 최대 횟수
+const TXT_NAVIGATION_MAX_ATTEMPTS = 12;
+// 이어읽기 복원이 "도착했다"고 볼 문자 오차(한 줄 남짓)와 재정렬 상한
+const TXT_RESUME_SETTLE_TOLERANCE = 300;
+const TXT_RESUME_SETTLE_MAX_ATTEMPTS = 10;
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
 const READER_LOCAL_PROGRESS_KEY_PREFIX = "@reader_position:";
 const EPUB_LOCATIONS_CACHE_KEY_PREFIX = "@reader_epub_locations:";
@@ -178,10 +187,21 @@ interface LocalReaderPosition {
   characterOffset?: number;
   previewCharacterOffset?: number;
   lineTopInset?: number;
-  scrollY?: number;
   layoutSignature?: string;
   updatedAt?: number;
 }
+
+type CanonicalReadingPosition =
+  | {
+      format: "TXT";
+      characterOffset: number;
+      lineTopInset: number;
+    }
+  | {
+      format: "EPUB";
+      cfi: string;
+      anchorRatio: number;
+    };
 
 function escapeSearchPattern(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -201,6 +221,73 @@ function splitSearchExcerpt(excerpt: string, query: string) {
     match: normalized.slice(matchIndex, matchIndex + normalizedQuery.length),
     after: normalized.slice(matchIndex + normalizedQuery.length),
   };
+}
+
+// 한 구간이 몇 줄로 그려질지 추정한다.
+// 구간은 각각 독립된 <Text>로 렌더되므로 줄바꿈 계산도 구간 단위로 끊어진다.
+// 본문 스타일에는 여백이 없어서 구간 높이 = 줄 수 × lineHeight 로 정확히 대응한다.
+function estimateTxtChunkLines(
+  text: string,
+  start: number,
+  end: number,
+  unitsPerLine: number,
+): number {
+  if (end <= start) return 1;
+
+  let lines = 0;
+  let units = 0;
+  for (let index = start; index < end; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 10) {
+      lines += Math.max(1, Math.ceil(units / unitsPerLine));
+      units = 0;
+      continue;
+    }
+    // 한글/한자 등은 전각, 영문·숫자·공백은 반각으로 폭을 근사한다.
+    units += code < 0x1100 ? 0.5 : 1;
+  }
+  lines += Math.max(1, Math.ceil(units / unitsPerLine));
+
+  return Math.max(1, lines);
+}
+
+// 화면에서 내려간 셀의 y는 더 이상 현재 목록 좌표계의 값이 아니다.
+// 언마운트될 때 측정값을 지워, 옛 좌표가 현재 스크롤 위치를 "포함"한다고
+// 오인해 엉뚱한 구간을 현재 위치로 보고하는 것을 막는다.
+function TxtCell({
+  index,
+  style,
+  onLayout,
+  onMeasuredRef,
+  onUnmountRef,
+  children,
+}: {
+  index?: number;
+  style?: any;
+  onLayout?: (event: any) => void;
+  onMeasuredRef: React.RefObject<(index: number, layout: TxtItemLayout) => void>;
+  onUnmountRef: React.RefObject<(index: number) => void>;
+  children?: React.ReactNode;
+}) {
+  useEffect(() => {
+    if (typeof index !== "number") return;
+    return () => onUnmountRef.current?.(index);
+  }, [index, onUnmountRef]);
+
+  return (
+    <View
+      style={style}
+      onLayout={(event) => {
+        onLayout?.(event);
+        if (typeof index !== "number") return;
+        const { y, height } = event.nativeEvent.layout;
+        if (!(height > 0)) return;
+        onMeasuredRef.current?.(index, { y, height });
+      }}
+    >
+      {children}
+    </View>
+  );
 }
 
 function splitTextIntoRenderChunks(text: string): TxtRenderChunk[] {
@@ -300,6 +387,7 @@ export default function ReaderScreen() {
   // txt 전용 스크롤 정보
   const scrollRef = useRef<FlatList<TxtRenderChunk>>(null);
   const [viewHeight, setViewHeight] = useState(1);
+  const [txtLayoutModelVersion, setTxtLayoutModelVersion] = useState(0);
   const [txtContentHeight, setTxtContentHeight] = useState(1);
   const viewHeightRef = useRef(1);
   const txtContentHeightRef = useRef(1);
@@ -312,24 +400,48 @@ export default function ReaderScreen() {
   const currentTxtCharOffsetRef = useRef(0);
   const currentTxtPreviewCharOffsetRef = useRef(0);
   const currentTxtLineTopInsetRef = useRef(0);
+  const canonicalReadingPositionRef = useRef<CanonicalReadingPosition | null>(null);
+  const previousTxtLayoutSignatureRef = useRef<string | null>(null);
+  const pendingTxtRelayoutAnchorRef = useRef<{
+    characterOffset: number;
+    lineTopInset: number;
+  } | null>(null);
   const txtVisibleChunkIndexRef = useRef(0);
   const txtItemLayoutsRef = useRef<Record<number, TxtItemLayout>>({});
   const txtLineMetricsRef = useRef<Record<number, TxtLineMetric[]>>({});
-  const txtPaginationSamplesRef = useRef<Record<number, { characters: number; height: number }>>({});
-  const txtPaginationLockedRef = useRef(false);
+  // 현재 레이아웃에서 문서 전체가 몇 px인지에 대한 단 하나의 모델.
+  // FlatList(getItemLayout), 슬라이더 이동, 이어읽기, 페이지 수가 모두 이 모델을 공유한다.
+  const txtLayoutModelRef = useRef<{
+    offsets: Float64Array;   // 구간별 시작 y (prefix sum)
+    lineHeight: number;
+    unitsPerLine: number;
+    totalHeight: number;
+  } | null>(null);
+  const txtMeasuredLineCountsRef = useRef<Record<number, number>>({});
+  const txtModelCalibratedRef = useRef(false);
+  const rebuildTxtLayoutModelRef = useRef<(calibrate: boolean) => void>(() => {});
+  const refreshTxtPaginationRef = useRef<() => void>(() => {});
   const txtTotalPagesRef = useRef(1);
-  const txtPixelsPerCharacterRef = useRef(1);
   const lastTxtScrollUiUpdateAtRef = useRef(0);
   const txtNavigationIdRef = useRef(0);
   const pendingTxtNavigationRef = useRef<TxtPendingNavigation | null>(null);
   const isTxtProgrammaticNavigationRef = useRef(false);
-  const completeTxtNavigationRef = useRef<(chunkIndex: number) => void>(() => {});
+  const txtNavigationRetryScheduledRef = useRef(false);
+  // 이어읽기 복원 전용: 목표 문자 위치에 "실제로" 도착할 때까지 확인한다.
+  const txtResumeSettleRef = useRef<{
+    characterOffset: number;
+    lineTopInset: number;
+    attempts: number;
+  } | null>(null);
+  const onTxtChunkMeasuredRef = useRef<(chunkIndex: number) => void>(() => {});
+  const txtCellMeasuredRef = useRef<(index: number, layout: TxtItemLayout) => void>(() => {});
+  const txtCellUnmountRef = useRef<(index: number) => void>(() => {});
+  const scheduleTxtNavigationRetryRef = useRef<() => void>(() => {});
   const navigateTxtToCharacterOffsetRef = useRef<(
     offset: number,
     viewPosition?: number,
     alignToMeasuredLine?: boolean,
     lineTopInset?: number,
-    revealWhenAligned?: boolean,
   ) => void>(() => {});
   const updateTxtReadingPreviewRef = useRef<() => void>(() => {});
   const recordedReadFileIdRef = useRef("");
@@ -386,6 +498,13 @@ export default function ReaderScreen() {
     resolve: () => void;
     timer: ReturnType<typeof setTimeout>;
   } | null>(null);
+  const [sliderPreviewValue, setSliderPreviewValue] = useState<number | null>(null);
+  const sliderDraggingRef = useRef(false);
+  const sliderPendingValueRef = useRef<number | null>(null);
+  const sliderThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSliderSeekAtRef = useRef(0);
+  const sliderSeekRequestIdRef = useRef(0);
+  const sliderFinalRequestIdRef = useRef<number | null>(null);
 
   // ===== 리더 설정 =====
   const [settings, setSettings] = useState<ReaderSettings>(DEFAULT_SETTINGS);
@@ -533,7 +652,9 @@ export default function ReaderScreen() {
     AsyncStorage.getItem(SETTINGS_KEY)
       .then((val) => {
         if (val) {
-          try { setSettings(JSON.parse(val)); } catch {}
+          try {
+            setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(val) });
+          } catch {}
         }
       })
       .finally(() => setReaderSettingsLoaded(true));
@@ -545,28 +666,60 @@ export default function ReaderScreen() {
     AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   }, [readerSettingsLoaded, settings]);
 
+  // 줄바꿈에 실제로 영향을 주는 값만 서명에 넣는다. 뷰포트 높이는 줄 나눔이 아니라
+  // 페이지 환산에만 쓰이므로 제외한다. (상/하단 UI 토글로 시스템 바가 접혔다 펴질 때
+  // 본문 셀이 통째로 다시 마운트되면서 측정값과 읽던 위치가 초기화되는 것을 막는다.)
   const txtLayoutSignature = [
     settings.fontSize,
     settings.fontFamily,
     settings.lineSpacing,
     settings.sidePadding,
     Math.round(windowWidth),
-    Math.round(viewHeight),
   ].join(":");
 
   useLayoutEffect(() => {
     if (isEpub) return;
-    const availableWidth = Math.max(120, windowWidth - settings.sidePadding * 2);
-    const averageGlyphWidth = Math.max(1, settings.fontSize * 0.72);
-    const estimatedCharactersPerLine = Math.max(1, availableWidth / averageGlyphWidth);
-    txtPixelsPerCharacterRef.current =
-      (settings.fontSize * settings.lineSpacing) / estimatedCharactersPerLine;
+    const previousSignature = previousTxtLayoutSignatureRef.current;
+    const layoutChanged = previousSignature != null
+      && previousSignature !== txtLayoutSignature
+      && rawTextRef.current.length > 0;
+
+    if (layoutChanged) {
+      const currentAnchor = canonicalReadingPositionRef.current;
+      pendingTxtRelayoutAnchorRef.current = currentAnchor?.format === "TXT"
+        ? {
+            characterOffset: currentAnchor.characterOffset,
+            lineTopInset: currentAnchor.lineTopInset,
+          }
+        : {
+            characterOffset: currentTxtCharOffsetRef.current,
+            lineTopInset: currentTxtLineTopInsetRef.current,
+          };
+      // 새 레이아웃의 초기 scroll 이벤트가 기존 pixel offset을 본문 위치로
+      // 오인하지 못하게, 문자 앵커 재정렬이 끝날 때까지 scroll 보고를 차단한다.
+      isTxtProgrammaticNavigationRef.current = true;
+    }
+    previousTxtLayoutSignatureRef.current = txtLayoutSignature;
     txtItemLayoutsRef.current = {};
     txtLineMetricsRef.current = {};
-    txtPaginationSamplesRef.current = {};
-    txtPaginationLockedRef.current = false;
-    txtTotalPagesRef.current = 1;
-    setTotalPages(1);
+    // 줄 나눔 모델은 폰트/자간/여백/폭에 종속이므로 새 레이아웃에서 다시 세운다.
+    // 우선 이론값으로 바로 세우고, 실제 측정이 들어오면 한 번 보정한다.
+    txtMeasuredLineCountsRef.current = {};
+    txtModelCalibratedRef.current = false;
+    rebuildTxtLayoutModelRef.current(false);
+
+    if (layoutChanged) {
+      requestAnimationFrame(() => {
+        const anchor = pendingTxtRelayoutAnchorRef.current;
+        if (!anchor) return;
+        navigateTxtToCharacterOffsetRef.current(
+          anchor.characterOffset,
+          0,
+          true,
+          anchor.lineTopInset,
+        );
+      });
+    }
   }, [
     content.length,
     isEpub,
@@ -586,10 +739,11 @@ export default function ReaderScreen() {
       textColor: settings.textColor,
       fontSize: settings.fontSize,
       fontFamily: settings.fontFamily,
+      usePublisherFont: settings.usePublisherFont,
       lineSpacing: settings.lineSpacing,
       sidePadding: settings.sidePadding,
     }));
-  }, [settings]);
+  }, [epubReady, isEpub, settings]);
 
 
   useEffect(() => {
@@ -621,11 +775,21 @@ export default function ReaderScreen() {
     setSearchError(null);
     setTxtSearchTarget(null);
     setEpubSearchHighlightActive(false);
+    setSliderPreviewValue(null);
+    sliderDraggingRef.current = false;
+    sliderPendingValueRef.current = null;
+    sliderFinalRequestIdRef.current = null;
+    if (sliderThrottleTimerRef.current) {
+      clearTimeout(sliderThrottleTimerRef.current);
+      sliderThrottleTimerRef.current = null;
+    }
     txtNavigationIdRef.current += 1;
     pendingTxtNavigationRef.current = null;
     isTxtProgrammaticNavigationRef.current = false;
+    txtResumeSettleRef.current = null;
     setLastCfi(null);
     lastCfiRef.current = null;
+    canonicalReadingPositionRef.current = null;
     lastWebPercentRef.current = null;
     epubStartedRef.current = false;
     epubStartedCfiRef.current = null;
@@ -741,11 +905,19 @@ export default function ReaderScreen() {
           currentTxtCharOffsetRef.current = 0;
           currentTxtPreviewCharOffsetRef.current = 0;
           currentTxtLineTopInsetRef.current = 0;
+          canonicalReadingPositionRef.current = {
+            format: "TXT",
+            characterOffset: 0,
+            lineTopInset: 0,
+          };
+          previousTxtLayoutSignatureRef.current = null;
+          pendingTxtRelayoutAnchorRef.current = null;
           txtVisibleChunkIndexRef.current = 0;
           txtItemLayoutsRef.current = {};
           txtLineMetricsRef.current = {};
-          txtPaginationSamplesRef.current = {};
-          txtPaginationLockedRef.current = false;
+          txtLayoutModelRef.current = null;
+          txtMeasuredLineCountsRef.current = {};
+          txtModelCalibratedRef.current = false;
           txtTotalPagesRef.current = 1;
           setTxtSearchTarget(null);
           currentReadingPreviewRef.current = "";
@@ -767,11 +939,17 @@ export default function ReaderScreen() {
           currentTxtCharOffsetRef.current = 0;
           currentTxtPreviewCharOffsetRef.current = 0;
           currentTxtLineTopInsetRef.current = 0;
+          canonicalReadingPositionRef.current = {
+            format: "TXT",
+            characterOffset: 0,
+            lineTopInset: 0,
+          };
           txtVisibleChunkIndexRef.current = 0;
           txtItemLayoutsRef.current = {};
           txtLineMetricsRef.current = {};
-          txtPaginationSamplesRef.current = {};
-          txtPaginationLockedRef.current = false;
+          txtLayoutModelRef.current = null;
+          txtMeasuredLineCountsRef.current = {};
+          txtModelCalibratedRef.current = false;
           txtTotalPagesRef.current = 1;
           currentReadingPreviewRef.current = "";
           setContent(chunks);
@@ -825,7 +1003,6 @@ export default function ReaderScreen() {
   const initialProgressRef = useRef<number>(0); // saveProgressToServer에서 사용
   const initialTxtCharOffsetRef = useRef<number | null>(null);
   const initialTxtLineTopInsetRef = useRef(0);
-  const initialTxtScrollYRef = useRef<number | null>(null);
   const initialTxtLayoutSignatureRef = useRef<string | null>(null);
   const [initialEpubLocationsCache, setInitialEpubLocationsCache] = useState<string | null>(null);
   const [epubLocationsCacheLoaded, setEpubLocationsCacheLoaded] = useState(false);
@@ -869,7 +1046,6 @@ export default function ReaderScreen() {
   initialProgressRef.current = 0;
   initialTxtCharOffsetRef.current = null;
   initialTxtLineTopInsetRef.current = 0;
-  initialTxtScrollYRef.current = null;
   initialTxtLayoutSignatureRef.current = null;
   setProgress(0);
   progressRef.current = 0;
@@ -936,9 +1112,6 @@ export default function ReaderScreen() {
         if (Number.isFinite(latestLocalPosition?.lineTopInset)) {
           initialTxtLineTopInsetRef.current = Math.max(0, Number(latestLocalPosition?.lineTopInset));
         }
-        if (Number.isFinite(latestLocalPosition?.scrollY)) {
-          initialTxtScrollYRef.current = Math.max(0, Number(latestLocalPosition?.scrollY));
-        }
         if (typeof latestLocalPosition?.layoutSignature === "string") {
           initialTxtLayoutSignatureRef.current = latestLocalPosition.layoutSignature;
         }
@@ -957,6 +1130,11 @@ export default function ReaderScreen() {
         const restoredCfi = localEpubCfi || fileInfo.epubCfi;
         setInitialCfi(restoredCfi);
         lastCfiRef.current = restoredCfi;
+        canonicalReadingPositionRef.current = {
+          format: "EPUB",
+          cfi: restoredCfi,
+          anchorRatio: lastAnchorRatioRef.current,
+        };
         console.log(`✅ [복원] ${localEpubCfi ? "로컬" : "서버"} CFI 로드:`, restoredCfi.slice(0, 80));
       } else if (!shouldResetProgress && fileInfo.epubCfi) {
         console.log("⚠️ CFI가 문자열이 아님, 무시:", typeof fileInfo.epubCfi);
@@ -970,6 +1148,12 @@ export default function ReaderScreen() {
         : fileInfo.anchorRatio;
       if (!shouldResetProgress && typeof restoredAnchorRatio === 'number' && restoredAnchorRatio > 0) {
         lastAnchorRatioRef.current = restoredAnchorRatio;
+        if (canonicalReadingPositionRef.current?.format === "EPUB") {
+          canonicalReadingPositionRef.current = {
+            ...canonicalReadingPositionRef.current,
+            anchorRatio: restoredAnchorRatio,
+          };
+        }
         console.log("✅ [복원] anchorRatio 로드:", restoredAnchorRatio);
       }
       if (epubOpenStartedAtRef.current > 0) {
@@ -992,9 +1176,6 @@ export default function ReaderScreen() {
         if (Number.isFinite(latestLocalPosition?.lineTopInset)) {
           initialTxtLineTopInsetRef.current = Math.max(0, Number(latestLocalPosition?.lineTopInset));
         }
-        if (Number.isFinite(latestLocalPosition?.scrollY)) {
-          initialTxtScrollYRef.current = Math.max(0, Number(latestLocalPosition?.scrollY));
-        }
         if (typeof latestLocalPosition?.layoutSignature === "string") {
           initialTxtLayoutSignatureRef.current = latestLocalPosition.layoutSignature;
         }
@@ -1003,9 +1184,20 @@ export default function ReaderScreen() {
         if (typeof readerLocalPosition.epubCfi === "string") {
           setInitialCfi(readerLocalPosition.epubCfi);
           lastCfiRef.current = readerLocalPosition.epubCfi;
+          canonicalReadingPositionRef.current = {
+            format: "EPUB",
+            cfi: readerLocalPosition.epubCfi,
+            anchorRatio: lastAnchorRatioRef.current,
+          };
         }
         if (typeof readerLocalPosition.anchorRatio === "number" && readerLocalPosition.anchorRatio > 0) {
           lastAnchorRatioRef.current = readerLocalPosition.anchorRatio;
+          if (canonicalReadingPositionRef.current?.format === "EPUB") {
+            canonicalReadingPositionRef.current = {
+              ...canonicalReadingPositionRef.current,
+              anchorRatio: readerLocalPosition.anchorRatio,
+            };
+          }
         }
         if (typeof readerLocalPosition.readingPreview === "string") {
           currentReadingPreviewRef.current = createPreviewText(readerLocalPosition.readingPreview);
@@ -1021,7 +1213,7 @@ export default function ReaderScreen() {
   };
 }, [fileId, BASE_URL, resetProgress, uri]);
 
-// TXT 본문과 저장 위치가 준비되면 문자 오프셋을 기준으로 이어읽기한다.
+// TXT 본문과 저장 위치가 준비되면 저장된 문자 위치를 기준으로 이어읽기한다.
 useEffect(() => {
   if (isEpub) return;
   if (hasResumedRef.current) return;
@@ -1037,24 +1229,39 @@ useEffect(() => {
   const savedProgress = initialProgress;
   if (!savedProgress || savedProgress <= 0) return;
 
-  const timer = setTimeout(() => {
-    const savedCharacterOffset = initialTxtCharOffsetRef.current;
-    const characterOffset = savedCharacterOffset != null
-      ? Math.min(rawTextRef.current.length, Math.max(0, Math.floor(savedCharacterOffset)))
-      : Math.floor(
-          Math.min(1, Math.max(0, savedProgress)) * rawTextRef.current.length,
-        );
-    console.log("📚 TXT 이어읽기 실행! progress:", savedProgress, "characterOffset:", characterOffset);
-    const canRestoreLineInset = initialTxtLayoutSignatureRef.current === txtLayoutSignature;
-    navigateTxtToCharacterOffsetRef.current(
-      characterOffset,
-      0,
-      true,
-      canRestoreLineInset ? initialTxtLineTopInsetRef.current : 0,
-    );
-  }, 80);
+  // progress는 있는데 문자 위치가 0이면 서로 모순된 기록이다.
+  // 이때는 진행률에서 문자 위치를 되돌려 같은 기준으로 복원한다.
+  const savedCharacterOffset = initialTxtCharOffsetRef.current;
+  const characterOffset = savedCharacterOffset != null && savedCharacterOffset > 0
+    ? Math.min(rawTextRef.current.length, Math.floor(savedCharacterOffset))
+    : Math.floor(
+        Math.min(1, Math.max(0, savedProgress)) * rawTextRef.current.length,
+      );
+  // 저장된 scrollY(픽셀)는 그 세션 목록의 추정 좌표계 값이라 다시 재현되지 않는다.
+  // 이어읽기는 슬라이더/스크롤과 똑같이 문자 오프셋만으로 복원한다.
+  // lineTopInset(줄 안에서의 세로 미세 위치)만 같은 레이아웃일 때 함께 복원한다.
+  const hasMatchingLayout = initialTxtLayoutSignatureRef.current === txtLayoutSignature;
 
-  return () => clearTimeout(timer);
+  console.log("[Resume] loaded char=" + characterOffset
+    + " progress=" + savedProgress.toFixed(4)
+    + " sameLayout=" + hasMatchingLayout
+    + " target=\"" + txtSnippetAt(characterOffset) + "\"");
+
+  const restoredLineTopInset = hasMatchingLayout ? initialTxtLineTopInsetRef.current : 0;
+  // 목록이 렌더 창을 넓히는 동안 위치가 밀릴 수 있으므로,
+  // 실제로 이 문자 위치가 화면에 올 때까지 측정값으로 다시 맞춘다.
+  txtResumeSettleRef.current = {
+    characterOffset,
+    lineTopInset: restoredLineTopInset,
+    attempts: 0,
+  };
+
+  navigateTxtToCharacterOffsetRef.current(
+    characterOffset,
+    0,
+    true,
+    restoredLineTopInset,
+  );
 }, [
   content.length,
   fileInfoLoaded,
@@ -1135,6 +1342,7 @@ useEffect(() => {
       textColor: settings.textColor,
       fontSize: settings.fontSize,
       fontFamily: settings.fontFamily,
+      usePublisherFont: settings.usePublisherFont,
       lineSpacing: settings.lineSpacing,
       sidePadding: settings.sidePadding,
       cfi: resetProgress === "true" ? null : (initialCfi || null),
@@ -1149,69 +1357,36 @@ useEffect(() => {
     initialEpubLocationsCache,
     isEpub,
     resetProgress,
+    settings.bgColor,
+    settings.fontFamily,
+    settings.fontSize,
+    settings.lineSpacing,
+    settings.sidePadding,
+    settings.textColor,
+    settings.usePublisherFont,
   ]);
 
 
   // ===================== TXT 쪽 진행도 계산 =====================
-  const renderTxtCell = useCallback((props: any) => {
-    const { index, onLayout, children, style } = props;
+  const renderTxtCell = useCallback((props: any) => (
+    <TxtCell
+      index={props.index}
+      style={props.style}
+      onLayout={props.onLayout}
+      onMeasuredRef={txtCellMeasuredRef}
+      onUnmountRef={txtCellUnmountRef}
+    >
+      {props.children}
+    </TxtCell>
+  ), []);
 
-    return (
-      <View
-        style={style}
-        onLayout={(event) => {
-          onLayout?.(event);
-          if (typeof index !== "number") return;
-
-          const { y, height } = event.nativeEvent.layout;
-          if (!(height > 0)) return;
-          txtItemLayoutsRef.current[index] = { y, height };
-          completeTxtNavigationRef.current(index);
-
-          const chunk = contentRef.current[index];
-          if (!chunk || txtPaginationLockedRef.current) return;
-          txtPaginationSamplesRef.current[index] = {
-            characters: Math.max(0, chunk.end - chunk.start),
-            height,
-          };
-
-          const samples = Object.values(txtPaginationSamplesRef.current);
-          const requiredSamples = Math.min(2, contentRef.current.length);
-          const viewportHeight = viewHeightRef.current;
-          if (samples.length < requiredSamples || viewportHeight <= 1) return;
-
-          const measuredCharacters = samples.reduce(
-            (sum, sample) => sum + sample.characters,
-            0,
-          );
-          const measuredHeight = samples.reduce(
-            (sum, sample) => sum + sample.height,
-            0,
-          );
-          if (measuredCharacters <= 0 || measuredHeight <= 0) return;
-
-          txtPixelsPerCharacterRef.current = measuredHeight / measuredCharacters;
-          const charactersPerPage = measuredCharacters * viewportHeight / measuredHeight;
-          const pages = Math.max(
-            1,
-            Math.ceil(rawTextRef.current.length / Math.max(1, charactersPerPage)),
-          );
-          txtPaginationLockedRef.current = true;
-          txtTotalPagesRef.current = pages;
-          setTotalPages(pages);
-          setCurrentPage(Math.min(
-            pages,
-            Math.max(
-              1,
-              Math.floor(progressRef.current * pages) + 1,
-            ),
-          ));
-        }}
-      >
-        {children}
-      </View>
-    );
-  }, []);
+  txtCellMeasuredRef.current = (index, layout) => {
+    txtItemLayoutsRef.current[index] = layout;
+    onTxtChunkMeasuredRef.current(index);
+  };
+  txtCellUnmountRef.current = (index) => {
+    delete txtItemLayoutsRef.current[index];
+  };
 
   const getRawTextPreviewAtOffset = (characterOffset: number) => {
     const raw = rawTextRef.current;
@@ -1264,21 +1439,6 @@ useEffect(() => {
     });
   };
 
-  const getTxtEstimatedItemLayout = (index: number) => {
-    const chunk = contentRef.current[index];
-    const pixelsPerCharacter = Math.max(0.01, txtPixelsPerCharacterRef.current);
-    const minimumHeight = Math.max(1, settings.fontSize * settings.lineSpacing);
-    if (!chunk) {
-      return { length: minimumHeight, offset: 0, index };
-    }
-
-    return {
-      length: Math.max(minimumHeight, (chunk.end - chunk.start) * pixelsPerCharacter),
-      offset: chunk.start * pixelsPerCharacter,
-      index,
-    };
-  };
-
   const findTxtChunkIndexForOffset = (characterOffset: number) => {
     const chunks = contentRef.current;
     if (chunks.length === 0) return -1;
@@ -1300,6 +1460,125 @@ useEffect(() => {
     return Math.min(chunks.length - 1, Math.max(0, low));
   };
 
+  // ---------- 문서 전체 높이 모델 ----------
+  // FlatList는 아직 그리지 않은 구간의 높이를 모른다. 그래서 getItemLayout이 없으면
+  // 스크롤 가능한 영역 자체가 "이미 그린 만큼"으로 제한되고, 먼 위치로의 이동이
+  // 구조적으로 불가능해진다. 문자 오프셋 하나로 어디든 갈 수 있게 하려면
+  // 문서 전체 좌표계를 우리가 직접 갖고 있어야 한다.
+  const buildTxtLayoutModel = (calibrate: boolean) => {
+    const chunks = contentRef.current;
+    const raw = rawTextRef.current;
+    if (chunks.length === 0 || raw.length === 0) {
+      txtLayoutModelRef.current = null;
+      return;
+    }
+
+    const lineHeight = Math.max(1, settings.fontSize * settings.lineSpacing);
+    const availableWidth = Math.max(
+      40,
+      windowWidth - settings.sidePadding * 2,
+    );
+    // 이론값: 전각 한 글자 폭 ≈ fontSize
+    let unitsPerLine = Math.max(2, availableWidth / Math.max(1, settings.fontSize));
+
+    if (calibrate) {
+      const measuredEntries = Object.entries(txtMeasuredLineCountsRef.current)
+        .map(([index, count]) => [Number(index), count] as const)
+        .filter(([index, count]) => chunks[index] && count > 0);
+
+      if (measuredEntries.length > 0) {
+        const measuredLines = measuredEntries.reduce((sum, [, count]) => sum + count, 0);
+        // 추정 줄 수는 unitsPerLine에 대해 단조 감소하므로 이분 탐색으로 맞춘다.
+        let low = 2;
+        let high = 400;
+        for (let step = 0; step < 40; step += 1) {
+          const middle = (low + high) / 2;
+          let estimated = 0;
+          for (const [index] of measuredEntries) {
+            const chunk = chunks[index];
+            estimated += estimateTxtChunkLines(raw, chunk.start, chunk.end, middle);
+          }
+          if (estimated > measuredLines) low = middle;
+          else high = middle;
+        }
+        unitsPerLine = (low + high) / 2;
+        txtModelCalibratedRef.current = true;
+      }
+    }
+
+    const offsets = new Float64Array(chunks.length + 1);
+    for (let index = 0; index < chunks.length; index += 1) {
+      const measured = txtMeasuredLineCountsRef.current[index];
+      const lines = measured && measured > 0
+        ? measured
+        : estimateTxtChunkLines(raw, chunks[index].start, chunks[index].end, unitsPerLine);
+      offsets[index + 1] = offsets[index] + lines * lineHeight;
+    }
+
+    const previousModel = txtLayoutModelRef.current;
+    txtLayoutModelRef.current = {
+      offsets,
+      lineHeight,
+      unitsPerLine,
+      totalHeight: offsets[chunks.length],
+    };
+
+    // 셀의 y는 "이전 모델 기준"으로 측정된 값이다. 모델이 바뀌면 같은 y가
+    // 다른 구간을 가리키므로, 새로 측정될 때까지 이전 좌표를 버린다.
+    // (버리지 않으면 이어읽기가 옛 좌표계의 y로 스크롤해 엉뚱한 구간에 도착한다)
+    if (previousModel && previousModel.totalHeight !== offsets[chunks.length]) {
+      txtItemLayoutsRef.current = {};
+    }
+    setTxtLayoutModelVersion((version) => version + 1);
+    refreshTxtPaginationRef.current();
+
+    // 모델이 바뀌면 목록의 좌표계 자체가 바뀐다. 스크롤 위치는 위치의 원본이
+    // 아니라 파생값이므로, 지금 읽고 있는 문자 위치를 기준으로 다시 계산한다.
+    const anchor = canonicalReadingPositionRef.current;
+    if (calibrate && hasResumedRef.current && anchor?.format === "TXT") {
+      requestAnimationFrame(() => {
+        navigateTxtToCharacterOffsetRef.current(
+          anchor.characterOffset,
+          0,
+          true,
+          anchor.lineTopInset,
+        );
+      });
+    }
+  };
+  rebuildTxtLayoutModelRef.current = buildTxtLayoutModel;
+
+  const getTxtItemLayout = useCallback((_data: any, index: number) => {
+    const model = txtLayoutModelRef.current;
+    if (!model || index + 1 >= model.offsets.length) {
+      return { length: 0, offset: 0, index };
+    }
+    return {
+      length: model.offsets[index + 1] - model.offsets[index],
+      offset: model.offsets[index],
+      index,
+    };
+  }, []);
+
+  // 페이지 수는 "문서 전체 높이 ÷ 화면 높이"에서 파생되는 표시값이다.
+  // 읽는 위치 자체는 문자 오프셋이므로 페이지 수가 다시 계산돼도 위치는 움직이지 않는다.
+  const refreshTxtPagination = () => {
+    const model = txtLayoutModelRef.current;
+    const viewportHeight = viewHeightRef.current;
+    if (!model || viewportHeight <= 1) return;
+
+    const pages = Math.max(1, Math.ceil(model.totalHeight / viewportHeight));
+    if (pages === txtTotalPagesRef.current) return;
+
+    txtTotalPagesRef.current = pages;
+    setTotalPages(pages);
+    setCurrentPage(Math.min(
+      pages,
+      Math.max(1, Math.floor(progressRef.current * pages) + 1),
+    ));
+  };
+  refreshTxtPaginationRef.current = refreshTxtPagination;
+
   const applyTxtCharacterPosition = (characterOffset: number, progressOverride?: number) => {
     const rawLength = rawTextRef.current.length;
     const clampedOffset = Math.min(
@@ -1312,6 +1591,11 @@ useEffect(() => {
     const pages = Math.max(1, txtTotalPagesRef.current);
 
     currentTxtCharOffsetRef.current = clampedOffset;
+    canonicalReadingPositionRef.current = {
+      format: "TXT",
+      characterOffset: clampedOffset,
+      lineTopInset: currentTxtLineTopInsetRef.current,
+    };
     progressRef.current = nextProgress;
     setProgress(nextProgress);
     setTotalPages(pages);
@@ -1353,18 +1637,109 @@ useEffect(() => {
       layout.y + targetWithinChunk - viewHeightRef.current * pending.viewPosition,
     );
     pendingTxtNavigationRef.current = null;
+    pendingTxtRelayoutAnchorRef.current = null;
     currentScrollYRef.current = targetY;
     currentTxtCharOffsetRef.current = pending.characterOffset;
     scrollTxtToOffset(targetY);
     applyTxtCharacterPosition(pending.characterOffset);
 
     const navigationId = pending.id;
-    setTimeout(() => {
-      if (txtNavigationIdRef.current !== navigationId) return;
-      isTxtProgrammaticNavigationRef.current = false;
-      applyTxtCharacterPosition(pending.characterOffset);
-      updateTxtReadingPreview(currentScrollYRef.current, progressRef.current);
-    }, 80);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (txtNavigationIdRef.current !== navigationId) return;
+        isTxtProgrammaticNavigationRef.current = false;
+        applyTxtCharacterPosition(pending.characterOffset);
+        updateTxtReadingPreview(currentScrollYRef.current, progressRef.current);
+      });
+    });
+  };
+
+  const requestTxtScrollToChunk = (chunkIndex: number, viewPosition: number) => {
+    if (!scrollRef.current) return;
+    try {
+      scrollRef.current.scrollToIndex({
+        index: chunkIndex,
+        animated: false,
+        viewPosition,
+      });
+    } catch {
+      // 목표 구간이 아직 측정되지 않았으면 onScrollToIndexFailed가 처리한다.
+    }
+  };
+
+  // 목표 구간까지 도달하지 못한 채 끝난 이동은 요청값을 그대로 두지 않는다.
+  // 화면에 실제로 보이는 위치를 다시 읽어 canonical position을 맞춘다.
+  const abandonTxtNavigation = () => {
+    pendingTxtNavigationRef.current = null;
+    pendingTxtRelayoutAnchorRef.current = null;
+    isTxtProgrammaticNavigationRef.current = false;
+
+    const measuredOffset = getTxtCharacterOffsetForScroll(currentScrollYRef.current);
+    if (measuredOffset == null) return;
+    console.log("⚠️ [TXT] 목표 구간 렌더 실패 - 실제 화면 위치로 재동기화", measuredOffset);
+    applyTxtCharacterPosition(measuredOffset);
+  };
+
+  // FlatList는 아직 측정하지 않은 구간의 위치를 평균값으로만 추정한다.
+  // 그래서 먼 곳으로의 이동은 한 번에 도착하지 못할 수 있다.
+  // 셀이 측정될 때마다 "목표 구간이 실제로 렌더됐는지" 확인하고,
+  // 아직이면 개선된 측정값으로 다시 요청해 수렴시킨다. (타이머 보정 아님)
+  const scheduleTxtNavigationRetry = () => {
+    if (txtNavigationRetryScheduledRef.current) return;
+    if (!pendingTxtNavigationRef.current) return;
+
+    txtNavigationRetryScheduledRef.current = true;
+    requestAnimationFrame(() => {
+      txtNavigationRetryScheduledRef.current = false;
+      const pending = pendingTxtNavigationRef.current;
+      if (!pending || pending.id !== txtNavigationIdRef.current) return;
+
+      completePendingTxtNavigation(pending.chunkIndex);
+      if (!pendingTxtNavigationRef.current) return;
+
+      // 목표 구간이 이미 렌더된 상태라면 줄 측정만 기다리면 된다.
+      if (txtItemLayoutsRef.current[pending.chunkIndex]) return;
+
+      if (pending.attempts >= TXT_NAVIGATION_MAX_ATTEMPTS) {
+        abandonTxtNavigation();
+        return;
+      }
+      pending.attempts += 1;
+      requestTxtScrollToChunk(pending.chunkIndex, pending.viewPosition);
+    });
+  };
+
+  // 이어읽기는 한 번 스크롤하는 것으로 끝나지 않는다. 가상 목록이 렌더 창을
+  // 넓히는 동안 같은 scrollY가 가리키는 본문이 조금씩 밀리기 때문에,
+  // 화면에 실제로 그 문자 위치가 올 때까지 측정값을 보고 다시 맞춘다.
+  const settleTxtResumePosition = () => {
+    const settle = txtResumeSettleRef.current;
+    if (!settle || pendingTxtNavigationRef.current) return;
+
+    const actual = getTxtCharacterOffsetForScroll(currentScrollYRef.current, false);
+    if (actual == null) return;
+
+    if (Math.abs(actual - settle.characterOffset) <= TXT_RESUME_SETTLE_TOLERANCE) {
+      console.log("[Restore] 완료 char=" + actual
+        + " (재정렬 " + settle.attempts + "회) 본문=\"" + txtSnippetAt(actual) + "\"");
+      txtResumeSettleRef.current = null;
+      return;
+    }
+    if (settle.attempts >= TXT_RESUME_SETTLE_MAX_ATTEMPTS) {
+      console.log("[Restore] 정렬 상한 도달 want=" + settle.characterOffset + " actual=" + actual);
+      txtResumeSettleRef.current = null;
+      return;
+    }
+
+    settle.attempts += 1;
+    navigateTxtToCharacterOffset(settle.characterOffset, 0, true, settle.lineTopInset);
+  };
+
+  // 셀이 측정될 때마다 목표 구간에 도착했는지 확인한다.
+  // 아직 목표가 렌더되지 않은 경우의 재시도는 scrollToIndex 실패 신호가 담당한다.
+  const handleTxtChunkMeasured = (chunkIndex: number) => {
+    completePendingTxtNavigation(chunkIndex);
+    settleTxtResumePosition();
   };
 
   const navigateTxtToCharacterOffset = (
@@ -1372,7 +1747,6 @@ useEffect(() => {
     viewPosition = 0,
     _alignToMeasuredLine = false,
     lineTopInset = 0,
-    _revealWhenAligned = false,
   ) => {
     const rawLength = rawTextRef.current.length;
     const clampedOffset = Math.min(
@@ -1391,6 +1765,7 @@ useEffect(() => {
       localOffset: Math.max(0, clampedOffset - chunk.start),
       lineTopInset: Math.max(0, lineTopInset),
       viewPosition: Math.min(0.8, Math.max(0, viewPosition)),
+      attempts: 0,
     };
     txtNavigationIdRef.current = pending.id;
     pendingTxtNavigationRef.current = pending;
@@ -1402,22 +1777,24 @@ useEffect(() => {
     completePendingTxtNavigation(chunkIndex);
     if (!pendingTxtNavigationRef.current) return;
 
-    scrollRef.current.scrollToIndex({
-      index: chunkIndex,
-      animated: false,
-      viewPosition: pending.viewPosition,
-    });
+    requestTxtScrollToChunk(chunkIndex, pending.viewPosition);
+    scheduleTxtNavigationRetry();
   };
 
   navigateTxtToCharacterOffsetRef.current = navigateTxtToCharacterOffset;
-  completeTxtNavigationRef.current = completePendingTxtNavigation;
+  onTxtChunkMeasuredRef.current = handleTxtChunkMeasured;
+  scheduleTxtNavigationRetryRef.current = scheduleTxtNavigationRetry;
 
   const getTxtCharacterOffsetForScroll = (
     offsetY: number,
     updateLineTopInset = true,
   ): number | null => {
     let chunkIndex = txtVisibleChunkIndexRef.current;
-    const measuredLayouts = Object.entries(txtItemLayoutsRef.current);
+    // 화면에 보이는 구간에서 멀리 떨어진 셀의 오래된 측정값이 현재 위치를
+    // 가로채지 못하게 한다. (가상 목록은 렌더 창이 움직이면 셀의 y를 다시 잡는다)
+    const measuredLayouts = Object.entries(txtItemLayoutsRef.current).filter(
+      ([index]) => Math.abs(Number(index) - chunkIndex) <= 12,
+    );
     const containingLayout = measuredLayouts.find(([, layout]) => (
       offsetY >= layout.y && offsetY < layout.y + layout.height
     ));
@@ -1485,22 +1862,56 @@ useEffect(() => {
     );
   };
 
-  const persistTxtProgressLocally = () => {
+  const txtSnippetAt = (offset: number) =>
+    rawTextRef.current.slice(Math.max(0, offset), Math.max(0, offset) + 26).replace(/\n/g, "\\n");
+
+  const captureTxtPositionSnapshot = () => {
+    const measuredCharacterOffset = getTxtCharacterOffsetForScroll(
+      currentScrollYRef.current,
+    );
+    if (measuredCharacterOffset != null) {
+      currentTxtCharOffsetRef.current = measuredCharacterOffset;
+    }
+    canonicalReadingPositionRef.current = {
+      format: "TXT",
+      characterOffset: currentTxtCharOffsetRef.current,
+      lineTopInset: currentTxtLineTopInsetRef.current,
+    };
+
+    const rawLength = rawTextRef.current.length;
+    const capturedProgress = rawLength > 0
+      ? Math.min(1, Math.max(0, currentTxtCharOffsetRef.current / rawLength))
+      : 0;
+    progressRef.current = capturedProgress;
+    updateTxtReadingPreview(currentScrollYRef.current, capturedProgress);
+
+    return {
+      progress: capturedProgress,
+      characterOffset: currentTxtCharOffsetRef.current,
+      previewCharacterOffset: currentTxtPreviewCharOffsetRef.current,
+      lineTopInset: currentTxtLineTopInsetRef.current,
+      layoutSignature: txtLayoutSignature,
+      readingPreview: currentReadingPreviewRef.current,
+      updatedAt: Date.now(),
+    };
+  };
+
+  const persistTxtProgressLocally = (
+    snapshot = captureTxtPositionSnapshot(),
+  ) => {
     const currentFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId ?? "");
-    if (!currentFileId || rawTextRef.current.length === 0 || progressRef.current <= 0) {
+    if (!currentFileId || rawTextRef.current.length === 0 || snapshot.progress <= 0) {
       return Promise.resolve();
     }
 
     const serializedPosition = JSON.stringify({
-        progress: progressRef.current,
-        characterOffset: currentTxtCharOffsetRef.current,
-        previewCharacterOffset: currentTxtPreviewCharOffsetRef.current,
-        lineTopInset: currentTxtLineTopInsetRef.current,
-        scrollY: currentScrollYRef.current,
-        contentHeight: txtContentHeightRef.current,
-        layoutSignature: txtLayoutSignature,
-        updatedAt: Date.now(),
-      });
+      progress: snapshot.progress,
+      characterOffset: snapshot.characterOffset,
+      previewCharacterOffset: snapshot.previewCharacterOffset,
+      lineTopInset: snapshot.lineTopInset,
+      layoutSignature: snapshot.layoutSignature,
+      updatedAt: snapshot.updatedAt,
+    });
 
     return enqueueReaderWrite(`txt-local:${currentFileId}`, () => AsyncStorage.setItem(
       `${TXT_LOCAL_PROGRESS_KEY_PREFIX}${currentFileId}`,
@@ -1523,15 +1934,24 @@ useEffect(() => {
     const skipPreview = offsetY < 5 && !hasResumedRef.current;
 
     const rawLength = rawTextRef.current.length;
-    const isLastChunkVisible = contentRef.current.length > 0
-      && txtVisibleChunkIndexRef.current === contentRef.current.length - 1;
-    const isAtActualEnd = isLastChunkVisible
-      && offsetY + e.nativeEvent.layoutMeasurement.height >= eventContentHeight - 2;
+    // 마지막 구간의 "측정된" 아래끝이 화면 안에 들어왔을 때만 문서 끝으로 본다.
+    // (가상 목록이 추정 중인 contentHeight를 문서 끝으로 오인하지 않게 한다)
+    const lastChunkLayout = contentRef.current.length > 0
+      ? txtItemLayoutsRef.current[contentRef.current.length - 1]
+      : undefined;
+    const isAtActualEnd = !!lastChunkLayout
+      && offsetY + e.nativeEvent.layoutMeasurement.height
+        >= lastChunkLayout.y + lastChunkLayout.height - 2;
     const measuredCharacterOffset = getTxtCharacterOffsetForScroll(offsetY);
     const characterOffset = isAtActualEnd
       ? rawLength
       : measuredCharacterOffset ?? currentTxtCharOffsetRef.current;
     currentTxtCharOffsetRef.current = characterOffset;
+    canonicalReadingPositionRef.current = {
+      format: "TXT",
+      characterOffset,
+      lineTopInset: currentTxtLineTopInsetRef.current,
+    };
     const clamped = rawLength > 0
       ? Math.min(1, Math.max(0, characterOffset / rawLength))
       : 0;
@@ -1573,6 +1993,13 @@ useEffect(() => {
     updateTxtScrollState(e);
   };
 
+  // 뷰포트 높이는 줄 나눔이 아니라 페이지 환산에만 영향을 준다.
+  // 본문을 다시 마운트하지 않고 페이지 수만 새로 계산한다.
+  useEffect(() => {
+    if (isEpub) return;
+    refreshTxtPaginationRef.current();
+  }, [isEpub, viewHeight]);
+
   useEffect(() => {
     if (isEpub || !showUI) return;
     const currentProgress = Math.min(1, Math.max(0, progressRef.current));
@@ -1587,6 +2014,8 @@ useEffect(() => {
 
   // txt 슬라이더로 위치 이동
   const handleSeekText = (value: number) => {
+    // 사용자가 직접 위치를 옮기면 이어읽기 복원 정착은 포기한다.
+    txtResumeSettleRef.current = null;
     const requested = Math.min(1, Math.max(0, value));
     navigateTxtToCharacterOffset(
       Math.floor(requested * rawTextRef.current.length),
@@ -1595,24 +2024,59 @@ useEffect(() => {
   };
 
   // ===================== Slider 공통 핸들러 =====================
-  // txt면 스크롤, epub이면 WebView에 "seek" 메시지 전송
-  const handleSliderComplete = (value: number) => {
+  const dispatchSliderSeek = (value: number, final = false) => {
+    const requested = Math.min(1, Math.max(0, value));
+    lastSliderSeekAtRef.current = Date.now();
     if (isEpub) {
       if (!epubNavigationReady) return;
-      const requested = Math.min(1, Math.max(0, value));
-      // WebView 정밀 이동이 끝나기 전에도 사용자가 놓은 위치를 즉시 유지한다.
-      progressRef.current = requested;
-      setProgress(requested);
-      setCurrentPage(Math.min(
-        Math.max(1, totalPages),
-        Math.max(1, Math.round(requested * Math.max(totalPages - 1, 0)) + 1)
-      ));
+      const requestId = sliderSeekRequestIdRef.current + 1;
+      sliderSeekRequestIdRef.current = requestId;
+      if (final) sliderFinalRequestIdRef.current = requestId;
       webViewRef.current?.postMessage(
-        JSON.stringify({ type: "seek", percent: requested })
+        JSON.stringify({ type: "seek", percent: requested, requestId })
       );
     } else {
-      handleSeekText(value);
+      handleSeekText(requested);
+      if (final) setSliderPreviewValue(null);
     }
+  };
+
+  const scheduleSliderSeek = (value: number) => {
+    const requested = Math.min(1, Math.max(0, value));
+    sliderPendingValueRef.current = requested;
+    setSliderPreviewValue(requested);
+
+    const elapsed = Date.now() - lastSliderSeekAtRef.current;
+    if (elapsed >= 80 && !sliderThrottleTimerRef.current) {
+      sliderPendingValueRef.current = null;
+      dispatchSliderSeek(requested);
+      return;
+    }
+    if (sliderThrottleTimerRef.current) return;
+
+    sliderThrottleTimerRef.current = setTimeout(() => {
+      sliderThrottleTimerRef.current = null;
+      const pendingValue = sliderPendingValueRef.current;
+      sliderPendingValueRef.current = null;
+      if (pendingValue != null) dispatchSliderSeek(pendingValue);
+    }, Math.max(0, 80 - elapsed));
+  };
+
+  const handleSliderStart = (value: number) => {
+    sliderDraggingRef.current = true;
+    setSliderPreviewValue(Math.min(1, Math.max(0, value)));
+  };
+
+  const handleSliderComplete = (value: number) => {
+    const requested = Math.min(1, Math.max(0, value));
+    sliderDraggingRef.current = false;
+    setSliderPreviewValue(requested);
+    sliderPendingValueRef.current = null;
+    if (sliderThrottleTimerRef.current) {
+      clearTimeout(sliderThrottleTimerRef.current);
+      sliderThrottleTimerRef.current = null;
+    }
+    dispatchSliderSeek(requested, true);
   };
 
   const openReaderSearch = () => {
@@ -1660,13 +2124,28 @@ useEffect(() => {
       }
     });
 
+    // 실제로 측정된 줄 수는 문서 높이 모델을 보정하는 표본이 된다.
+    txtMeasuredLineCountsRef.current[chunkIndex] = lines.length;
+    if (
+      !txtModelCalibratedRef.current
+      && Object.keys(txtMeasuredLineCountsRef.current).length >= 3
+    ) {
+      rebuildTxtLayoutModelRef.current(true);
+    }
+
     txtLineMetricsRef.current[chunkIndex] = lines.map((line) => {
       const lineText = String(line?.text || "");
       const foundOffset = lineText
         ? chunkText.indexOf(lineText, cursor)
         : cursor;
       const offset = foundOffset >= cursor ? foundOffset : cursor;
-      cursor = Math.min(chunkText.length, offset + lineText.length);
+      // 빈 줄은 원문의 줄바꿈 문자 하나에 대응한다. 커서를 함께 넘겨야
+      // 연달아 나오는 빈 줄들이 서로 다른 문자 위치를 갖고,
+      // 저장 당시의 줄과 복원 시의 줄이 정확히 같아진다.
+      cursor = Math.min(
+        chunkText.length,
+        offset + (lineText.length > 0 ? lineText.length : 1),
+      );
       return {
         offset,
         y: Number(line?.y) || 0,
@@ -1677,7 +2156,7 @@ useEffect(() => {
 
   const handleTxtTextLayout = (chunkIndex: number, lines: any[]) => {
     recordTxtLineMetrics(chunkIndex, lines);
-    completeTxtNavigationRef.current(chunkIndex);
+    onTxtChunkMeasuredRef.current(chunkIndex);
   };
 
   const handleSearchResultSelect = (result: ReaderSearchResult) => {
@@ -1696,6 +2175,7 @@ useEffect(() => {
 
     if (typeof result.textOffset !== "number") return;
 
+    txtResumeSettleRef.current = null;
     const chunkIndex = findTxtChunkIndexForOffset(result.textOffset);
     const chunkStart = contentRef.current[chunkIndex]?.start || 0;
 
@@ -1726,7 +2206,7 @@ useEffect(() => {
         console.log("📱 WebView:", data.message);
       } else if (data.type === "progress") {
         const { current, total, percent, cfi, anchorRatio, visibleText } = data;
-        const nextPercent = (percent || 0);
+        const nextPercent = Math.min(100, Math.max(0, Number(percent) || 0));
         const prevPercent = lastWebPercentRef.current;
         if (prevPercent != null) {
           const diff = nextPercent - prevPercent;
@@ -1755,6 +2235,11 @@ useEffect(() => {
           lastCfiRef.current = cfi;
           setLastCfi(cfi);
           if (typeof anchorRatio === 'number') lastAnchorRatioRef.current = anchorRatio;
+          canonicalReadingPositionRef.current = {
+            format: "EPUB",
+            cfi,
+            anchorRatio: typeof anchorRatio === "number" ? anchorRatio : lastAnchorRatioRef.current,
+          };
         }
         if (visibleText) {
           currentReadingPreviewRef.current = createPreviewText(visibleText);
@@ -1804,15 +2289,22 @@ useEffect(() => {
           )).catch((error) => console.log("EPUB 위치 인덱스 캐시 저장 실패:", error));
         }
       } else if (data.type === "seekState") {
-        // 슬라이더를 놓은 즉시 목표 페이지/퍼센트를 반영하고 WebView의 정밀 이동을 기다린다.
+        // 드래그 중 page 표시는 목표 위치의 파생값만 미리 보여 준다.
+        // canonical position/progress는 실제 CFI 이동 완료 후 progress 메시지에서만 갱신한다.
         const nextTotal = Math.max(1, Number(data.total) || 1);
         const nextCurrent = Math.min(nextTotal, Math.max(1, Number(data.current) || 1));
-        const nextPercent = Math.min(100, Math.max(0, Number(data.percent) || 0));
         setCurrentPage(nextCurrent);
         setTotalPages(nextTotal);
-        progressRef.current = nextPercent / 100;
-        setProgress(nextPercent / 100);
-        lastWebPercentRef.current = nextPercent;
+      } else if (data.type === "seekComplete") {
+        const completedRequestId = Number(data.requestId) || 0;
+        if (
+          !sliderDraggingRef.current
+          && sliderFinalRequestIdRef.current != null
+          && completedRequestId >= sliderFinalRequestIdRef.current
+        ) {
+          sliderFinalRequestIdRef.current = null;
+          setSliderPreviewValue(null);
+        }
       } else if (data.type === "navigationReady") {
         console.log("✅ EPUB 위치 이동 준비 완료:", data.mode || "unknown");
         setEpubNavigationReady(true);
@@ -2344,7 +2836,8 @@ useEffect(() => {
             // 테마 상태
             var currentTheme = {
               bgColor: '#f5f0e6', textColor: '#333333', fontSize: 18,
-              lineSpacing: 1.9, sidePadding: 24, fontFamily: 'default'
+              lineSpacing: 1.9, sidePadding: 24, fontFamily: 'default',
+              usePublisherFont: false
             };
             var loadedContents = [];
             var contentTouchActive = false;
@@ -2353,11 +2846,15 @@ useEffect(() => {
             function buildThemeCss(t, preserveLayout) {
               var ff = (t.fontFamily && t.fontFamily !== 'default')
                 ? t.fontFamily + ', sans-serif'
-                : '-apple-system, BlinkMacSystemFont, sans-serif';
+                : 'Roboto, "Noto Sans KR", "Noto Sans CJK KR", sans-serif';
               if (preserveLayout) {
                 return 'html,body{background:' + t.bgColor + '!important}' +
                   'img,svg,object,video,canvas{max-width:100%!important;max-height:100vh!important;object-fit:contain!important}';
               }
+              var fontCss = t.usePublisherFont
+                ? ':where(body){font-family:' + ff + '}'
+                : 'body,p,li,dd,dt,blockquote,td,th{' +
+                    'font-family:' + ff + '!important}';
               return 'html{background:' + t.bgColor + '!important;margin:0!important;padding:0!important;width:100%!important}' +
                 'body{background:' + t.bgColor + '!important;color:' + t.textColor + '!important;' +
                 'font-size:' + t.fontSize + 'px!important;line-height:' + t.lineSpacing + '!important;' +
@@ -2366,8 +2863,7 @@ useEffect(() => {
                 'padding-top:16px!important;padding-bottom:36px!important;' +
                 'margin:0!important;box-sizing:border-box!important;width:100%!important;' +
                 'word-break:keep-all!important;overflow-wrap:break-word!important;' +
-                'text-align:left!important;' +
-                'font-family:' + ff + '!important}' +
+                'text-align:left!important}' + fontCss +
                 'p{line-height:' + t.lineSpacing + '!important;margin-left:0!important;margin-right:0!important;word-break:keep-all!important;text-align:left!important}' +
                 'img,svg,object,video,canvas{max-width:100%!important;max-height:100vh!important;width:auto!important;height:auto!important;object-fit:contain!important}';
             }
@@ -2754,6 +3250,12 @@ useEffect(() => {
                 + ' scrollTop=' + Math.round(fallbackSectionEl.scrollTop)
                 + ' max=' + Math.round(maxScroll));
               reportFallbackPaging();
+              if (seek.requestId) {
+                window.ReactNativeWebView.postMessage(JSON.stringify({
+                  type: 'seekComplete',
+                  requestId: seek.requestId
+                }));
+              }
               if (pendingFallbackRestore) {
                 pendingFallbackRestore = false;
                 sendLog('✅ fallback 이어읽기 복원 완료 section=' + seek.sectionIndex
@@ -2763,7 +3265,7 @@ useEffect(() => {
               return true;
             }
 
-            function seekFallbackPercent(percent) {
+            function seekFallbackPercent(percent, requestId) {
               var paging = getFallbackPagination();
               var p = Math.max(0, Math.min(1, percent));
               var targetPosition = p * paging.total;
@@ -2782,7 +3284,8 @@ useEffect(() => {
               var targetPage = Math.min(paging.total, Math.floor(targetPosition) + 1);
               pendingFallbackSeek = {
                 sectionIndex: sectionIndex,
-                withinRatio: withinRatio
+                withinRatio: withinRatio,
+                requestId: requestId || 0
               };
               totalLocations = paging.total;
               window.ReactNativeWebView.postMessage(JSON.stringify({
@@ -3695,6 +4198,43 @@ useEffect(() => {
               }
             }
 
+            var layoutRestoreGeneration = 0;
+            function restoreCfiAfterLayout(targetCfi, anchorRatio, onDone) {
+              var generation = ++layoutRestoreGeneration;
+              var fontPromises = [];
+              loadedContents.forEach(function(contents) {
+                try {
+                  if (contents.document && contents.document.fonts && contents.document.fonts.ready) {
+                    fontPromises.push(contents.document.fonts.ready);
+                  }
+                } catch(e) {}
+              });
+
+              Promise.all(fontPromises).catch(function() {}).then(function() {
+                var frame = 0;
+                var stableFrames = 0;
+                var previousHeight = -1;
+
+                function alignOnStableFrame() {
+                  if (generation !== layoutRestoreGeneration) return;
+                  alignCfiInViewport(targetCfi, anchorRatio);
+                  var container = rendition.manager && rendition.manager.container;
+                  var height = container ? container.scrollHeight : 0;
+                  stableFrames = height === previousHeight ? stableFrames + 1 : 0;
+                  previousHeight = height;
+                  frame += 1;
+
+                  if (stableFrames >= 2 || frame >= 18) {
+                    if (onDone) onDone();
+                    return;
+                  }
+                  requestAnimationFrame(alignOnStableFrame);
+                }
+
+                requestAnimationFrame(alignOnStableFrame);
+              });
+            }
+
             function navigateInternalHref(href) {
               if (!href || isSeeking || isAutoTransition) return;
               isSeeking = true;
@@ -3787,8 +4327,40 @@ useEffect(() => {
                   current = lastDisplayedSectionIndex + 1;
                   percent = spineCount > 1 ? (lastDisplayedSectionIndex / (spineCount - 1)) * 100 : 0;
                 } else {
-                  current = book.locations.locationFromCfi(saveCfi) + 1;
-                  percent = book.locations.percentageFromCfi(saveCfi) * 100;
+                  var canonicalLocationIndex = book.locations.locationFromCfi(saveCfi);
+                  if (
+                    typeof canonicalLocationIndex !== 'number'
+                    || !isFinite(canonicalLocationIndex)
+                    || canonicalLocationIndex < 0
+                  ) {
+                    sendLog('⚠️ safeReport: CFI를 locations 좌표로 변환할 수 없어 이전 위치 유지');
+                    return;
+                  }
+                  canonicalLocationIndex = Math.max(0, Math.min(generatedCount - 1, canonicalLocationIndex));
+                  current = canonicalLocationIndex + 1;
+                  // Use the exact same zero-based locations coordinate system as
+                  // slider -> CFI. epub.js percentageFromCfi divides by a different
+                  // total in some versions, so mixing the two makes a completed seek
+                  // report a different percentage on the following scroll event.
+                  percent = generatedCount > 1
+                    ? (canonicalLocationIndex / (generatedCount - 1)) * 100
+                    : 0;
+
+                  // The canonical anchor is the visible text CFI, but reaching the
+                  // physical end of the final spine is an exact 100% layout state.
+                  // Preserve the CFI for resume while deriving the edge percentage
+                  // from the settled scroll container so 100% cannot fall back to an
+                  // unrelated location after the next ordinary scroll event.
+                  var reportContainer = rendition.manager && rendition.manager.container;
+                  var visibleSectionIndex = getVisibleSectionIndex();
+                  var atDocumentEnd = reportContainer
+                    && visibleSectionIndex >= getLastNavigableSectionIndex()
+                    && reportContainer.scrollTop + reportContainer.clientHeight
+                      >= reportContainer.scrollHeight - 2;
+                  if (atDocumentEnd) {
+                    current = generatedCount;
+                    percent = 100;
+                  }
                 }
                 var reportTotal = generatedCount > 1 ? generatedCount : totalLocations;
 
@@ -4177,14 +4749,24 @@ useEffect(() => {
             function buildFallbackReaderCss(t) {
               var ff = (t.fontFamily && t.fontFamily !== 'default')
                 ? t.fontFamily + ', sans-serif'
-                : '-apple-system, BlinkMacSystemFont, sans-serif';
+                : 'Roboto, "Noto Sans KR", "Noto Sans CJK KR", sans-serif';
+              var fontCss = t.usePublisherFont
+                ? '#fallback-section #fallback-document{font-family:' + ff + '}'
+                : '#fallback-section #fallback-document,' +
+                    '#fallback-section #fallback-document p,' +
+                    '#fallback-section #fallback-document li,' +
+                    '#fallback-section #fallback-document dd,' +
+                    '#fallback-section #fallback-document dt,' +
+                    '#fallback-section #fallback-document blockquote,' +
+                    '#fallback-section #fallback-document td,' +
+                    '#fallback-section #fallback-document th{' +
+                    'font-family:' + ff + '!important}';
               return '#fallback-section #fallback-document{' +
                 'color:' + t.textColor + '!important;' +
                 'font-size:' + t.fontSize + 'px!important;' +
                 'line-height:' + t.lineSpacing + '!important;' +
-                'font-family:' + ff + '!important;' +
                 'word-break:keep-all!important;overflow-wrap:break-word!important;' +
-                'text-align:left!important}' +
+                'text-align:left!important}' + fontCss +
                 '#fallback-section #fallback-document p{' +
                 'line-height:' + t.lineSpacing + '!important;' +
                 'word-break:keep-all!important;' +
@@ -4437,6 +5019,11 @@ useEffect(() => {
                 });
               }
               if (section && typeof section.index === 'number') {
+                if (lastDisplayedSectionIndex !== section.index) {
+                  lastCenterCfi = '';
+                  lastVisibleText = '';
+                  lastAnchorRatio = 0.5;
+                }
                 lastDisplayedSectionIndex = section.index;
                 sendLog('✅ rendered spine index=' + section.index + ' href=' + (section.href || ''));
               }
@@ -4924,6 +5511,107 @@ useEffect(() => {
               }, CHAPTER_EXIT_MS);
             }
 
+            // Slider input can arrive faster than rendition.display() can settle. Keep at
+            // most one display in flight and coalesce the rest to the newest request so
+            // an older async completion cannot replace the user's final drag position.
+            var sliderSeekRunning = false;
+            var queuedSliderSeek = null;
+
+            function runSliderSeek(request) {
+              if (!request) return;
+              if (sliderSeekRunning || isSeeking || isAutoTransition) {
+                queuedSliderSeek = request;
+                return;
+              }
+
+              var p = Math.max(0, Math.min(1, request.percent));
+              var requestId = request.requestId || 0;
+              var generatedCount = Math.max(1, book.locations.length());
+
+              if (p <= 0.001 && coverAvailable) {
+                showExistingBookCover();
+                lastDisplayedSectionIndex = 0;
+                reportLocationsReady();
+                window.ReactNativeWebView.postMessage(JSON.stringify({
+                  type: 'seekComplete', requestId: requestId
+                }));
+                return;
+              }
+
+              if (generatedCount <= 1) {
+                seekFallbackPercent(p, requestId);
+                return;
+              }
+
+              totalLocations = generatedCount;
+              var targetIndex = Math.round(p * (generatedCount - 1));
+              targetIndex = Math.max(0, Math.min(generatedCount - 1, targetIndex));
+              var targetCfi = book.locations.cfiFromLocation(targetIndex);
+              if (!targetCfi) return;
+
+              window.ReactNativeWebView.postMessage(JSON.stringify({
+                type: 'seekState',
+                requestId: requestId,
+                current: targetIndex + 1,
+                total: generatedCount,
+                percent: generatedCount > 1 ? (targetIndex / (generatedCount - 1)) * 100 : 0
+              }));
+
+              sendLog('🔍 슬라이더 이동: ' + Math.round(p * 100) + '% (index: ' + targetIndex + ')');
+              sliderSeekRunning = true;
+              isSeeking = true;
+              isChapterLoading = true;
+              activeSeekTargetCfi = targetCfi;
+              lastCenterCfi = '';
+              hideBookCover();
+              hideFallbackSection('locations 슬라이더 이동', false);
+
+              function finishSliderSeek() {
+                if (p >= 0.999) {
+                  var edgeContainer = rendition.manager && rendition.manager.container;
+                  if (edgeContainer) {
+                    edgeContainer.scrollTop = Math.max(0, edgeContainer.scrollHeight - edgeContainer.clientHeight);
+                  }
+                } else {
+                  alignCfiInViewport(targetCfi, 0.5);
+                }
+                lastAnchorRatio = 0.5;
+                lastCenterCfi = targetCfi;
+                updateCenterText();
+                isChapterLoading = false;
+                isSeeking = false;
+                activeSeekTargetCfi = '';
+                sliderSeekRunning = false;
+                try {
+                  var loc = rendition.currentLocation();
+                  if (loc) safeReport(loc, false);
+                } catch(e) {}
+                reportSectionState();
+                window.ReactNativeWebView.postMessage(JSON.stringify({
+                  type: 'seekComplete', requestId: requestId
+                }));
+
+                var nextRequest = queuedSliderSeek;
+                queuedSliderSeek = null;
+                if (nextRequest) requestAnimationFrame(function() { runSliderSeek(nextRequest); });
+              }
+
+              Promise.resolve(rendition.display(targetCfi)).then(function() {
+                requestAnimationFrame(function() {
+                  requestAnimationFrame(finishSliderSeek);
+                });
+              }).catch(function(error) {
+                sendLog('⚠️ 슬라이더 이동 실패: ' + error.message);
+                isChapterLoading = false;
+                isSeeking = false;
+                activeSeekTargetCfi = '';
+                sliderSeekRunning = false;
+                var nextRequest = queuedSliderSeek;
+                queuedSliderSeek = null;
+                if (nextRequest) runSliderSeek(nextRequest);
+              });
+            }
+
             // React Native -> WebView 메시지 수신 (window로 수정!)
             window.addEventListener("message", function(e) {
               try {
@@ -4944,67 +5632,10 @@ useEffect(() => {
                 } else if (data.type === "seek" && (locationsReady || isFallbackVisible())) {
                   var p = data.percent;
                   if (typeof p !== "number") return;
-
-                  // 0~1 범위로 클램프
-                  p = Math.max(0, Math.min(1, p));
-
-                  if (p <= 0.001 && coverAvailable) {
-                    showExistingBookCover();
-                    lastDisplayedSectionIndex = 0;
-                    reportLocationsReady();
-                    return;
-                  }
-
-                  var generatedCount = Math.max(1, book.locations.length());
-                  if (generatedCount <= 1) {
-                    seekFallbackPercent(p);
-                    return;
-                  }
-
-                  // percent를 location index로 변환
-                  totalLocations = generatedCount;
-                  var targetIndex = Math.round(p * (generatedCount - 1));
-                  targetIndex = Math.max(0, Math.min(generatedCount - 1, targetIndex));
-                  
-                  // index를 CFI로 변환해서 이동
-                  var cfi = book.locations.cfiFromLocation(targetIndex);
-                  if (cfi) {
-                    var seekTargetCfi = cfi;
-                    sendLog("🔍 슬라이더 이동: " + Math.round(p * 100) + "% (index: " + targetIndex + ")");
-                    isSeeking = true;
-                    isChapterLoading = true;
-                    activeSeekTargetCfi = seekTargetCfi;
-                    lastCenterCfi = '';
-                    hideBookCover();
-                    hideFallbackSection('locations 슬라이더 이동', false);
-                    window.ReactNativeWebView.postMessage(JSON.stringify({
-                      type: "seekState",
-                      current: targetIndex + 1,
-                      total: generatedCount,
-                      percent: generatedCount > 1 ? (targetIndex / (generatedCount - 1)) * 100 : 0
-                    }));
-                    rendition.display(seekTargetCfi).then(function() {
-                      requestAnimationFrame(function() {
-                        if (activeSeekTargetCfi !== seekTargetCfi) return;
-                        lastCenterCfi = seekTargetCfi;
-                        updateCenterText();
-                        isChapterLoading = false;
-                        isSeeking = false;
-                        activeSeekTargetCfi = '';
-                        try {
-                          var loc = rendition.currentLocation();
-                          if (loc) safeReport(loc, false);
-                        } catch(e) {}
-                        reportSectionState();
-                      });
-                    }).catch(function() {
-                      if (activeSeekTargetCfi === seekTargetCfi) {
-                        activeSeekTargetCfi = '';
-                        isChapterLoading = false;
-                        isSeeking = false;
-                      }
-                    });
-                  }
+                  runSliderSeek({
+                    percent: Math.max(0, Math.min(1, p)),
+                    requestId: Number(data.requestId) || 0
+                  });
                 } else if (data.type === "tryBoundaryTransition") {
                   tryBoundaryTransition(data.direction === 'prev');
                 } else if (data.type === "themeAndStart") {
@@ -5032,7 +5663,8 @@ useEffect(() => {
                     fontSize: data.fontSize || 18,
                     lineSpacing: data.lineSpacing || 1.9,
                     sidePadding: (data.sidePadding != null) ? data.sidePadding : 24,
-                    fontFamily: data.fontFamily || 'default'
+                    fontFamily: data.fontFamily || 'default',
+                    usePublisherFont: data.usePublisherFont === true
                   };
                   document.documentElement.style.background = currentTheme.bgColor;
                   document.body.style.background = currentTheme.bgColor;
@@ -5070,107 +5702,18 @@ useEffect(() => {
                     sendLog("➡️ [복원] display(cfi) 호출: " + targetCfi);
                     reportPerformance("이어읽기 display 요청");
                     rendition.display(targetCfi).then(function() {
-
-                      // CFI를 저장 당시의 화면 내 상대 위치(anchorRatio)에 정렬하는 함수
-                      // getBoundingClientRect() 기반 → 레이아웃 완료 후에만 정확
-                      function scrollCfiToCenter(onDone) {
-                        try {
-                          var container = rendition.manager && rendition.manager.container;
-                          var views = rendition.manager && rendition.manager.visible && rendition.manager.visible();
-                          var view = views && views[0];
-                          if (!container || !view) { if (onDone) onDone(); return; }
-
-                          // iframe 엘리먼트 찾기
-                          var iframeEl = view.element && view.element.querySelector('iframe');
-                          if (!iframeEl) { if (onDone) onDone(); return; }
-                          var iframeDoc = iframeEl.contentDocument || (iframeEl.contentWindow && iframeEl.contentWindow.document);
-                          if (!iframeDoc) { if (onDone) onDone(); return; }
-
-                          // CFI → DOM Range: view.contents.range() 사용 (epub.js 공식 API)
-                          var range;
-                          try {
-                            range = view.contents.range(targetCfi);
-                          } catch(rangeErr) {
-                            range = null;
-                          }
-                          if (!range) {
-                            sendLog('⚠️ [복원] toRange 반환 null, locationOf 폴백 시도');
-                            // 폴백: locationOf 방식
-                            var pos = view.contents.locationOf(targetCfi, 'px');
-                            var viewOffsetTop = view.element ? view.element.offsetTop : 0;
-                            var rawTarget = viewOffsetTop + (pos && pos.top > 0 ? pos.top : 0);
-                            var targetScrollTop = Math.max(0, rawTarget - container.clientHeight * savedAnchorRatio);
-                            container.scrollTop = targetScrollTop;
-                            if (onDone) onDone();
-                            return;
-                          }
-
-                          // getBoundingClientRect: iframe viewport 기준 좌표
-                          var rect = range.getBoundingClientRect();
-                          var iframeRect = iframeEl.getBoundingClientRect();
-                          var containerRect = container.getBoundingClientRect();
-
-                          // CFI 요소의 outer container 스크롤 공간 기준 절대 y
-                          // = 현재 scrollTop + (iframe 뷰포트 내 y) + (iframe가 outer container 내에서의 y)
-                          var elementAbsTop = container.scrollTop
-                            + (iframeRect.top - containerRect.top)
-                            + rect.top;
-
-                          // 저장 당시 anchorRatio 위치에 오도록: scrollTop = elementAbsTop - clientHeight*anchorRatio + rect.height/2
-                          // anchorRatio=0.5 → 정중앙, 0.3 → 화면 위쪽 30% 위치
-                          var desiredY = container.clientHeight * savedAnchorRatio;
-                          var desiredScrollTop = elementAbsTop
-                            - desiredY
-                            + rect.height / 2;
-
-                          desiredScrollTop = Math.max(0, desiredScrollTop);
-
-                          sendLog('📍 [복원스크롤]'
-                            + ' anchor=' + savedAnchorRatio.toFixed(3)
-                            + ' desiredY=' + Math.round(desiredY)
-                            + ' iframeTop=' + Math.round(iframeRect.top)
-                            + ' rect.top=' + Math.round(rect.top)
-                            + ' rect.h=' + Math.round(rect.height)
-                            + ' scrollBefore=' + Math.round(container.scrollTop)
-                            + ' elemAbsTop=' + Math.round(elementAbsTop)
-                            + ' → target=' + Math.round(desiredScrollTop));
-
-                          container.scrollTop = desiredScrollTop;
-
-                          if (onDone) onDone();
-                        } catch(e) {
-                          sendLog('⚠️ [복원스크롤 오류] ' + e.message);
-                          if (onDone) onDone();
-                        }
-                      }
-
-                      // 1차 보정: 2 RAF + 200ms (iframe 레이아웃 + 테마 CSS 안정화)
-                      requestAnimationFrame(function() {
-                        requestAnimationFrame(function() {
-                          setTimeout(function() {
-                            scrollCfiToCenter(function() {
-                              // 2차 보정: 폰트/이미지 로딩 후 재보정 (300ms 후)
-                              setTimeout(function() {
-                                scrollCfiToCenter(function() {
-                                  // 최종 확인 로그
-                                  var container = rendition.manager && rendition.manager.container;
-                                  updateCenterText();
-                                  var loc2 = rendition.currentLocation();
-                                  sendLog('✅ [복원완료]'
-                                    + ' scrollTop=' + (container ? Math.round(container.scrollTop) : 'n/a')
-                                    + ' cfi=' + (loc2 && loc2.start ? (loc2.start.cfi||'').slice(0,50) : 'n/a')
-                                    + ' centerTxt=' + lastVisibleText.slice(0, 50));
-                                  if (loc2) safeReport(loc2, false);
-                                  reportSectionState();
-                                  // 복원 완료 → RN 로딩 오버레이 제거
-                                  window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'restored' }));
-                                });
-                              }, 300);
-                            });
-                          }, 200);
-                        });
+                      restoreCfiAfterLayout(targetCfi, savedAnchorRatio, function() {
+                        var container = rendition.manager && rendition.manager.container;
+                        updateCenterText();
+                        var loc2 = rendition.currentLocation();
+                        sendLog('✅ [복원완료]'
+                          + ' scrollTop=' + (container ? Math.round(container.scrollTop) : 'n/a')
+                          + ' cfi=' + (loc2 && loc2.start ? (loc2.start.cfi||'').slice(0,50) : 'n/a')
+                          + ' centerTxt=' + lastVisibleText.slice(0, 50));
+                        if (loc2) safeReport(loc2, false);
+                        reportSectionState();
+                        window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'restored' }));
                       });
-
                     }).catch(function(err) {
                       sendLog("❌ display(cfi) 실패, 처음부터: " + err.message);
                       rendition.display();
@@ -5197,6 +5740,35 @@ useEffect(() => {
                     });
                   }
                 } else if (data.type === "theme") {
+                  var layoutChanged = Number(data.fontSize || currentTheme.fontSize) !== currentTheme.fontSize
+                    || Number(data.lineSpacing || currentTheme.lineSpacing) !== currentTheme.lineSpacing
+                    || Number(data.sidePadding != null ? data.sidePadding : currentTheme.sidePadding) !== currentTheme.sidePadding
+                    || String(data.fontFamily || currentTheme.fontFamily) !== currentTheme.fontFamily
+                    || (data.usePublisherFont === true) !== currentTheme.usePublisherFont;
+                  var preservedCfi = '';
+                  var preservedAnchorRatio = lastAnchorRatio;
+                  var preservedFallbackRatio = 0;
+
+                  if (layoutChanged) {
+                    if (isFallbackVisible()) {
+                      var oldFallbackMax = Math.max(1, fallbackSectionEl.scrollHeight - fallbackSectionEl.clientHeight);
+                      preservedFallbackRatio = Math.max(0, Math.min(1, fallbackSectionEl.scrollTop / oldFallbackMax));
+                    } else {
+                      updateCenterText();
+                      preservedCfi = lastCenterCfi;
+                      if (!preservedCfi) {
+                        try {
+                          var currentThemeLocation = rendition.currentLocation();
+                          preservedCfi = currentThemeLocation && currentThemeLocation.start
+                            ? (currentThemeLocation.start.cfi || currentThemeLocation.start)
+                            : '';
+                        } catch(e) {}
+                      }
+                    }
+                    isSeeking = true;
+                    isChapterLoading = true;
+                  }
+
                   // 읽는 중 설정 변경 → 현재 로드된 모든 섹션에 CSS 직접 주입
                   currentTheme = {
                     bgColor: data.bgColor || currentTheme.bgColor,
@@ -5204,7 +5776,8 @@ useEffect(() => {
                     fontSize: data.fontSize || currentTheme.fontSize,
                     lineSpacing: data.lineSpacing || currentTheme.lineSpacing,
                     sidePadding: (data.sidePadding != null) ? data.sidePadding : currentTheme.sidePadding,
-                    fontFamily: data.fontFamily || currentTheme.fontFamily
+                    fontFamily: data.fontFamily || currentTheme.fontFamily,
+                    usePublisherFont: data.usePublisherFont === true
                   };
                   loadedContents = loadedContents.filter(function(c) {
                     return c && c.document && c.document.head;
@@ -5218,6 +5791,45 @@ useEffect(() => {
                     fallbackSectionEl.style.paddingRight = currentTheme.sidePadding + 'px';
                   }
                   sendLog("🎨 테마 업데이트: " + currentTheme.bgColor);
+
+                  if (layoutChanged && isFallbackVisible()) {
+                    var fallbackLayoutFrame = 0;
+                    var fallbackPreviousHeight = -1;
+                    var fallbackStableFrames = 0;
+                    function restoreFallbackLayoutAnchor() {
+                      var fallbackMax = Math.max(0, fallbackSectionEl.scrollHeight - fallbackSectionEl.clientHeight);
+                      fallbackSectionEl.scrollTop = fallbackMax * preservedFallbackRatio;
+                      var fallbackHeight = fallbackSectionEl.scrollHeight;
+                      fallbackStableFrames = fallbackHeight === fallbackPreviousHeight
+                        ? fallbackStableFrames + 1
+                        : 0;
+                      fallbackPreviousHeight = fallbackHeight;
+                      fallbackLayoutFrame += 1;
+                      if (fallbackStableFrames < 2 && fallbackLayoutFrame < 18) {
+                        requestAnimationFrame(restoreFallbackLayoutAnchor);
+                        return;
+                      }
+                      isSeeking = false;
+                      isChapterLoading = false;
+                      reportFallbackPaging();
+                    }
+                    requestAnimationFrame(restoreFallbackLayoutAnchor);
+                  } else if (layoutChanged && preservedCfi) {
+                    restoreCfiAfterLayout(preservedCfi, preservedAnchorRatio, function() {
+                      lastCenterCfi = preservedCfi;
+                      lastAnchorRatio = preservedAnchorRatio;
+                      updateCenterText();
+                      isSeeking = false;
+                      isChapterLoading = false;
+                      try {
+                        var themedLocation = rendition.currentLocation();
+                        if (themedLocation) safeReport(themedLocation, false);
+                      } catch(e) {}
+                    });
+                  } else if (layoutChanged) {
+                    isSeeking = false;
+                    isChapterLoading = false;
+                  }
                 }
               } catch(err) {
                 // WebView 내부 비-JSON 메시지(setImmediate 등) 파싱 실패 → 무시
@@ -5272,6 +5884,13 @@ useEffect(() => {
     exitInProgressRef.current = false;
   }, [fileId]);
 
+  useEffect(() => () => {
+    if (sliderThrottleTimerRef.current) {
+      clearTimeout(sliderThrottleTimerRef.current);
+      sliderThrottleTimerRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     progressRef.current = progress;
   }, [progress]);
@@ -5323,9 +5942,23 @@ useEffect(() => {
     }
     if (hasSupersedingReaderSession(readerSessionIdRef.current, saveFileId)) return;
 
-    const currentProgress = progressRef.current;
-    const currentCfi = lastCfiRef.current;
-    const currentAnchorRatio = lastAnchorRatioRef.current;
+    // await 전에 한 번만 캡처해 progress/문자 위치/preview가
+    // 서로 다른 시점의 값으로 섞이지 않게 한다.
+    const isTxtPositionStable = isEpub || (
+      !pendingTxtNavigationRef.current
+      && !isTxtProgrammaticNavigationRef.current
+    );
+    const txtSnapshot = !isEpub && isTxtPositionStable
+      ? captureTxtPositionSnapshot()
+      : null;
+    const currentProgress = txtSnapshot?.progress ?? progressRef.current;
+    const canonicalPosition = canonicalReadingPositionRef.current;
+    const currentCfi = isEpub && canonicalPosition?.format === "EPUB"
+      ? canonicalPosition.cfi
+      : lastCfiRef.current;
+    const currentAnchorRatio = isEpub && canonicalPosition?.format === "EPUB"
+      ? canonicalPosition.anchorRatio
+      : lastAnchorRatioRef.current;
     
     // 0으로 덮어쓰기 방지
     if (currentProgress === 0 && initialProgressRef.current === 0) {
@@ -5344,33 +5977,47 @@ useEffect(() => {
       return;
     }
 
-    if (!isEpub) {
-      updateTxtReadingPreview(currentScrollYRef.current, currentProgress);
-      await persistTxtProgressLocally();
-    }
-    const currentPreview = currentReadingPreviewRef.current;
+    const currentPreview = txtSnapshot?.readingPreview ?? currentReadingPreviewRef.current;
 
     const saveUri = Array.isArray(uri) ? String(uri[0] ?? "") : String(uri ?? "");
-    const localPosition: LocalReaderPosition = {
-      uri: saveUri,
-      format: isEpub ? "EPUB" : "TXT",
-      progress: currentProgress,
-      readingPreview: currentReadingPreviewRef.current,
-      updatedAt: Date.now(),
-      ...(isEpub
-        ? { epubCfi: currentCfi || undefined, anchorRatio: currentAnchorRatio }
-        : {
-            characterOffset: currentTxtCharOffsetRef.current,
-            previewCharacterOffset: currentTxtPreviewCharOffsetRef.current,
-            lineTopInset: currentTxtLineTopInsetRef.current,
-            scrollY: currentScrollYRef.current,
-            layoutSignature: txtLayoutSignature,
-          }),
-    };
-    await enqueueReaderWrite(`reader-local:${saveFileId}`, () => AsyncStorage.setItem(
-      `${READER_LOCAL_PROGRESS_KEY_PREFIX}${saveFileId}`,
-      JSON.stringify(localPosition),
-    ));
+    if (txtSnapshot) {
+      await persistTxtProgressLocally(txtSnapshot);
+      const localPosition: LocalReaderPosition = {
+        uri: saveUri,
+        format: "TXT",
+        progress: currentProgress,
+        readingPreview: currentPreview,
+        updatedAt: txtSnapshot.updatedAt,
+        characterOffset: txtSnapshot.characterOffset,
+        previewCharacterOffset: txtSnapshot.previewCharacterOffset,
+        lineTopInset: txtSnapshot.lineTopInset,
+        layoutSignature: txtSnapshot.layoutSignature,
+      };
+      await enqueueReaderWrite(`reader-local:${saveFileId}`, () => AsyncStorage.setItem(
+        `${READER_LOCAL_PROGRESS_KEY_PREFIX}${saveFileId}`,
+        JSON.stringify(localPosition),
+      )).catch((error) => {
+        console.log("TXT 로컬 이어읽기 위치 저장 실패:", error);
+      });
+    } else if (isEpub) {
+      const localPosition: LocalReaderPosition = {
+        uri: saveUri,
+        format: "EPUB",
+        progress: currentProgress,
+        readingPreview: currentPreview,
+        updatedAt: Date.now(),
+        epubCfi: currentCfi || undefined,
+        anchorRatio: currentAnchorRatio,
+      };
+      await enqueueReaderWrite(`reader-local:${saveFileId}`, () => AsyncStorage.setItem(
+        `${READER_LOCAL_PROGRESS_KEY_PREFIX}${saveFileId}`,
+        JSON.stringify(localPosition),
+      ));
+    } else {
+      console.log(
+        "⏸️ [Persist] TXT 위치 이동 중: 임시 상세 좌표는 로컬에 덮어쓰지 않고 서버 진행도만 저장",
+      );
+    }
 
     const body: any = {
       progress: currentProgress,
@@ -5392,16 +6039,16 @@ useEffect(() => {
       progress: currentProgress,
       cfi: currentCfi,
       anchorRatio: currentAnchorRatio,
-      characterOffset: currentTxtCharOffsetRef.current,
-      lineTopInset: currentTxtLineTopInsetRef.current,
+      characterOffset: txtSnapshot?.characterOffset,
+      lineTopInset: txtSnapshot?.lineTopInset,
       preview: currentPreview,
     });
-    if (
-      positionSignature === lastSavedPositionSignatureRef.current
-      || positionSignature === lastQueuedPositionSignatureRef.current
-    ) {
-      await waitForReaderWrites(`server-progress:${saveFileId}`);
+    if (positionSignature === lastSavedPositionSignatureRef.current) {
       return;
+    }
+    if (positionSignature === lastQueuedPositionSignatureRef.current) {
+      await waitForReaderWrites(`server-progress:${saveFileId}`);
+      if (positionSignature === lastSavedPositionSignatureRef.current) return;
     }
     lastQueuedPositionSignatureRef.current = positionSignature;
 
@@ -5422,6 +6069,9 @@ useEffect(() => {
 
           if (response.ok) {
             lastSavedPositionSignatureRef.current = positionSignature;
+            if (lastQueuedPositionSignatureRef.current === positionSignature) {
+              lastQueuedPositionSignatureRef.current = "";
+            }
             console.log("✅ [저장 성공] progress=" + currentProgress.toFixed(3)
               + " anchorRatio=" + currentAnchorRatio.toFixed(3)
               + " cfi=" + (currentCfi ? currentCfi.slice(0, 60) : '없음'));
@@ -5508,6 +6158,178 @@ useEffect(() => {
     });
     return () => subscription.remove();
   });
+
+  const txtListCallbacksRef = useRef({
+    handleScroll,
+    updateTxtScrollState,
+    handleTxtTextLayout,
+  });
+  txtListCallbacksRef.current = {
+    handleScroll,
+    updateTxtScrollState,
+    handleTxtTextLayout,
+  };
+
+  // 하단 progress가 갱신되어 Reader가 다시 렌더되어도 TXT 목록 자체는 다시
+  // 구성하지 않는다. 본문은 파일/검색 강조/보기 설정이 바뀔 때만 갱신한다.
+  const txtReaderList = useMemo(() => (
+    <FlatList
+      ref={scrollRef}
+      data={content}
+      // 키는 구간의 문자 위치로 고정한다. 글자 크기가 바뀌어도 셀을 통째로
+      // 다시 마운트하지 않으므로, 목록 높이가 순간적으로 0으로 무너졌다가
+      // 되돌아오면서 화면이 튀는 일이 없다. 새 측정값은 스타일 변경으로
+      // onLayout/onTextLayout이 다시 발생하면서 채워진다.
+      keyExtractor={(item) => "txt-" + item.start}
+      getItemLayout={getTxtItemLayout}
+      CellRendererComponent={renderTxtCell}
+      onViewableItemsChanged={onTxtViewableItemsChangedRef.current}
+      viewabilityConfig={txtViewabilityConfigRef.current}
+      initialNumToRender={2}
+      maxToRenderPerBatch={2}
+      updateCellsBatchingPeriod={40}
+      windowSize={5}
+      removeClippedSubviews={false}
+      maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+      style={{ flex: 1, backgroundColor: settings.bgColor }}
+      contentContainerStyle={{ paddingHorizontal: settings.sidePadding, paddingBottom: 40 }}
+      onScroll={(event) => txtListCallbacksRef.current.handleScroll(event)}
+      onScrollEndDrag={(event) => txtListCallbacksRef.current.updateTxtScrollState(event, true)}
+      onMomentumScrollEnd={(event) => txtListCallbacksRef.current.updateTxtScrollState(event, true)}
+      onScrollToIndexFailed={(info) => {
+        const pending = pendingTxtNavigationRef.current;
+        if (!pending || pending.chunkIndex !== info.index || !scrollRef.current) return;
+
+        // 높이가 서로 다른 TXT chunk를 고정 layout처럼 취급하지 않는다.
+        // FlatList가 실제 측정한 평균으로 목표 주변을 먼저 렌더링하면,
+        // Cell onLayout/onTextLayout에서 정확한 문자 위치로 마무리한다.
+        // 목표 구간이 아직 렌더되지 않았다면 다음 프레임에 개선된 측정값으로 다시 시도한다.
+        const estimatedOffset = Math.max(0, info.averageItemLength * info.index);
+        scrollRef.current.scrollToOffset({ offset: estimatedOffset, animated: false });
+        scheduleTxtNavigationRetryRef.current();
+      }}
+      onContentSizeChange={(_width, height) => {
+        const measuredHeight = Math.max(1, height);
+        txtContentHeightRef.current = measuredHeight;
+        // state는 최초 복원 준비 신호로만 필요하다. 이후 가상 셀 측정 변화는
+        // ref에만 반영해 Reader 전체 재렌더와 셀 재부착을 만들지 않는다.
+        setTxtContentHeight((currentHeight) => (
+          currentHeight > 1 ? currentHeight : measuredHeight
+        ));
+      }}
+      scrollEventThrottle={16}
+      onLayout={(event) => {
+        const height = event.nativeEvent.layout.height;
+        setViewHeight(height);
+        viewHeightRef.current = height;
+      }}
+      onTouchStart={(event) => {
+        touchStartPos.current = {
+          x: event.nativeEvent.pageX,
+          y: event.nativeEvent.pageY,
+          time: Date.now(),
+          maxMove: 0,
+          active: true,
+          didScroll: false,
+        };
+      }}
+      onTouchMove={(event) => {
+        const touch = touchStartPos.current;
+        const dx = event.nativeEvent.pageX - touch.x;
+        const dy = event.nativeEvent.pageY - touch.y;
+        touch.maxMove = Math.max(touch.maxMove, Math.sqrt(dx * dx + dy * dy));
+        if (touch.maxMove > 8) touch.didScroll = true;
+      }}
+      onScrollBeginDrag={() => {
+        txtNavigationIdRef.current += 1;
+        pendingTxtNavigationRef.current = null;
+        isTxtProgrammaticNavigationRef.current = false;
+        // 사용자가 직접 스크롤하면 이어읽기 복원 정착은 즉시 포기한다.
+        txtResumeSettleRef.current = null;
+        if (touchStartPos.current.active) {
+          touchStartPos.current.didScroll = true;
+        }
+      }}
+      onTouchEnd={(event) => {
+        const touch = touchStartPos.current;
+        const dx = Math.abs(event.nativeEvent.pageX - touch.x);
+        const dy = Math.abs(event.nativeEvent.pageY - touch.y);
+        const elapsed = Date.now() - touch.time;
+        if (
+          !touch.didScroll
+          && elapsed >= 40
+          && elapsed <= 350
+          && dx <= 8
+          && dy <= 8
+          && touch.maxMove <= 8
+        ) {
+          setShowUI((previous) => !previous);
+        }
+        touch.active = false;
+      }}
+      onTouchCancel={() => {
+        touchStartPos.current.active = false;
+        touchStartPos.current.didScroll = true;
+      }}
+      renderItem={({ item, index }) => {
+        const target = txtSearchTarget?.chunkIndex === index ? txtSearchTarget : null;
+        const itemText = rawTextRef.current.slice(item.start, item.end);
+        return (
+          <Text
+            onTextLayout={(event) => (
+              txtListCallbacksRef.current.handleTxtTextLayout(
+                index,
+                event.nativeEvent.lines || [],
+              )
+            )}
+            style={[
+              styles.text,
+              {
+                fontSize: settings.fontSize,
+                color: settings.textColor,
+                lineHeight: settings.fontSize * settings.lineSpacing,
+                fontFamily: settings.fontFamily !== "default"
+                  ? settings.fontFamily
+                  : Platform.OS === "android" ? "sans-serif" : undefined,
+              },
+            ]}
+          >
+            {target ? (
+              <>
+                {itemText.slice(0, target.localOffset)}
+                <Text style={styles.searchHighlight}>
+                  {itemText.slice(target.localOffset, target.localOffset + target.length)}
+                </Text>
+                {itemText.slice(target.localOffset + target.length)}
+              </>
+            ) : itemText}
+          </Text>
+        );
+      }}
+      extraData={[
+        txtSearchTarget?.chunkIndex,
+        txtSearchTarget?.localOffset,
+        txtSearchTarget?.length,
+        settings.fontSize,
+        settings.textColor,
+        settings.lineSpacing,
+        settings.fontFamily,
+      ].join(":")}
+    />
+  ), [
+    content,
+    getTxtItemLayout,
+    renderTxtCell,
+    settings.bgColor,
+    settings.fontFamily,
+    settings.fontSize,
+    settings.lineSpacing,
+    settings.sidePadding,
+    settings.textColor,
+    txtLayoutModelVersion,
+    txtLayoutSignature,
+    txtSearchTarget,
+  ]);
 
   return (
     <View style={styles.root}>
@@ -5780,126 +6602,7 @@ useEffect(() => {
                 </TouchableOpacity>
               </View>
             ) : (
-            <FlatList
-              ref={scrollRef}
-              data={content}
-              keyExtractor={(_, index) => txtLayoutSignature + "-txt-" + index}
-              CellRendererComponent={renderTxtCell}
-              onViewableItemsChanged={onTxtViewableItemsChangedRef.current}
-              viewabilityConfig={txtViewabilityConfigRef.current}
-              getItemLayout={(_data, index) => getTxtEstimatedItemLayout(index)}
-              initialNumToRender={2}
-              maxToRenderPerBatch={2}
-              updateCellsBatchingPeriod={40}
-              windowSize={5}
-              removeClippedSubviews={false}
-              style={{ flex: 1, backgroundColor: settings.bgColor }}
-              contentContainerStyle={{ paddingHorizontal: settings.sidePadding, paddingBottom: 40 }}
-              onScroll={handleScroll}
-              onScrollEndDrag={(e) => updateTxtScrollState(e, true)}
-              onMomentumScrollEnd={(e) => updateTxtScrollState(e, true)}
-              onScrollToIndexFailed={(info) => {
-                const pending = pendingTxtNavigationRef.current;
-                if (!pending || pending.chunkIndex !== info.index || !scrollRef.current) return;
-
-                const measuredOffset = getTxtEstimatedItemLayout(info.index).offset;
-                scrollRef.current.scrollToOffset({ offset: measuredOffset, animated: false });
-              }}
-              onContentSizeChange={(_width, height) => {
-                const measuredHeight = Math.max(1, height);
-                txtContentHeightRef.current = measuredHeight;
-                // state는 최초 복원 준비 신호로만 필요하다. 이후 가상 셀 측정 변화는
-                // ref에만 반영해 Reader 전체 재렌더와 셀 재부착을 만들지 않는다.
-                setTxtContentHeight((currentHeight) => (
-                  currentHeight > 1 ? currentHeight : measuredHeight
-                ));
-              }}
-              scrollEventThrottle={16}
-              onLayout={(e) => { const h = e.nativeEvent.layout.height; setViewHeight(h); viewHeightRef.current = h; }}
-              onTouchStart={(e) => {
-                touchStartPos.current = {
-                  x: e.nativeEvent.pageX,
-                  y: e.nativeEvent.pageY,
-                  time: Date.now(),
-                  maxMove: 0,
-                  active: true,
-                  didScroll: false,
-                };
-              }}
-              onTouchMove={(e) => {
-                const touch = touchStartPos.current;
-                const dx = e.nativeEvent.pageX - touch.x;
-                const dy = e.nativeEvent.pageY - touch.y;
-                touch.maxMove = Math.max(touch.maxMove, Math.sqrt(dx * dx + dy * dy));
-                if (touch.maxMove > 8) touch.didScroll = true;
-              }}
-              onScrollBeginDrag={() => {
-                txtNavigationIdRef.current += 1;
-                pendingTxtNavigationRef.current = null;
-                isTxtProgrammaticNavigationRef.current = false;
-                if (touchStartPos.current.active) {
-                  touchStartPos.current.didScroll = true;
-                }
-              }}
-              onTouchEnd={(e) => {
-                const touch = touchStartPos.current;
-                const dx = Math.abs(e.nativeEvent.pageX - touch.x);
-                const dy = Math.abs(e.nativeEvent.pageY - touch.y);
-                const elapsed = Date.now() - touch.time;
-                if (
-                  !touch.didScroll &&
-                  elapsed >= 40 &&
-                  elapsed <= 350 &&
-                  dx <= 8 &&
-                  dy <= 8 &&
-                  touch.maxMove <= 8
-                ) {
-                  setShowUI((prev) => !prev);
-                }
-                touch.active = false;
-              }}
-              onTouchCancel={() => {
-                touchStartPos.current.active = false;
-                touchStartPos.current.didScroll = true;
-              }}
-              renderItem={({ item, index }) => {
-                const target = txtSearchTarget?.chunkIndex === index ? txtSearchTarget : null;
-                const itemText = rawTextRef.current.slice(item.start, item.end);
-                return (
-                  <Text
-                    onTextLayout={(e) => handleTxtTextLayout(index, e.nativeEvent.lines || [])}
-                    style={[
-                      styles.text,
-                      {
-                        fontSize: settings.fontSize,
-                        color: settings.textColor,
-                        lineHeight: settings.fontSize * settings.lineSpacing,
-                        fontFamily: settings.fontFamily !== "default" ? settings.fontFamily : undefined,
-                      },
-                    ]}
-                  >
-                    {target ? (
-                      <>
-                        {itemText.slice(0, target.localOffset)}
-                        <Text style={styles.searchHighlight}>
-                          {itemText.slice(target.localOffset, target.localOffset + target.length)}
-                        </Text>
-                        {itemText.slice(target.localOffset + target.length)}
-                      </>
-                    ) : itemText}
-                  </Text>
-                );
-              }}
-              extraData={[
-                txtSearchTarget?.chunkIndex,
-                txtSearchTarget?.localOffset,
-                txtSearchTarget?.length,
-                settings.fontSize,
-                settings.textColor,
-                settings.lineSpacing,
-                settings.fontFamily,
-              ].join(":")}
-            />
+            txtReaderList
             )}
           </View>
         </>
@@ -5924,7 +6627,7 @@ useEffect(() => {
             ) : isEpub && epubNavigationError ? (
               <Text style={styles.navigationErrorText}>!</Text>
             ) : (
-              <Text style={styles.pageText}>{Math.round(progress * 100)}%</Text>
+              <Text style={styles.pageText}>{Math.round((sliderPreviewValue ?? progress) * 100)}%</Text>
             )}
           </View>
 
@@ -5932,11 +6635,13 @@ useEffect(() => {
             style={{ width: "100%", opacity: isEpub && !epubNavigationReady ? 0.35 : 1 }}
             minimumValue={0}
             maximumValue={1}
-            value={progress}
+            value={sliderPreviewValue ?? progress}
             disabled={isEpub && !epubNavigationReady}
             minimumTrackTintColor="#b84a8c"
             maximumTrackTintColor="#ddd"
             thumbTintColor="#b84a8c"
+            onSlidingStart={handleSliderStart}
+            onValueChange={scheduleSliderSeek}
             onSlidingComplete={handleSliderComplete}
           />
         </View>
@@ -6030,19 +6735,44 @@ useEffect(() => {
                     key={f.value}
                     style={[
                       styles.fontBtn,
-                      settings.fontFamily === f.value && styles.fontBtnActive,
+                      !settings.usePublisherFont
+                        && settings.fontFamily === f.value
+                        && styles.fontBtnActive,
                     ]}
-                    onPress={() => setSettings(s => ({ ...s, fontFamily: f.value }))}
+                    onPress={() => setSettings(s => ({
+                      ...s,
+                      fontFamily: f.value,
+                      usePublisherFont: false,
+                    }))}
                   >
                     <Text style={[
                       styles.fontBtnText,
-                      settings.fontFamily === f.value && styles.fontBtnTextActive,
+                      !settings.usePublisherFont
+                        && settings.fontFamily === f.value
+                        && styles.fontBtnTextActive,
                       f.value !== "default" && { fontFamily: f.value },
                     ]}>{f.label}</Text>
                   </TouchableOpacity>
                 ))}
               </View>
             </View>
+
+            {isEpub && (
+              <View style={styles.settingsRow}>
+                <Text style={styles.settingsLabel}>출판사 글꼴</Text>
+                <View style={styles.publisherFontControl}>
+                  <Switch
+                    value={settings.usePublisherFont}
+                    onValueChange={(value) => setSettings((current) => ({
+                      ...current,
+                      usePublisherFont: value,
+                    }))}
+                    trackColor={{ false: "#d7d7d7", true: "#d98ab8" }}
+                    thumbColor={settings.usePublisherFont ? "#b84a8c" : "#f4f4f4"}
+                  />
+                </View>
+              </View>
+            )}
 
             {/* 줄 간격 */}
             <View style={styles.settingsRow}>
@@ -6373,6 +7103,10 @@ const styles = StyleSheet.create({
   fontBtnTextActive: {
     color: "#b84a8c",
     fontWeight: "700",
+  },
+  publisherFontControl: {
+    flex: 1,
+    alignItems: "flex-end",
   },
   resetBtn: {
     marginTop: 4,

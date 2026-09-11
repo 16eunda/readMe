@@ -7,12 +7,17 @@ import * as Linking from 'expo-linking';
 import { Stack, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useRef } from 'react';
+import { Platform } from 'react-native';
 import 'react-native-reanimated';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { UserProvider, useUser } from '../contexts/UserContext';
-import { getExternalFileDisplayName } from '../modules/external-file-info/src';
+import {
+  clearExternalFileIntent,
+  getExternalFileDisplayName,
+  isLaunchedFromHistory,
+} from '../modules/external-file-info/src';
 import { flushActiveReaderSession } from '../utils/readerLifecycle';
 
 const ACTIVE_READER_SESSION_KEY = '@active_reader_session';
@@ -206,6 +211,7 @@ function AppContent() {
 
         console.log('📂 외부 파일 수신 완료:', name);
         lastIncomingUrlRef.current = { url: normalizedUrl, handledAt: Date.now() };
+        await clearExternalFileIntent(url);
         setIncomingFile({ uri: finalUri, name });
         // 리더가 열려 있더라도 중복 확인창과 등록 상태가 보이는 홈으로 이동한다.
         router.replace('/(tabs)' as any);
@@ -221,9 +227,14 @@ function AppContent() {
     if (!didReadInitialUrlRef.current) {
       didReadInitialUrlRef.current = true;
       Linking.getInitialURL().then(async (initialUrl) => {
-        if (initialUrl) {
+        const isHistoryRelaunch = Platform.OS === 'android'
+          && await isLaunchedFromHistory();
+        if (initialUrl && !isHistoryRelaunch) {
           await processIncomingUrl(initialUrl);
         } else {
+          if (initialUrl && isHistoryRelaunch) {
+            console.log('↩️ 최근 앱에서 재실행된 기존 파일 intent는 다시 등록하지 않음');
+          }
           await restoreActiveReader();
         }
       });
