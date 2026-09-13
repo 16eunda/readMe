@@ -6,6 +6,18 @@ type ExternalFileInfoModule = {
   isGooglePlayInstallAsync?: () => Promise<boolean>;
   isLaunchedFromHistoryAsync?: () => Promise<boolean>;
   clearCurrentIntentDataAsync?: (expectedUri: string) => Promise<void>;
+  getCurrentIntentInfoAsync?: () => Promise<ExternalIntentInfo | null>;
+};
+
+export type ExternalIntentInfo = {
+  action: string | null;
+  data: string | null;
+  mimeType: string | null;
+  flags: string;
+  grantReadUriFlag: boolean;
+  persistableGrantFlag: boolean;
+  clipDataUris: string[];
+  readPermission: "granted" | "denied" | "not-content-uri" | "no-data";
 };
 
 const ExternalFileInfo = requireOptionalNativeModule<ExternalFileInfoModule>("ExternalFileInfo");
@@ -47,5 +59,14 @@ export async function clearExternalFileIntent(expectedUri: string): Promise<void
     await ExternalFileInfo?.clearCurrentIntentDataAsync?.(expectedUri);
   } catch {
     // 파일은 이미 앱 저장소로 복사됐으므로 intent 정리 실패가 등록을 막으면 안 된다.
+  }
+}
+
+// 개발 로그용: 현재 Activity Intent의 action/MIME/flag/ClipData와 URI 읽기 권한
+export async function getCurrentExternalIntentInfo(): Promise<ExternalIntentInfo | null> {
+  try {
+    return (await ExternalFileInfo?.getCurrentIntentInfoAsync?.()) ?? null;
+  } catch {
+    return null;
   }
 }

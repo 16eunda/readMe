@@ -1,8 +1,11 @@
 package com.readme.externalfileinfo
 
+import android.content.ContentResolver
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Process
 import android.provider.OpenableColumns
 import expo.modules.kotlin.exception.Exceptions
 import expo.modules.kotlin.modules.Module
@@ -72,6 +75,38 @@ class ExternalFileInfoModule : Module() {
     AsyncFunction("isLaunchedFromHistoryAsync") {
       val flags = appContext.currentActivity?.intent?.flags ?: 0
       flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+    }
+
+    // 개발 로그용: 현재 Activity Intent(onNewIntent로 최신화됨)의 전달 형태와 URI 읽기 권한
+    AsyncFunction("getCurrentIntentInfoAsync") {
+      val activity = appContext.currentActivity ?: return@AsyncFunction null
+      val intent = activity.intent ?: return@AsyncFunction null
+      val data = intent.data
+      val clipUris = intent.clipData?.let { clip ->
+        (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri?.toString() }
+      } ?: emptyList()
+      val readPermission = when {
+        data == null -> "no-data"
+        data.scheme != ContentResolver.SCHEME_CONTENT -> "not-content-uri"
+        activity.checkUriPermission(
+          data,
+          Process.myPid(),
+          Process.myUid(),
+          Intent.FLAG_GRANT_READ_URI_PERMISSION,
+        ) == PackageManager.PERMISSION_GRANTED -> "granted"
+        else -> "denied"
+      }
+
+      mapOf(
+        "action" to intent.action,
+        "data" to intent.dataString,
+        "mimeType" to intent.type,
+        "flags" to "0x${Integer.toHexString(intent.flags)}",
+        "grantReadUriFlag" to (intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0),
+        "persistableGrantFlag" to (intent.flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION != 0),
+        "clipDataUris" to clipUris,
+        "readPermission" to readPermission,
+      )
     }
 
     AsyncFunction("clearCurrentIntentDataAsync") { expectedUri: String ->

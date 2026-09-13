@@ -48,6 +48,7 @@ import FileOptionsModal from "../../components/FileOptionsModal";
 import FolderOptionsModal from "../../components/FolderOptionsModal";
 import FolderRenameModal from "../../components/FolderRenameModal";
 import PreviewModal from "../../components/PreviewModal";
+import { isSupportedFileName } from "../../utils/externalFile";
 import SortModal, { SortOption } from "../../components/SortModal";
 import { useUser } from "../../contexts/UserContext";
 import { flushActiveReaderSession } from "../../utils/readerLifecycle";
@@ -65,17 +66,6 @@ const activeExternalRegistrations = new Set<string>();
 
 const getExternalRegistrationKey = (name: string, uri: string) =>
   `root:${name.trim().toLocaleLowerCase()}:${uri}`;
-
-// 지원 형식 판정. 확장자가 없는 파일은 기존대로 TXT로 취급한다.
-function getFileExtension(name: string) {
-  const index = String(name || "").lastIndexOf(".");
-  return index > 0 ? String(name).slice(index).toLowerCase() : "";
-}
-
-function isSupportedFileName(name: string) {
-  const extension = getFileExtension(name);
-  return extension === "" || extension === ".txt" || extension === ".epub";
-}
 
 function readFilePrefix(uri: string, byteCount: number): Buffer {
   let handle: FileHandle | null = null;
@@ -578,6 +568,7 @@ export default function Home() {
     
     try {
       // 중복 체크 (root 폴더 기준)
+      if (__DEV__) console.log('[External File Handling] duplicate check start', { name, operationId });
       const checkRes = await authenticatedFetch(
         `${BASE_URL}/files/check?title=${encodeURIComponent(name)}&path=root`,
         { signal: fileRegistrationAbortRef.current?.signal },
@@ -602,8 +593,10 @@ export default function Home() {
       }
 
       // 새 파일 → root에 추가 후 바로 reader로 이동
+      if (__DEV__) console.log('[External File Handling] register start', { name, operationId });
       const saved = await addFileToSystem({ uri, name }, 'root', operationId);
       if (saved && isCurrentFileRegistration(operationId)) {
+        if (__DEV__) console.log('[Reader] new file open', { fileId: saved.id, name: saved.title });
         router.push({
           pathname: '/reader',
           params: { fileId: saved.id, uri: saved.uri, name: saved.title, type: saved.type },
@@ -612,6 +605,10 @@ export default function Home() {
     } catch (e) {
       if (!isCurrentFileRegistration(operationId)) return;
       console.error('❌ 외부 파일 처리 실패:', e);
+      // 앱 내부 파일 추가와 같이 실패를 알린다. (화면 이탈로 인한 요청 취소는 제외)
+      if ((e as any)?.name !== 'AbortError') {
+        Alert.alert('파일 추가 실패', String(e));
+      }
     } finally {
       if (!waitingForDuplicateConfirmation) {
         activeExternalRegistrations.delete(registrationKey);
