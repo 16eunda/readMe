@@ -466,11 +466,14 @@ export default function Home() {
       return;
     }
     if (prevUserIdRef.current !== nextUserId && deviceId) {
-      console.log(user ? "🔐 로그인 감지 → 캐시 무효화" : "🚪 로그아웃 감지 → 캐시 무효화");
+      console.log(user ? "🔐 로그인 감지 → 캐시 초기화" : "🚪 로그아웃 감지 → 캐시 초기화");
       prevUserIdRef.current = nextUserId;
-      queryClient.invalidateQueries({ queryKey: ['files'] });
-      queryClient.invalidateQueries({ queryKey: ['folders'] });
-      queryClient.invalidateQueries({ queryKey: ['allFolders'] });
+      // invalidateQueries는 새로 fetch가 끝나기 전까지 화면에 이전 데이터를 그대로 유지한다.
+      // 계정이 바뀐 직후에는 그 잠깐 사이에도 이전 계정의 파일/폴더 목록이 보이면 안 되므로,
+      // 캐시된 데이터 자체를 즉시 비우는 resetQueries를 사용한다.
+      queryClient.resetQueries({ queryKey: ['files'] });
+      queryClient.resetQueries({ queryKey: ['folders'] });
+      queryClient.resetQueries({ queryKey: ['allFolders'] });
     }
   }, [user?.userId, deviceId, isUserLoading, queryClient]);
 

@@ -70,6 +70,7 @@ export default function SubscriptionScreen() {
   // IAP 초기화 및 결제 리스너 등록
   useEffect(() => {
     let purchaseListener: any;
+    let errorListener: any;
     let connectedIap: typeof import('react-native-iap') | null = null;
     let active = true;
 
@@ -98,10 +99,29 @@ export default function SubscriptionScreen() {
         }
         setIapReady(true);
 
+        // 결제 실패/취소 리스너.
+        // requestPurchase는 결제창을 띄우고 바로 반환하며 실제 결과는 이벤트로만 전달된다.
+        // 이 리스너가 없으면 사용자가 결제창을 취소했을 때 isLoading이 true로 남아
+        // 구독 버튼이 계속 비활성 상태가 된다.
+        errorListener = iap.purchaseErrorListener((error: any) => {
+          setIsLoading(false);
+          if (error?.code === 'E_USER_CANCELLED') return;
+          console.log('결제 오류:', error?.code, error?.message);
+          Alert.alert('결제 오류', '결제를 완료하지 못했습니다. 다시 시도해주세요.');
+        });
+
         // 결제 완료 리스너
         purchaseListener = iap.purchaseUpdatedListener(async (purchase: any) => {
           try {
             if (!purchase.purchaseToken) return;
+
+            // 아직 승인 대기 중인 결제(예: 현금 결제)는 결제가 끝난 것이 아니므로
+            // 서버에 등록하거나 승인하지 않는다. 결제가 확정되면 다시 전달된다.
+            if (purchase.purchaseState === 'pending') {
+              console.log('ℹ️ 보류 중인 결제 - 확정 후 다시 처리됩니다.');
+              Alert.alert('결제 대기 중', '결제가 승인되면 프리미엄이 자동으로 적용됩니다.');
+              return;
+            }
 
             // 백엔드에 구독 요청
             const res = await authenticatedFetch(`${BASE_URL}/subscriptions/subscribe`, {
@@ -118,11 +138,19 @@ export default function SubscriptionScreen() {
             });
 
             if (res.ok) {
-              await iap.finishTransaction({ purchase, isConsumable: false });
+              // 백엔드에 구독이 등록된 시점에 먼저 프리미엄 상태를 반영하고 사용자에게 알린다.
+              // finishTransaction이 네트워크 등으로 실패해도 결제/서버 등록 자체는 끝난 것이므로
+              // 사용자에게 완료 사실을 숨기지 않는다. 끝내지 못한 트랜잭션은 react-native-iap가
+              // 다음 initConnection 때 purchaseUpdatedListener로 다시 전달해 재시도할 수 있다.
               await checkSubscription();
               Alert.alert('🎉 구독 완료!', '프리미엄 기능을 모두 이용할 수 있어요!', [
                 { text: '확인', onPress: () => router.back() },
               ]);
+              try {
+                await iap.finishTransaction({ purchase, isConsumable: false });
+              } catch (finishError) {
+                console.error('finishTransaction 실패 (다음 실행 시 재시도됨):', finishError);
+              }
             } else {
               Alert.alert('오류', '구독 검증에 실패했습니다. 고객센터에 문의해주세요.');
             }
@@ -146,6 +174,7 @@ export default function SubscriptionScreen() {
     return () => {
       active = false;
       purchaseListener?.remove();
+      errorListener?.remove();
       if (connectedIap) {
         void connectedIap.endConnection().catch(() => {});
       }
