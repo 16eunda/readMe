@@ -85,6 +85,11 @@ export default function AiAnalysisModal({
           await handlePremiumRequired();
           return;
         }
+        // 서버는 분석 실패도 200 OK + analysisStatus: "FAILED" 로 응답한다.
+        if (data.analysisStatus === "FAILED") {
+          setFailed(true);
+          return;
+        }
         // keywords가 문자열로 오면 파싱, 없으면 빈 배열
         if (typeof data.keywords === "string") {
           console.log("🔍 keywords 문자열 감지:", data.keywords);

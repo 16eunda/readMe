@@ -458,10 +458,13 @@ export default function ReaderScreen() {
 
   // epub 전용 base64 데이터
   const [epubBase64, setEpubBase64] = useState("");
+  // location 간격 정책은 "파일 크기" 기준을 유지한다. (로딩 방식과 분리)
+  const [epubFileSize, setEpubFileSize] = useState(0);
   const [epubLoadKey, setEpubLoadKey] = useState("");
   const epubLoadRetryRef = useRef(0);
   const webViewRef = useRef<WebView>(null);
   const epubOpenStartedAtRef = useRef(0);
+  const txtOpenStartedAtRef = useRef(0);
   const epubTouchStartRef = useRef({
     x: 0,
     y: 0,
@@ -758,6 +761,7 @@ export default function ReaderScreen() {
     
     setIsEpub(isEpubFile);
     setEpubBase64("");
+    setEpubFileSize(0);
     setEpubLoadKey("");
     epubLoadRetryRef.current = 0;
     setEpubReady(false);
@@ -866,14 +870,19 @@ export default function ReaderScreen() {
               `⏱️ EPUB [${Date.now() - epubOpenStartedAtRef.current}ms] 파일 정보 조회 완료`,
               `${(fileSize / 1024 / 1024).toFixed(1)}MB`,
             );
-            if (fileSize >= 5 * 1024 * 1024) {
-              console.log("✅ 대용량 EPUB 파일 URI 직접 로드:", (fileSize / 1024 / 1024).toFixed(1), "MB");
+            // 파일 URI로 바로 여는 경로가 압도적으로 빠르다.
+            // base64로 읽으면 파일 전체가 문자열이 되어 WebView HTML에 박히고,
+            // RN 브리지 전달 + 거대 HTML 파싱 비용이 파일 크기에 비례해 붙는다.
+            if (decoded.startsWith("file://")) {
+              console.log("✅ EPUB 파일 URI 직접 로드:", (fileSize / 1024 / 1024).toFixed(1), "MB");
               if (!active) return;
+              setEpubFileSize(fileSize);
               setEpubBase64("__FILE_URI__");
               setEpubLoadKey(`${String(fileId || '')}-${Date.now()}-${Math.random()}`);
               return;
             }
 
+            // file:// 이 아닌 예외적인 경로만 기존 base64 방식으로 처리한다.
             const b64 = await readWithFallback(decoded, {
               encoding: FileSystem.EncodingType.Base64,
             });
@@ -885,6 +894,7 @@ export default function ReaderScreen() {
               return;
             }
             if (!active) return;
+            setEpubFileSize(fileSize);
             setEpubBase64(b64);
             setEpubLoadKey(`${String(fileId || '')}-${Date.now()}-${Math.random()}`);
           } catch (epubError) {
@@ -893,7 +903,8 @@ export default function ReaderScreen() {
           }
         } else {
           // TXT 파일
-          console.log("text 파일 읽기");
+          txtOpenStartedAtRef.current = Date.now();
+          console.log("⏱️ TXT [0ms] 파일 열기 시작:", fileName);
           hasResumedRef.current = false;
           setTxtLoading(true);
           setTxtError(null);
@@ -923,6 +934,8 @@ export default function ReaderScreen() {
           currentReadingPreviewRef.current = "";
 
           let text = await readTextWithNativeFallback(decoded);
+          console.log(`⏱️ TXT [${Date.now() - txtOpenStartedAtRef.current}ms] 파일 읽기/디코딩 완료`,
+            text == null ? "native-fail" : `${text.length}자`);
           if (text == null) {
             console.log("⚠️ 네이티브 TXT 읽기 실패, JS base64 폴백 사용");
             const base64 = await readWithFallback(decoded, {
@@ -934,7 +947,9 @@ export default function ReaderScreen() {
 
           if (!active) return;
           const normalizedText = text.includes('\r') ? text.replace(/\r/g, '') : text;
+          console.log(`⏱️ TXT [${Date.now() - txtOpenStartedAtRef.current}ms] 개행 정규화 완료`);
           const chunks = splitTextIntoRenderChunks(normalizedText);
+          console.log(`⏱️ TXT [${Date.now() - txtOpenStartedAtRef.current}ms] 구간 분할 완료`, `${chunks.length}개`);
           rawTextRef.current = normalizedText; // progress 비율 fallback용
           currentTxtCharOffsetRef.current = 0;
           currentTxtPreviewCharOffsetRef.current = 0;
@@ -955,6 +970,7 @@ export default function ReaderScreen() {
           setContent(chunks);
           contentRef.current = chunks;
           setTxtLoading(false);
+          console.log(`⏱️ TXT [${Date.now() - txtOpenStartedAtRef.current}ms] 본문 렌더 요청`);
         }
       } catch (e) {
         console.error("❌ 파일 읽기 오류:", e);
@@ -985,7 +1001,10 @@ export default function ReaderScreen() {
 
     // 실제 기기의 대용량 EPUB은 HTML 주입, base64 디코딩, ZIP 분석에 오래 걸릴 수 있다.
     // 시간 초과만으로 정상 WebView를 파괴하거나 파일 오류로 판정하지 않는다.
-    const estimatedMegabytes = epubBase64.length / 4 * 3 / (1024 * 1024);
+    // 파일 URI로 열면 base64 길이가 없으므로 실제 파일 크기를 쓴다.
+    const estimatedMegabytes = epubFileSize > 0
+      ? epubFileSize / (1024 * 1024)
+      : epubBase64.length / 4 * 3 / (1024 * 1024);
     const readyTimeoutMs = Math.min(300000, Math.max(90000, 60000 + estimatedMegabytes * 6000));
     const timer = setTimeout(() => {
       if (epubReady) return;
@@ -996,7 +1015,7 @@ export default function ReaderScreen() {
     }, readyTimeoutMs);
 
     return () => clearTimeout(timer);
-  }, [isEpub, epubBase64, epubLoadKey, epubReady, fileId]);
+  }, [isEpub, epubBase64, epubFileSize, epubLoadKey, epubReady, fileId]);
 
   // 서버에서 불러온 초기 progress (이어읽기 시작점)
   const [initialProgress, setInitialProgress] = useState<number>(0);
@@ -1720,8 +1739,8 @@ useEffect(() => {
     if (actual == null) return;
 
     if (Math.abs(actual - settle.characterOffset) <= TXT_RESUME_SETTLE_TOLERANCE) {
-      console.log("[Restore] 완료 char=" + actual
-        + " (재정렬 " + settle.attempts + "회) 본문=\"" + txtSnippetAt(actual) + "\"");
+      console.log(`⏱️ TXT [${Date.now() - txtOpenStartedAtRef.current}ms] 이어읽기 복원 완료`
+        + " char=" + actual + " (재정렬 " + settle.attempts + "회)");
       txtResumeSettleRef.current = null;
       return;
     }
@@ -2757,7 +2776,8 @@ useEffect(() => {
             var book;
             var rawZipPromise = null;
             var archiveBytes = null;
-            var archiveDecodedLength = 0;
+            // 파일 URI로 열면 디코딩한 바이트가 없으므로 RN이 알려준 파일 크기를 쓴다.
+            var archiveDecodedLength = ${Number(epubFileSize) || 0};
             if (useDirectFile) {
               sendLog("📂 대용량 EPUB 파일 URI 직접 초기화: " + directFileUri);
               book = ePub(directFileUri, { openAs: "epub" });
@@ -3446,7 +3466,7 @@ useEffect(() => {
                 estimatedTextLength += fallbackTextLengths[key] || 0;
               });
               var locationBreakSize;
-              if (useDirectFile || archiveDecodedLength >= 5 * 1024 * 1024) {
+              if (archiveDecodedLength >= 5 * 1024 * 1024) {
                 locationBreakSize = 1000;
               } else if (estimatedTextLength > 0) {
                 // 최대 약 1,200개 location, 최소 180자 간격
@@ -5859,7 +5879,7 @@ useEffect(() => {
       </script>
     </body>
   </html>
-  `, [epubBase64, uri]);
+  `, [epubBase64, epubFileSize, uri]);
 
   const epubSource = useMemo(() => ({
     html: epubHtml,
