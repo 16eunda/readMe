@@ -9,6 +9,7 @@ import {
   setAuthFailureHandler,
 } from '../utils/api';
 import { getDeviceId } from '../utils/deviceId';
+import { restorePurchases } from '../utils/subscriptionPurchases';
 import {
   clearOrphanedTokensOnFreshInstall,
   clearTokens,
@@ -299,6 +300,11 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
       console.error('사용자 데이터 로드 실패:', error);
     } finally {
       setIsLoading(false);
+      // 구매 복원은 로그인 상태(저장된 토큰)가 확정된 뒤에 돌려야 올바른 계정/기기로 등록된다.
+      // 모든 종료 경로가 여기를 지나므로 이곳에서 기다리지 않고 조용히 실행한다.
+      void restorePurchases().then((result) => {
+        if (result === 'restored') void checkSubscription();
+      });
     }
   };
 

@@ -13,17 +13,13 @@ import {
   View,
 } from 'react-native';
 import { useUser } from '../contexts/UserContext';
-import { isGooglePlayInstall } from '../modules/external-file-info/src';
-import { authenticatedFetch, BASE_URL } from '../utils/api';
-
-// ✅ Google Play Console에서 등록한 구독 상품 ID와 일치해야 함
-const PRODUCT_IDS = {
-  monthly: 'monthly_2900',
-  yearly: 'yearly_19900',
-};
-
-// Expo Go / 에뮬레이터에서는 IAP 불가 → 빌드된 APK에서만 동작
-const IS_NATIVE_IAP_BUILD = !__DEV__;
+import {
+  acquireIapConnection,
+  registerSubscriptionPurchase,
+  releaseIapConnection,
+  restorePurchases,
+  SUBSCRIPTION_PRODUCT_IDS,
+} from '../utils/subscriptionPurchases';
 
 const FEATURES = [
   { emoji: '🤖', text: 'AI 독서 추천 무제한' },
@@ -66,52 +62,48 @@ export default function SubscriptionScreen() {
   const [selectedPlan, setSelectedPlan] = useState<'monthly' | 'yearly'>('yearly');
   const [isLoading, setIsLoading] = useState(false);
   const [iapReady, setIapReady] = useState(false);
+  const [isRestoring, setIsRestoring] = useState(false);
 
   // IAP 초기화 및 결제 리스너 등록
   useEffect(() => {
-    let purchaseListener: any;
-    let errorListener: any;
-    let connectedIap: typeof import('react-native-iap') | null = null;
+    let purchaseListener: { remove: () => void } | undefined;
+    let errorListener: { remove: () => void } | undefined;
+    let connected = false;
     let active = true;
 
     const setup = async () => {
-      if (!IS_NATIVE_IAP_BUILD) {
-        console.log('ℹ️ IAP는 빌드된 APK에서만 동작합니다 (Expo Go 불가)');
+      // Billing 연결은 앱 시작 시 구매 복원과 공유한다. 이 화면이 직접 initConnection/endConnection을
+      // 부르면 복원이 끝나면서 이 화면의 연결까지 끊긴다.
+      const iap = await acquireIapConnection();
+      if (!iap) return;
+      if (!active) {
+        releaseIapConnection();
         return;
       }
-      try {
-        if (Platform.OS === 'android' && !(await isGooglePlayInstall())) {
-          console.log('ℹ️ Google Play 설치 앱이 아니므로 Billing 초기화를 건너뜁니다.');
-          return;
-        }
+      connected = true;
 
-        const iap = await import('react-native-iap');
-        await iap.initConnection();
-        connectedIap = iap;
+      try {
         await iap.fetchProducts({
-          skus: Object.values(PRODUCT_IDS),
+          skus: Object.values(SUBSCRIPTION_PRODUCT_IDS),
           type: 'subs',
         });
-        if (!active) {
-          await iap.endConnection();
-          connectedIap = null;
-          return;
-        }
+        if (!active) return;
         setIapReady(true);
 
         // 결제 실패/취소 리스너.
         // requestPurchase는 결제창을 띄우고 바로 반환하며 실제 결과는 이벤트로만 전달된다.
         // 이 리스너가 없으면 사용자가 결제창을 취소했을 때 isLoading이 true로 남아
         // 구독 버튼이 계속 비활성 상태가 된다.
-        errorListener = iap.purchaseErrorListener((error: any) => {
+        errorListener = iap.purchaseErrorListener((error) => {
           setIsLoading(false);
-          if (error?.code === 'E_USER_CANCELLED') return;
+          // react-native-iap 15의 취소 코드는 'user-cancelled'다. 문자열 비교 대신 라이브러리 판정을 쓴다.
+          if (iap.isUserCancelledError(error)) return;
           console.log('결제 오류:', error?.code, error?.message);
           Alert.alert('결제 오류', '결제를 완료하지 못했습니다. 다시 시도해주세요.');
         });
 
         // 결제 완료 리스너
-        purchaseListener = iap.purchaseUpdatedListener(async (purchase: any) => {
+        purchaseListener = iap.purchaseUpdatedListener(async (purchase) => {
           try {
             if (!purchase.purchaseToken) return;
 
@@ -123,21 +115,10 @@ export default function SubscriptionScreen() {
               return;
             }
 
-            // 백엔드에 구독 요청
-            const res = await authenticatedFetch(`${BASE_URL}/subscriptions/subscribe`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                purchaseToken: purchase.purchaseToken,
-                productId: purchase.productId,
-                planType: purchase.productId === 'monthly_2900' ? 'monthly' : 'yearly',
-                platform: Platform.OS.toUpperCase(),
-              }),
-            });
+            // 백엔드에 구독 등록 (구매 복원과 같은 요청을 쓴다)
+            const registered = await registerSubscriptionPurchase(purchase);
 
-            if (res.ok) {
+            if (registered === 'registered') {
               // 백엔드에 구독이 등록된 시점에 먼저 프리미엄 상태를 반영하고 사용자에게 알린다.
               // finishTransaction이 네트워크 등으로 실패해도 결제/서버 등록 자체는 끝난 것이므로
               // 사용자에게 완료 사실을 숨기지 않는다. 끝내지 못한 트랜잭션은 react-native-iap가
@@ -151,6 +132,8 @@ export default function SubscriptionScreen() {
               } catch (finishError) {
                 console.error('finishTransaction 실패 (다음 실행 시 재시도됨):', finishError);
               }
+            } else if (registered === 'owned-by-other-account') {
+              Alert.alert('다른 계정의 구독', '이 Google Play 구독은 다른 계정에 연결돼 있어요. 구독한 계정으로 로그인해 주세요.');
             } else {
               Alert.alert('오류', '구독 검증에 실패했습니다. 고객센터에 문의해주세요.');
             }
@@ -161,11 +144,11 @@ export default function SubscriptionScreen() {
           }
         });
       } catch (e) {
-        console.log('IAP 초기화 실패 (에뮬레이터/Expo Go에서는 정상):', e);
-        if (active) setIapReady(false);
-        if (connectedIap) {
-          await connectedIap.endConnection().catch(() => {});
-          connectedIap = null;
+        console.log('IAP 초기화 실패:', e);
+        if (active) {
+          setIapReady(false);
+          connected = false;
+          releaseIapConnection();
         }
       }
     };
@@ -175,11 +158,16 @@ export default function SubscriptionScreen() {
       active = false;
       purchaseListener?.remove();
       errorListener?.remove();
-      if (connectedIap) {
-        void connectedIap.endConnection().catch(() => {});
-      }
+      if (connected) releaseIapConnection();
     };
   }, []);
+
+  const alertIapUnavailable = () => {
+    const message = Platform.OS === 'android'
+      ? 'Google Play에서 설치한 최신 앱과 활성화된 Google Play 스토어가 필요합니다.'
+      : '결제 서비스를 준비하지 못했습니다. 잠시 후 다시 시도해주세요.';
+    Alert.alert('결제를 사용할 수 없어요', message);
+  };
 
   const handleSubscribe = async () => {
     if (!user) {
@@ -188,17 +176,15 @@ export default function SubscriptionScreen() {
     }
 
     if (!iapReady) {
-      const message = Platform.OS === 'android'
-        ? 'Google Play에서 설치한 최신 앱과 활성화된 Google Play 스토어가 필요합니다.'
-        : '결제 서비스를 준비하지 못했습니다. 잠시 후 다시 시도해주세요.';
-      Alert.alert('결제를 사용할 수 없어요', message);
+      alertIapUnavailable();
       return;
     }
 
+    // iapReady면 이미 로드된 모듈이다.
+    const iap = await import('react-native-iap');
     try {
       setIsLoading(true);
-      const sku = selectedPlan === 'monthly' ? PRODUCT_IDS.monthly : PRODUCT_IDS.yearly;
-      const iap = await import('react-native-iap');
+      const sku = selectedPlan === 'monthly' ? SUBSCRIPTION_PRODUCT_IDS.monthly : SUBSCRIPTION_PRODUCT_IDS.yearly;
       await iap.requestPurchase({
         request: {
           google: { skus: [sku] },
@@ -207,11 +193,36 @@ export default function SubscriptionScreen() {
         type: 'subs',
       });
       // 결제 결과는 purchaseUpdatedListener에서 처리됨
-    } catch (e: any) {
+    } catch (e) {
       setIsLoading(false);
-      if (e?.code !== 'E_USER_CANCELLED') {
+      if (!iap.isUserCancelledError(e)) {
         Alert.alert('결제 오류', '결제 중 오류가 발생했습니다. 다시 시도해주세요.');
       }
+    }
+  };
+
+  // 재설치·기기 변경 후 구독 복원. 비회원 구독도 복원되므로 로그인을 요구하지 않는다.
+  const handleRestore = async () => {
+    if (!iapReady) {
+      alertIapUnavailable();
+      return;
+    }
+
+    setIsRestoring(true);
+    try {
+      const result = await restorePurchases();
+      if (result === 'restored') {
+        await checkSubscription();
+        Alert.alert('복원 완료', '프리미엄 구독이 복원되었어요.');
+      } else if (result === 'owned-by-other-account') {
+        Alert.alert('다른 계정의 구독', '이 구독은 다른 계정에 연결돼 있어요. 구독한 계정으로 로그인해 주세요.');
+      } else if (result === 'nothing') {
+        Alert.alert('복원할 구독 없음', '이 Google 계정으로 결제한 구독을 찾지 못했어요.');
+      } else {
+        Alert.alert('복원 실패', '잠시 후 다시 시도해 주세요.');
+      }
+    } finally {
+      setIsRestoring(false);
     }
   };
 
@@ -367,6 +378,18 @@ export default function SubscriptionScreen() {
           구독은 App Store / Google Play 계정으로 청구됩니다.{'\n'}
           구독 기간 중 취소해도 만료일까지 이용 가능합니다.
         </Text>
+
+        {/* 구매 복원 */}
+        <TouchableOpacity
+          style={styles.restoreBtn}
+          onPress={handleRestore}
+          disabled={isRestoring || isLoading}
+        >
+          {isRestoring
+            ? <ActivityIndicator color={PURPLE} />
+            : <Text style={styles.restoreBtnText}>구매 복원</Text>
+          }
+        </TouchableOpacity>
       </ScrollView>
     </SafeAreaView>
   );
@@ -476,6 +499,17 @@ const styles = StyleSheet.create({
     color: '#aaa',
     fontSize: 11,
     lineHeight: 17,
+  },
+  restoreBtn: {
+    alignSelf: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    marginTop: 12,
+  },
+  restoreBtnText: {
+    color: '#888',
+    fontSize: 13,
+    textDecorationLine: 'underline',
   },
 
   // 이미 프리미엄인 경우

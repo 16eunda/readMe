@@ -4,6 +4,8 @@ import { useCallback, useState } from "react";
 import {
   Alert,
   Dimensions,
+  Linking,
+  Platform,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -22,6 +24,8 @@ type FileStats = {
 };
 
 const SCREEN_HEIGHT = Dimensions.get("window").height;
+
+const PLAY_SUBSCRIPTIONS_URL = "https://play.google.com/store/account/subscriptions";
 
 export default function SettingsScreen() {
   // 전역 상태 사용
@@ -73,6 +77,30 @@ export default function SettingsScreen() {
   };
 
   const handleWithdraw = () => {
+    // Google Play 정기 결제는 앱 계정을 지워도 해지되지 않고 계속 청구되므로 탈퇴 전에 알린다.
+    if (isPremium && Platform.OS === "android") {
+      Alert.alert(
+        "구독 해지 안내",
+        "탈퇴해도 Google Play 정기 결제는 자동으로 해지되지 않아요.\n결제를 멈추려면 Play 스토어에서 구독을 해지해 주세요.",
+        [
+          { text: "취소", style: "cancel" },
+          {
+            text: "구독 관리",
+            onPress: () => {
+              Linking.openURL(PLAY_SUBSCRIPTIONS_URL).catch((e) =>
+                console.error("구독 관리 페이지 열기 실패:", e)
+              );
+            },
+          },
+          { text: "계속 탈퇴", style: "destructive", onPress: confirmWithdraw },
+        ]
+      );
+      return;
+    }
+    confirmWithdraw();
+  };
+
+  const confirmWithdraw = () => {
     // 1단계: 탈퇴 의사 확인
     Alert.alert(
       "회원 탈퇴",
