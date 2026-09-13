@@ -133,7 +133,7 @@ export default function SettingsScreen() {
   // 실제 탈퇴 처리 함수
   const withdrawAccount = async () => {
     try {
-      const res = await authenticatedFetch(`${BASE_URL}/auth/user/me`, {
+      const res = await authenticatedFetch(`${BASE_URL}/auth/users/me`, {
         method: "DELETE",
       }, deviceId ?? undefined);
 

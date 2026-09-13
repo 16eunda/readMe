@@ -325,7 +325,7 @@ export default function Home() {
     queryKey: foldersQueryKey,
     queryFn: async () => {
       const url = `${BASE_URL}/folders?path=${String(currentFolder)}`;
-      console.log("📁 폴더 쿼리 요청:", url, "deviceId:", deviceId);
+      console.log("📁 폴더 쿼리 요청:", url);
       const response = await authenticatedFetch(url, {}, deviceId!);
       const data = await response.json();
 
@@ -803,7 +803,7 @@ export default function Home() {
         sort: sortParam
       });
       
-      console.log('🔍 검색 요청:', keyword, 'page:', page, 'sort:', sortParam, "deviceId:", deviceId);
+      console.log('🔍 검색 요청:', keyword, 'page:', page, 'sort:', sortParam);
 
       const response = await authenticatedFetch(
         `${BASE_URL}/files/search?${params.toString()}`,
@@ -864,7 +864,6 @@ export default function Home() {
       console.log('🚀 서버 요청 시작:', {
         url: `${BASE_URL}/files`,
         method: 'POST',
-        deviceId: resolvedDeviceId,
       });
       
       const response = await authenticatedFetch(`${BASE_URL}/files`, {

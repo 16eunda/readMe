@@ -92,6 +92,18 @@ async function requestRefresh(): Promise<RefreshOutcome> {
   }
 
   await setToken('accessToken', newAccessToken);
+
+  // 백엔드가 재발급 때마다 refreshToken도 새로 준다(쓰는 동안 로그인 유지, 30일 슬라이딩).
+  // 저장에 실패해도 기존 refreshToken은 만료일까지 유효하므로 재발급 자체를 실패로 보지 않는다.
+  const newRefreshToken = data?.refreshToken;
+  if (typeof newRefreshToken === 'string' && newRefreshToken) {
+    try {
+      await setToken('refreshToken', newRefreshToken);
+    } catch (error) {
+      console.log('⚠️ 새 refreshToken 저장 실패 - 기존 토큰 유지:', error);
+    }
+  }
+
   console.log('✅ accessToken 재발급 성공');
   return { status: 'refreshed', accessToken: newAccessToken };
 }
@@ -142,10 +154,10 @@ export async function authenticatedFetch(
     'X-Device-Id': normalizedDeviceId,
     ...(accessToken && { 'Authorization': `Bearer ${accessToken}` }),
   };
+  // deviceId 값은 비회원 데이터 접근 키이므로 로그에 남기지 않는다.
   console.log('🌐 API 요청 식별 정보:', {
     method: options.method ?? 'GET',
     url,
-    deviceId: normalizedDeviceId,
     authenticated: !!accessToken,
   });
 

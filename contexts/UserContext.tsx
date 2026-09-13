@@ -270,7 +270,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
         // accessToken 유효성 검증
         try {
           const verifyRes = await fetchWithTimeout(
-            `${API_BASE_URL}/auth/user/me`,
+            `${API_BASE_URL}/auth/users/me`,
             { headers: { Authorization: `Bearer ${accessToken}` } },
             AUTH_VERIFY_TIMEOUT_MS,
           );
