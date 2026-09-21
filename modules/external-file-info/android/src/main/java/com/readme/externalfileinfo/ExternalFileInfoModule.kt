@@ -72,9 +72,11 @@ class ExternalFileInfoModule : Module() {
       installerPackage == "com.android.vending" && playStoreEnabled
     }
 
-    AsyncFunction("isLaunchedFromHistoryAsync") {
-      val flags = appContext.currentActivity?.intent?.flags ?: 0
-      flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+    // 외부 파일 Intent가 새로 전달된 요청이면 true. Activity 복원으로 이미 처리한 Intent를 다시 받은 경우 false.
+    AsyncFunction("claimExternalIntentAsync") { uri: String ->
+      // Activity 없이는 복원 여부를 판별할 근거가 없으므로 새 요청으로 취급하지 않는다.
+      val activity = appContext.currentActivity ?: return@AsyncFunction false
+      ExternalLaunchIntentRegistry.claim(activity, uri)
     }
 
     // 개발 로그용: 현재 Activity Intent(onNewIntent로 최신화됨)의 전달 형태와 URI 읽기 권한

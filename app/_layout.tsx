@@ -7,17 +7,17 @@ import * as Linking from 'expo-linking';
 import { Stack, usePathname, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useRef } from 'react';
-import { Alert, Platform } from 'react-native';
+import { Alert } from 'react-native';
 import 'react-native-reanimated';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { UserProvider, useUser } from '../contexts/UserContext';
 import {
+  claimExternalFileIntent,
   clearExternalFileIntent,
   getCurrentExternalIntentInfo,
   getExternalFileDisplayName,
-  isLaunchedFromHistory,
 } from '../modules/external-file-info/src';
 import { isSupportedFileName, toExternalFileUrl } from '../utils/externalFile';
 import { flushActiveReaderSession, getActiveReaderSessionFileId } from '../utils/readerLifecycle';
@@ -293,13 +293,14 @@ function AppContent() {
     if (!didReadInitialUrlRef.current) {
       didReadInitialUrlRef.current = true;
       Linking.getInitialURL().then(async (initialUrl) => {
-        const isHistoryRelaunch = Platform.OS === 'android'
-          && await isLaunchedFromHistory();
-        if (initialUrl && !isHistoryRelaunch) {
+        // 백그라운드에서 프로세스가 종료된 뒤 복귀하면 Activity가 복원되면서 처음 파일을 연 Intent가
+        // 그대로 다시 전달된다. 새로 전달된 Intent만 등록하고, 복원이면 읽던 Reader를 되살린다.
+        const isNewIntent = initialUrl ? await claimExternalFileIntent(initialUrl) : false;
+        if (initialUrl && isNewIntent) {
           await processIncomingUrl(initialUrl, 'initial');
         } else {
-          if (initialUrl && isHistoryRelaunch) {
-            console.log('↩️ 최근 앱에서 재실행된 기존 파일 intent는 다시 등록하지 않음');
+          if (initialUrl) {
+            console.log('↩️ 이미 처리한 외부 파일 intent가 Activity 복원으로 다시 전달됨 - 등록하지 않음');
           }
           await restoreActiveReader();
         }
@@ -308,6 +309,9 @@ function AppContent() {
 
     // 앱이 백그라운드에 있다가 파일로 열린 경우
     const subscription = Linking.addEventListener('url', ({ url }) => {
+      // onNewIntent로 온 URL은 항상 새 요청이다. 처리했다고 기록해 두어야
+      // 이후 Activity가 이 Intent로 복원될 때 다시 등록하지 않는다.
+      void claimExternalFileIntent(url);
       processIncomingUrl(url, 'event');
     });
 

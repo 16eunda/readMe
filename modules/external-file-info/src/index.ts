@@ -4,7 +4,7 @@ type ExternalFileInfoModule = {
   getDisplayNameAsync?: (uri: string) => Promise<string | null>;
   readTextFileAsync?: (uri: string) => Promise<string>;
   isGooglePlayInstallAsync?: () => Promise<boolean>;
-  isLaunchedFromHistoryAsync?: () => Promise<boolean>;
+  claimExternalIntentAsync?: (uri: string) => Promise<boolean>;
   clearCurrentIntentDataAsync?: (expectedUri: string) => Promise<void>;
   getCurrentIntentInfoAsync?: () => Promise<ExternalIntentInfo | null>;
 };
@@ -46,11 +46,14 @@ export async function isGooglePlayInstall(): Promise<boolean> {
   }
 }
 
-export async function isLaunchedFromHistory(): Promise<boolean> {
+// 외부 파일 Intent를 한 번만 처리하기 위한 판별. 새로 전달된 요청이면 true,
+// 백그라운드 복귀 등으로 Activity가 복원되면서 이미 처리한 Intent를 다시 받은 경우 false.
+// 네이티브 모듈이 없는 플랫폼은 판별 수단이 없으므로 기존처럼 새 요청으로 처리한다.
+export async function claimExternalFileIntent(uri: string): Promise<boolean> {
   try {
-    return (await ExternalFileInfo?.isLaunchedFromHistoryAsync?.()) ?? false;
+    return (await ExternalFileInfo?.claimExternalIntentAsync?.(uri)) ?? true;
   } catch {
-    return false;
+    return true;
   }
 }
 
