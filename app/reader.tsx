@@ -2863,13 +2863,17 @@ useEffect(() => {
             var contentTouchActive = false;
             var contentScrolledDuringTouch = false;
 
-            function buildThemeCss(t, preserveLayout) {
+            function buildThemeCss(t, preserveLayout, pageHeight) {
               var ff = (t.fontFamily && t.fontFamily !== 'default')
                 ? t.fontFamily + ', sans-serif'
                 : 'Roboto, "Noto Sans KR", "Noto Sans CJK KR", sans-serif';
               if (preserveLayout) {
                 return 'html,body{background:' + t.bgColor + '!important}' +
-                  'img,svg,object,video,canvas{max-width:100%!important;max-height:100vh!important;object-fit:contain!important}';
+                  // 표지·그림 페이지는 한 화면을 페이지로 전제하고 만들어진다(svg height:100%, max-height:100vh 등).
+                  // scrolled-doc iframe의 뷰포트는 본문 높이에 맞춰 늘어나므로 vh·백분율 높이가 화면이 아니라
+                  // 아직 작은 iframe 높이에 묶인다. 뷰포트 단위 대신 Reader 화면 높이(px)를 페이지 높이로 준다.
+                  (pageHeight > 0 ? 'html{height:' + pageHeight + 'px!important}body{height:100%!important;margin:0}' : '') +
+                  'img,svg,object,video,canvas{max-width:100%!important;max-height:' + (pageHeight > 0 ? pageHeight + 'px' : '100vh') + '!important;object-fit:contain!important}';
               }
               var fontCss = t.usePublisherFont
                 ? ':where(body){font-family:' + ff + '}'
@@ -2882,10 +2886,15 @@ useEffect(() => {
                 // WebView 자체가 safe area 아래에서 시작하므로 여기에는 읽기용 최소 여백만 둔다.
                 'padding-top:16px!important;padding-bottom:36px!important;' +
                 'margin:0!important;box-sizing:border-box!important;width:100%!important;' +
-                'word-break:keep-all!important;overflow-wrap:break-word!important;' +
-                'text-align:left!important}' + fontCss +
-                'p{line-height:' + t.lineSpacing + '!important;margin-left:0!important;margin-right:0!important;word-break:keep-all!important;text-align:left!important}' +
-                'img,svg,object,video,canvas{max-width:100%!important;max-height:100vh!important;width:auto!important;height:auto!important;object-fit:contain!important}';
+                'word-break:keep-all!important;overflow-wrap:break-word!important}' + fontCss +
+                'p{line-height:' + t.lineSpacing + '!important;word-break:keep-all!important}' +
+                'img,svg,object,video,canvas{max-width:100%!important;max-height:100vh!important;object-fit:contain!important}' +
+                // 정렬·좌우 여백·미디어 크기는 사용자 설정이 아니라 Reader 기본값이다. !important 없이 요소 선택자로 두면
+                // EPUB CSS 뒤에 주입되므로 p{text-align:justify} 같은 제작자의 일반 요소 규칙은 이 기본값이 이기고,
+                // .kakao-out{text-align:right}, .center, .chapter-header img{width:42%} 같은 클래스 레이아웃은
+                // 선택자 우선순위대로 유지된다. (!important는 선택자와 무관하게 제작자 레이아웃까지 덮어쓴다)
+                'body,p{text-align:left}p{margin-left:0;margin-right:0}' +
+                'img,svg,object,video,canvas{width:auto;height:auto}';
             }
 
             function injectTheme(contents) {
@@ -2897,7 +2906,9 @@ useEffect(() => {
                 var hasViewport = Boolean(doc.querySelector && doc.querySelector('meta[name="viewport"]'));
                 var bodyText = doc.body ? String(doc.body.textContent || '').replace(/\\s+/g, '').trim() : '';
                 var preserveLayout = metadataLayout === 'pre-paginated' || (hasViewport && bodyText.length < 20);
-                var css = buildThemeCss(currentTheme, preserveLayout);
+                var pageContainer = rendition.manager && rendition.manager.container;
+                var pageHeight = metadataLayout === 'pre-paginated' || !pageContainer ? 0 : pageContainer.clientHeight;
+                var css = buildThemeCss(currentTheme, preserveLayout, pageHeight);
                 if (el) { el.textContent = css; }
                 else {
                   var s = doc.createElement('style');
@@ -4441,6 +4452,32 @@ useEffect(() => {
               sendLog("📚 book.ready 완료");
               reportPerformance("book.ready 완료");
 
+              // epub.js는 챕터 XHTML의 documentElement만 직렬화해 iframe에 document.write 하므로 DOCTYPE이 빠지고,
+              // 모든 챕터가 quirks mode로 렌더링된다. quirks mode에서는 height:100% 같은 백분율 높이가
+              // iframe 뷰포트 기준으로 계산되는데, scrolled-doc은 iframe 높이를 본문 높이에 맞춰 늘리므로
+              // 둘이 서로를 키우며 본문이 화면 밖 수백만 px 아래로 밀려난다. XHTML은 원래 표준 모드 문서이므로
+              // 다른 EPUB 리더와 같이 표준 모드로 렌더링한다.
+              // epub.js가 book 열기 중 등록한 리소스 치환 hook이 section.output을 다시 쓰므로,
+              // 그 뒤(book.ready 이후)에 등록하고 치환이 끝난 section.output에 DOCTYPE을 붙인다.
+              book.spine.hooks.serialize.register(function(output, section) {
+                if (typeof section.output === 'string' && !/^\\s*<!DOCTYPE/i.test(section.output)) {
+                  section.output = '<!DOCTYPE html>' + section.output;
+                }
+              });
+
+              // OPF spine의 itemref가 manifest에 없는 항목은 읽을 문서(href)가 없다. epub.js는 이 항목을
+              // 그대로 두어 불러올 때 동기 예외가 나고, locations 생성 큐가 그 자리에서 멈춰
+              // 전체 페이지 계산과 슬라이더 이동이 끝내 준비되지 않는다. 읽기 순서에서 제외하고,
+              // 어떤 경로로 불러오더라도 멈추지 않고 오류로 끝나게 한다. (CFI 기준 spine 번호는 유지)
+              (book.spine && book.spine.spineItems ? book.spine.spineItems : []).forEach(function(section) {
+                if (section.url) return;
+                section.linear = false;
+                section.load = section.render = function() {
+                  return Promise.reject(new Error('manifest에 없는 spine 항목: ' + (section.idref || section.index)));
+                };
+                sendLog('⚠️ manifest에 없는 spine 항목 제외 index=' + section.index + ' idref=' + section.idref);
+              });
+
               // 준비 완료 알림(빠른 시작)
               window.ReactNativeWebView.postMessage(JSON.stringify({
                 type: "ready"
@@ -4785,12 +4822,13 @@ useEffect(() => {
                 'color:' + t.textColor + '!important;' +
                 'font-size:' + t.fontSize + 'px!important;' +
                 'line-height:' + t.lineSpacing + '!important;' +
-                'word-break:keep-all!important;overflow-wrap:break-word!important;' +
-                'text-align:left!important}' + fontCss +
+                'word-break:keep-all!important;overflow-wrap:break-word!important}' + fontCss +
                 '#fallback-section #fallback-document p{' +
                 'line-height:' + t.lineSpacing + '!important;' +
-                'word-break:keep-all!important;' +
-                'text-align:left!important}' +
+                'word-break:keep-all!important}' +
+                // 정렬 기본값은 범위가 지정된 EPUB CSS(#fallback-document p 등)와 같은 선택자 우선순위로 두어
+                // 제작자의 클래스 정렬(#fallback-document .center 등)이 유지되게 한다.
+                '#fallback-document,#fallback-document p{text-align:left}' +
                 '#fallback-section #fallback-document.fallback-prose-page p{' +
                 'margin-top:0!important;' +
                 'margin-bottom:1em!important;' +
@@ -4810,7 +4848,9 @@ useEffect(() => {
               var currentMedia = renderedDoc.querySelectorAll
                 ? renderedDoc.querySelectorAll('img,svg,image,object,video,canvas').length
                 : 0;
-              if (!forceRecovery && renderedBody && renderedBody.scrollHeight > 0) {
+              // 빈 섹션 여부는 높이가 아니라 실제 내용(텍스트·미디어)으로 판단한다. 높이는 렌더링 모드와
+              // 여백 CSS에 따라 달라져, 내용이 있는 그림 페이지를 빈 페이지로 오판하거나 그 반대가 된다.
+              if (!forceRecovery && (currentText || currentMedia > 0)) {
                 return Promise.resolve(false);
               }
 
@@ -5072,7 +5112,7 @@ useEffect(() => {
                     sendLog('⏳ EPUB 이미지 로딩 대기 index=' + lastDisplayedSectionIndex
                       + ' pending=' + pendingImageCount);
                     recoverRenderedImagesAfterSettlement(section, renderedContents, renderedImages);
-                  } else if (renderedBody && (renderedBody.scrollHeight === 0
+                  } else if (renderedBody && ((!renderedText && renderedMedia === 0)
                     || (renderedImages.length > 0 && loadedImageCount === 0))) {
                     recoverEmptyRenderedSection(
                       section,
@@ -5087,7 +5127,7 @@ useEffect(() => {
                         }, 100);
                       }
                     });
-                  } else if (renderedBody && renderedBody.scrollHeight > 0) {
+                  } else if (renderedBody) {
                     hideFallbackSection('정상 EPUB 본문 렌더링', false);
                     applyPendingSectionEdge(false);
                   }
