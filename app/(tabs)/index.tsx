@@ -354,13 +354,107 @@ export default function Home() {
 
   // React Query 데이터 → 로컬 변수
   const page0Files: any[] = filesData?.content ?? [];
+  const firstPageFiles: any[] = locationPageFiles ?? page0Files;
+  // 파일이 빠진 뒤 첫 페이지를 다시 받으면 원래 2페이지에 있던 파일이 첫 페이지로 올라온다. 같은 파일을 두 번 표시하지 않는다.
+  const firstPageFileIds = new Set(firstPageFiles.map((file: any) => String(file?.id)));
   const files = isSearching
     ? searchResults
-    : locationPageFiles
-      ? [...locationPageFiles, ...extraFiles]
-      : [...page0Files, ...extraFiles];
+    : [...firstPageFiles, ...extraFiles.filter((file: any) => !firstPageFileIds.has(String(file?.id)))];
   const folders: any[] = foldersData ?? [];
   const allFolders: any[] = useMemo(() => allFoldersData ?? [], [allFoldersData]);
+
+  // ========== 목록 캐시 동기화 ==========
+  // Home과 폴더 화면은 같은 컴포넌트이고, 목록은 폴더(path)별 React Query 캐시(['files', path, sort, deviceId],
+  // ['folders', path, deviceId], ['allFolders', deviceId])와 현재 폴더의 2페이지 이후 state(extraFiles/locationPageFiles)로 나뉜다.
+  // 지금 보고 있지 않은 폴더의 캐시는 staleTime(30초) 안에는 다시 조회되지 않으므로, 위치가 바뀌는 작업 뒤에
+  // 원래 폴더와 새 폴더의 캐시를 함께 맞추지 않으면 새 폴더에 들어가도 작업 전 목록이 그대로 보인다.
+  const fileSortValue = (file: any, field: string) =>
+    field === "rating" ? Number(file?.rating ?? 0) : new Date(file?.date ?? 0).getTime() || 0;
+
+  // 해당 폴더의 모든 정렬 캐시와, 그 폴더를 보고 있다면 2페이지 이후 state에서도 파일을 뺀다.
+  const removeFilesFromLists = (path: string, ids: (string | number)[]) => {
+    const removedIds = new Set(ids.map(String));
+    const keep = (file: any) => !removedIds.has(String(file?.id));
+    queryClient.setQueriesData({ queryKey: ["files", path] }, (old: any) =>
+      old ? { ...old, content: (old.content ?? []).filter(keep) } : old
+    );
+    if (path === currentFolder) {
+      setExtraFiles((prev) => prev.filter(keep));
+      setLocationPageFiles((prev) => (prev ? prev.filter(keep) : prev));
+    }
+  };
+
+  // 새 폴더에 이미 캐시된 목록이 있으면 정렬 위치에 넣는다. 조회한 적 없는 폴더는 들어갈 때 처음 조회된다.
+  const addFileToLists = (file: any) => {
+    const path = String(file?.path ?? "root");
+    for (const [key, data] of queryClient.getQueriesData<any>({ queryKey: ["files", path] })) {
+      if (!data) continue;
+      const [field, direction] = String(key[2] ?? "date,desc").split(",");
+      const content = (data.content ?? []).filter((item: any) => String(item?.id) !== String(file.id));
+      const value = fileSortValue(file, field);
+      const index = content.findIndex((item: any) => {
+        const other = fileSortValue(item, field);
+        return direction === "asc" ? value < other : value > other;
+      });
+      // 첫 페이지보다 뒤에 속하는 파일은 다음 페이지를 불러올 때 표시되므로 첫 페이지에는 넣지 않는다.
+      if (index < 0 && data.hasMore) {
+        queryClient.setQueryData(key, { ...data, content });
+        continue;
+      }
+      const nextContent = [...content];
+      nextContent.splice(index < 0 ? nextContent.length : index, 0, file);
+      queryClient.setQueryData(key, { ...data, content: nextContent });
+    }
+  };
+
+  const replaceFileInLists = (file: any) => {
+    const replace = (item: any) => (String(item?.id) === String(file.id) ? file : item);
+    queryClient.setQueriesData({ queryKey: ["files", String(file?.path ?? currentFolder)] }, (old: any) =>
+      old ? { ...old, content: (old.content ?? []).map(replace) } : old
+    );
+    setExtraFiles((prev) => prev.map(replace));
+    setLocationPageFiles((prev) => (prev ? prev.map(replace) : prev));
+  };
+
+  // 캐시를 먼저 맞춘 뒤 서버 기준으로 재검증한다. 보고 있는 폴더는 바로 다시 조회되고,
+  // 나머지 폴더는 stale로 표시되어 그 폴더에 들어갈 때 다시 조회된다.
+  const invalidateFileLists = (...paths: string[]) => {
+    for (const path of new Set(paths.map(String))) {
+      queryClient.invalidateQueries({ queryKey: ["files", path] });
+    }
+  };
+
+  const moveFolderInLists = (folder: any, fromPath: string) => {
+    const folderId = String(folder.id);
+    const toPath = String(folder.path);
+    queryClient.setQueriesData({ queryKey: ["folders", fromPath] }, (old: any) =>
+      Array.isArray(old) ? old.filter((item: any) => String(item?.id) !== folderId) : old
+    );
+    queryClient.setQueriesData({ queryKey: ["folders", toPath] }, (old: any) =>
+      Array.isArray(old) ? [...old.filter((item: any) => String(item?.id) !== folderId), folder] : old
+    );
+    queryClient.setQueriesData({ queryKey: ["allFolders"] }, (old: any) =>
+      Array.isArray(old) ? old.map((item: any) => (String(item?.id) === folderId ? { ...item, path: toPath } : item)) : old
+    );
+    queryClient.invalidateQueries({ queryKey: ["folders", fromPath] });
+    queryClient.invalidateQueries({ queryKey: ["folders", toPath] });
+    queryClient.invalidateQueries({ queryKey: ["allFolders"] });
+  };
+
+  const removeDeletedItemsFromLists = (fileIds: (string | number)[], folderIds: (string | number)[]) => {
+    for (const id of fileIds) {
+      const file = files.find((item: any) => String(item?.id) === String(id));
+      removeFilesFromLists(String(file?.path ?? currentFolder), [id]);
+    }
+    if (folderIds.length > 0) {
+      const deletedIds = new Set(folderIds.map(String));
+      const keep = (item: any) => !deletedIds.has(String(item?.id));
+      queryClient.setQueriesData({ queryKey: ["folders"] }, (old: any) => (Array.isArray(old) ? old.filter(keep) : old));
+      // 삭제한 폴더가 이동 위치 선택 목록에 남지 않도록 전체 폴더 목록도 맞춘다. (하위 폴더 포함 삭제는 재조회로 반영)
+      queryClient.setQueriesData({ queryKey: ["allFolders"] }, (old: any) => (Array.isArray(old) ? old.filter(keep) : old));
+      queryClient.invalidateQueries({ queryKey: ["allFolders"] });
+    }
+  };
 
   // hasMore 동기화 (queryFn 바깥에서 side effect 처리)
   useEffect(() => {
@@ -1616,6 +1710,7 @@ export default function Home() {
                     }
 
                     console.log("✅ 일괄 삭제 완료");
+                    removeDeletedItemsFromLists(selectedItems.files, selectedItems.folders);
                     setIsSelectMode(false);
                     setSelectedItems({ files: [], folders: [] });
                     refetchFiles();
@@ -1650,6 +1745,7 @@ export default function Home() {
       }
 
       console.log("✅ 일괄 삭제 완료");
+      removeDeletedItemsFromLists(selectedItems.files, selectedItems.folders);
       setIsSelectMode(false);
       setSelectedItems({ files: [], folders: [] });
       refetchFiles();
@@ -1662,6 +1758,8 @@ export default function Home() {
 
   // 선택 모드에서 이동 버튼 핸들러 (파일 + 폴더 이동)
   const handleBulkMove = async (folder: any) => {
+    const targetPath = String(folder.id);
+    const sourcePaths = [currentFolder];
     try {
       // 파일 이동
       for (const id of selectedItems.files) {
@@ -1674,7 +1772,15 @@ export default function Home() {
 
         if (!response.ok) {
           console.error(`❌ 파일 ${id} 이동 실패:`, response.status);
+          continue;
         }
+        // 성공한 파일만 원래 폴더 목록에서 빼고 새 폴더 목록에 넣는다.
+        const original = files.find((item: any) => String(item?.id) === String(id));
+        const updated = await response.json().catch(() => null);
+        const fromPath = String(original?.path ?? currentFolder);
+        sourcePaths.push(fromPath);
+        removeFilesFromLists(fromPath, [id]);
+        addFileToLists({ ...(original ?? { id }), ...(updated ?? {}), path: targetPath });
       }
 
       // 폴더 이동
@@ -1688,14 +1794,18 @@ export default function Home() {
 
         if (!response.ok) {
           console.error(`❌ 폴더 ${id} 이동 실패:`, response.status);
+          continue;
         }
+        const original = folders.find((item: any) => String(item?.id) === String(id));
+        moveFolderInLists({ ...(original ?? { id }), path: targetPath }, String(original?.path ?? currentFolder));
       }
 
       console.log("✅ 일괄 이동 완료");
       setBulkMoveModalVisible(false);
       setIsSelectMode(false);
       setSelectedItems({ files: [], folders: [] });
-      refetchFiles();
+      // 실패한 항목까지 포함해 원래 폴더와 새 폴더를 서버 기준으로 재검증한다.
+      invalidateFileLists(...sourcePaths, targetPath);
       refetchFolders();
     } catch (error) {
       console.error("❌ 일괄 이동 실패:", error);
@@ -1727,11 +1837,8 @@ export default function Home() {
 
       const saved = await res.json();
 
-      // 3. 캐시 즉시 업데이트
-      queryClient.setQueryData(filesQueryKey, (old: any) => ({
-        content: (old?.content ?? []).map((f: any) => (f.id === saved.id ? saved : f)),
-        hasMore: old?.hasMore ?? false,
-      }));
+      // 3. 캐시 즉시 업데이트 (같은 폴더의 다른 정렬 캐시와 2페이지 이후 목록 포함)
+      replaceFileInLists(saved);
     } catch (err) {
       console.log(err);
       Alert.alert("오류", "파일 정보를 업데이트하는데 실패했습니다.");
@@ -2308,11 +2415,8 @@ export default function Home() {
             return;
           }
 
-          // 캐시에서 즉시 제거
-          queryClient.setQueryData(filesQueryKey, (old: any) => ({
-            content: (old?.content ?? []).filter((f: any) => f.id !== selectedFile!.id),
-            hasMore: old?.hasMore ?? false,
-          }));
+          // 캐시에서 즉시 제거 (같은 폴더의 다른 정렬 캐시와 2페이지 이후 목록 포함)
+          removeFilesFromLists(String(selectedFile.path ?? currentFolder), [selectedFile.id]);
         } catch (error) {
           console.log("파일 삭제 실패:", error);
           Alert.alert("삭제 실패", "파일 삭제에 실패했습니다.");
@@ -2370,8 +2474,12 @@ export default function Home() {
           const updatedFile = await response.json();
           console.log("✅ 파일 이동 완료:", updatedFile);
 
-          // 현재 폴더 목록 새로고침 (파일이 사라지도록)
-          refetchFiles();
+          // 원래 폴더 목록에서 빼고 새 폴더 목록에 넣은 뒤, 두 폴더 모두 서버 기준으로 재검증한다.
+          const fromPath = String(selectedFile.path ?? currentFolder);
+          const movedFile = { ...selectedFile, ...updatedFile, path: String(folder.id) };
+          removeFilesFromLists(fromPath, [selectedFile.id]);
+          addFileToLists(movedFile);
+          invalidateFileLists(fromPath, movedFile.path);
         } catch (error) {
           console.log("❌ 파일 이동 실패:", error);
           Alert.alert("이동 실패", "파일 이동에 실패했습니다.");
@@ -2399,9 +2507,11 @@ export default function Home() {
 
         const ok = await moveFolderToServer(selectedFolder.id, String(folder.id));
         if (ok) {
-          await refetchFolders();
-          await refetchAllFolders();
-          await refetchFiles();
+          // 원래 위치와 새 위치의 폴더 목록, 전체 폴더 목록을 함께 맞춘다.
+          moveFolderInLists(
+            { ...selectedFolder, path: String(folder.id) },
+            String(selectedFolder.path ?? currentFolder),
+          );
           setFolderMoveModalVisible(false);
         } else {
           Alert.alert("이동 실패", "폴더 이동에 실패했습니다.");
