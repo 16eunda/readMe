@@ -258,6 +258,11 @@ export default function Home() {
   // 파일 삭제 중 로딩
   const [isDeleting, setIsDeleting] = useState(false);
 
+  // 여러 파일/폴더 이동 진행 표시
+  const [bulkMoveProgress, setBulkMoveProgress] = useState<{ done: number; total: number } | null>(null);
+  const [bulkMoveOverlayVisible, setBulkMoveOverlayVisible] = useState(false);
+  const bulkMoveInProgressRef = useRef(false);
+
   // 전역 상태에서 사용자 정보 가져오기
   const { user, deviceId, incomingFile, setIncomingFile, isLoading: isUserLoading } = useUser();
   const queryClient = useQueryClient();
@@ -1560,7 +1565,8 @@ export default function Home() {
     if (effectiveProgress <= 0) {
       router.push({
         pathname: "/reader",
-        params: { fileId: file.id, uri: file.uri, name: file.title, type: file.type }
+        // 읽기를 끝냈을 때 파일을 연 위치로 돌아가도록 현재 폴더를 함께 넘긴다.
+        params: { fileId: file.id, uri: file.uri, name: file.title, type: file.type, folder: currentFolder }
       });
       return;
     }
@@ -1758,58 +1764,103 @@ export default function Home() {
 
   // 선택 모드에서 이동 버튼 핸들러 (파일 + 폴더 이동)
   const handleBulkMove = async (folder: any) => {
+    // 이동 버튼을 연타해도 같은 작업이 두 번 실행되지 않게 한다.
+    if (bulkMoveInProgressRef.current) return;
+    const fileIds = [...selectedItems.files];
+    const folderIds = [...selectedItems.folders];
+    const total = fileIds.length + folderIds.length;
+    if (total === 0) return;
+
+    bulkMoveInProgressRef.current = true;
     const targetPath = String(folder.id);
     const sourcePaths = [currentFolder];
+    const failedNames: string[] = [];
+    let processed = 0;
+    // 위치 선택 모달은 바로 닫고 진행 상황을 오버레이로 보여 준다.
+    setBulkMoveModalVisible(false);
+    setBulkMoveProgress({ done: 0, total });
+    // 금방 끝나는 작업에서 오버레이가 깜빡이지 않도록 잠깐 뒤에만 표시한다.
+    const overlayTimer = setTimeout(() => setBulkMoveOverlayVisible(true), 250);
+
     try {
       // 파일 이동
-      for (const id of selectedItems.files) {
+      for (const id of fileIds) {
         console.log(`🚀 파일 ${id} 이동 요청:`, folder.id);
-        const response = await authenticatedFetch(`${BASE_URL}/files/${id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: String(folder.id) })
-        }, deviceId ?? undefined);
-
-        if (!response.ok) {
-          console.error(`❌ 파일 ${id} 이동 실패:`, response.status);
-          continue;
-        }
-        // 성공한 파일만 원래 폴더 목록에서 빼고 새 폴더 목록에 넣는다.
         const original = files.find((item: any) => String(item?.id) === String(id));
-        const updated = await response.json().catch(() => null);
-        const fromPath = String(original?.path ?? currentFolder);
-        sourcePaths.push(fromPath);
-        removeFilesFromLists(fromPath, [id]);
-        addFileToLists({ ...(original ?? { id }), ...(updated ?? {}), path: targetPath });
+        try {
+          const response = await authenticatedFetch(`${BASE_URL}/files/${id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: String(folder.id) })
+          }, deviceId ?? undefined);
+
+          if (!response.ok) {
+            console.error(`❌ 파일 ${id} 이동 실패:`, response.status);
+            failedNames.push(String(original?.title ?? `파일 ${id}`));
+          } else {
+            // 성공한 파일만 원래 폴더 목록에서 빼고 새 폴더 목록에 넣는다.
+            const updated = await response.json().catch(() => null);
+            const fromPath = String(original?.path ?? currentFolder);
+            sourcePaths.push(fromPath);
+            removeFilesFromLists(fromPath, [id]);
+            addFileToLists({ ...(original ?? { id }), ...(updated ?? {}), path: targetPath });
+          }
+        } catch (fileError) {
+          console.error(`❌ 파일 ${id} 이동 실패:`, fileError);
+          failedNames.push(String(original?.title ?? `파일 ${id}`));
+        }
+        setBulkMoveProgress({ done: ++processed, total });
       }
 
       // 폴더 이동
-      for (const id of selectedItems.folders) {
+      for (const id of folderIds) {
         console.log(`📁 폴더 ${id} 이동 요청:`, folder.id);
-        const response = await authenticatedFetch(`${BASE_URL}/folders/${id}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: String(folder.id) })
-        }, deviceId ?? undefined);
-
-        if (!response.ok) {
-          console.error(`❌ 폴더 ${id} 이동 실패:`, response.status);
-          continue;
-        }
         const original = folders.find((item: any) => String(item?.id) === String(id));
-        moveFolderInLists({ ...(original ?? { id }), path: targetPath }, String(original?.path ?? currentFolder));
+        try {
+          const response = await authenticatedFetch(`${BASE_URL}/folders/${id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: String(folder.id) })
+          }, deviceId ?? undefined);
+
+          if (!response.ok) {
+            console.error(`❌ 폴더 ${id} 이동 실패:`, response.status);
+            failedNames.push(String(original?.name ?? `폴더 ${id}`));
+          } else {
+            moveFolderInLists({ ...(original ?? { id }), path: targetPath }, String(original?.path ?? currentFolder));
+          }
+        } catch (folderError) {
+          console.error(`❌ 폴더 ${id} 이동 실패:`, folderError);
+          failedNames.push(String(original?.name ?? `폴더 ${id}`));
+        }
+        setBulkMoveProgress({ done: ++processed, total });
       }
 
-      console.log("✅ 일괄 이동 완료");
-      setBulkMoveModalVisible(false);
+      console.log(`✅ 일괄 이동 완료 (성공 ${total - failedNames.length} / ${total})`);
       setIsSelectMode(false);
       setSelectedItems({ files: [], folders: [] });
       // 실패한 항목까지 포함해 원래 폴더와 새 폴더를 서버 기준으로 재검증한다.
       invalidateFileLists(...sourcePaths, targetPath);
       refetchFolders();
+
+      // 실패가 있으면 전체 성공처럼 보이지 않도록 결과를 그대로 알린다.
+      if (failedNames.length > 0) {
+        const moved = total - failedNames.length;
+        const preview = failedNames.slice(0, 5).join("\n");
+        const rest = failedNames.length > 5 ? `\n외 ${failedNames.length - 5}개` : "";
+        Alert.alert(
+          moved > 0 ? "일부만 이동했습니다" : "이동하지 못했습니다",
+          `${moved}개 이동 완료, ${failedNames.length}개 실패\n\n${preview}${rest}`,
+        );
+      }
     } catch (error) {
       console.error("❌ 일괄 이동 실패:", error);
       Alert.alert("이동 실패", "파일/폴더 이동에 실패했습니다.");
+    } finally {
+      clearTimeout(overlayTimer);
+      setBulkMoveOverlayVisible(false);
+      setBulkMoveProgress(null);
+      bulkMoveInProgressRef.current = false;
     }
   };
 
@@ -2154,6 +2205,7 @@ export default function Home() {
       file={selectedFile}
       previewText={previewText}
       lastProgress={lastProgress}
+      folder={currentFolder}
       onClose={() => {
         filePreviewRequestIdRef.current += 1;
         setPreviewModalVisible(false);
@@ -2535,6 +2587,33 @@ export default function Home() {
       onMove={handleBulkMove}
       onClose={() => setBulkMoveModalVisible(false)}
     />
+
+    {/* 여러 파일/폴더 이동 중 진행 오버레이 */}
+    <Modal visible={bulkMoveOverlayVisible} transparent animationType="fade">
+      <View style={{
+        flex: 1,
+        backgroundColor: "rgba(0,0,0,0.5)",
+        justifyContent: "center",
+        alignItems: "center",
+      }}>
+        <View style={{
+          backgroundColor: "#fff",
+          borderRadius: 16,
+          padding: 32,
+          alignItems: "center",
+          gap: 16,
+          minWidth: 200,
+        }}>
+          <ActivityIndicator size="large" color="#4A90E2" />
+          <Text style={{ fontSize: 16, fontWeight: "600", color: "#333" }}>
+            {bulkMoveProgress && bulkMoveProgress.total > 1
+              ? `파일 이동 중... (${Math.min(bulkMoveProgress.done + 1, bulkMoveProgress.total)} / ${bulkMoveProgress.total})`
+              : "파일 이동 중..."}
+          </Text>
+          <Text style={{ fontSize: 13, color: "#888", textAlign: "center" }}>잠시만 기다려 주세요</Text>
+        </View>
+      </View>
+    </Modal>
 
     {/* 파일 삭제 중 로딩 오버레이 */}
     <Modal visible={isDeleting} transparent animationType="fade">

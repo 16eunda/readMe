@@ -317,7 +317,7 @@ function splitTextIntoRenderChunks(text: string): TxtRenderChunk[] {
 
 export default function ReaderScreen() {
   const router = useRouter();
-  const { fileId, uri, name, type, resetProgress } = useLocalSearchParams();
+  const { fileId, uri, name, type, resetProgress, folder } = useLocalSearchParams();
   const insets = useSafeAreaInsets();
   const readerTopInset = Math.max(
     insets.top,
@@ -333,6 +333,9 @@ export default function ReaderScreen() {
       const normalizedUri = Array.isArray(uri) ? String(uri[0] ?? "") : String(uri ?? "");
       const normalizedName = Array.isArray(name) ? String(name[0] ?? "") : String(name ?? "");
       const normalizedType = Array.isArray(type) ? String(type[0] ?? "") : String(type ?? "");
+      // 파일을 연 위치(Home 또는 폴더)를 세션에 함께 저장한다. 앱이 재시작돼 Reader가 복원되면
+      // 돌아갈 화면이 없으므로, 이 값이 있어야 읽기를 끝냈을 때 원래 폴더로 돌아갈 수 있다.
+      const normalizedFolder = Array.isArray(folder) ? String(folder[0] ?? "") : String(folder ?? "");
       if (!normalizedFileId || !normalizedUri || !normalizedName) return;
 
       const serializedSession = JSON.stringify({
@@ -341,6 +344,7 @@ export default function ReaderScreen() {
         uri: normalizedUri,
         name: normalizedName,
         type: normalizedType,
+        folder: normalizedFolder,
       });
       const unregisterReaderSession = registerActiveReaderSession({
         sessionId: readerSessionIdRef.current,
@@ -359,7 +363,7 @@ export default function ReaderScreen() {
           })
           .catch(() => {});
       };
-    }, [fileId, name, type, uri]),
+    }, [fileId, folder, name, type, uri]),
   );
 
   const [isEpub, setIsEpub] = useState(false);
@@ -6206,7 +6210,13 @@ useEffect(() => {
     if (router.canGoBack()) {
       router.back();
     } else {
-      router.replace('/(tabs)');
+      // 세션 복원으로 열린 Reader는 쌓인 화면이 없다. 파일을 열었던 폴더로 돌려보낸다.
+      const originFolder = Array.isArray(folder) ? String(folder[0] ?? "") : String(folder ?? "");
+      router.replace(
+        originFolder && originFolder !== "root"
+          ? { pathname: '/(tabs)', params: { folder: originFolder } }
+          : '/(tabs)',
+      );
     }
   };
 

@@ -8,6 +8,7 @@ export default function PreviewModal({
   file,
   previewText,
   lastProgress,
+  folder,
   onClose
 }: any) {
   const router = useRouter();
@@ -94,6 +95,7 @@ export default function PreviewModal({
                     uri: file.uri,
                     name: file.title,
                     resetProgress: "true",
+                    folder,
                   },
                 });
                 onClose();
@@ -117,6 +119,7 @@ export default function PreviewModal({
                     fileId: file.id,
                     uri: file.uri,
                     name: file.title,
+                    folder,
                   },
                 });
                 onClose();

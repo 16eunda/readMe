@@ -134,6 +134,8 @@ function AppContent() {
             uri: String(session.uri),
             name: String(session.name),
             type: session.type ? String(session.type) : undefined,
+            // 읽기를 끝냈을 때 파일을 열었던 폴더로 돌아가기 위해 함께 복원한다.
+            folder: session.folder ? String(session.folder) : undefined,
           },
         });
       } catch (error) {
