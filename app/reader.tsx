@@ -6020,7 +6020,7 @@ useEffect(() => {
   };
 
   // 서버에 저장하는 함수
-  const saveProgressToServer = async (forceLog = false, refreshEpubLocation = false) => {
+  const saveProgressToServer = async (forceLog = false, refreshEpubLocation = false, waitForServer = true) => {
     if (!fileId) return;
     const saveFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId);
     if (hasSupersedingReaderSession(readerSessionIdRef.current, saveFileId)) return;
@@ -6135,6 +6135,8 @@ useEffect(() => {
       return;
     }
     if (positionSignature === lastQueuedPositionSignatureRef.current) {
+      // 같은 위치가 이미 서버 저장 대기열에 있다. 화면을 떠날 때는 그 완료를 기다리지 않는다.
+      if (!waitForServer) return;
       await waitForReaderWrites(`server-progress:${saveFileId}`);
       if (positionSignature === lastSavedPositionSignatureRef.current) return;
     }
@@ -6177,6 +6179,7 @@ useEffect(() => {
           }
         }
       });
+    if (!waitForServer) return;
     await saveRequest;
   };
 
@@ -6186,8 +6189,11 @@ useEffect(() => {
     saveProgressRef.current = saveProgressToServer;
   });
   flushReaderSessionRef.current = async (reason) => {
-    await saveProgressRef.current(true, true);
-    if (reason === "external-file" || reason === "hardware-back" || reason === "reader-exit") {
+    // Reader를 떠날 때는 최신 위치를 확보해 기기에 저장한 뒤 바로 화면을 이동한다.
+    // 서버 저장은 파일별 저장 큐에서 순서대로 이어서 완료되므로, 느린 네트워크 때문에 이동이 멈추지 않는다.
+    const leavingReader = reason === "external-file" || reason === "hardware-back" || reason === "reader-exit";
+    await saveProgressRef.current(true, true, !leavingReader);
+    if (leavingReader) {
       exitFlushCompletedRef.current = true;
     }
   };
@@ -6216,7 +6222,18 @@ useEffect(() => {
         void flushReaderSessionRef.current("background");
       }
     });
-    return () => subscription.remove();
+    // 최근 앱 화면을 열어도 앱을 멈추지 않고 미리보기로 유지하는 기기에서는 background 없이
+    // 창 포커스만 잃는다. 그 상태에서 카드를 밀어 앱을 지우면 저장 없이 프로세스가 종료되므로,
+    // 포커스를 잃는 시점에도 같은 방식으로 최신 위치를 저장해 둔다.
+    const blurSubscription = Platform.OS === 'android'
+      ? AppState.addEventListener('blur', () => {
+          void flushReaderSessionRef.current("background");
+        })
+      : null;
+    return () => {
+      subscription.remove();
+      blurSubscription?.remove();
+    };
   }, []);
 
   const exitReader = async (reason: "hardware-back" | "reader-exit" = "reader-exit") => {
