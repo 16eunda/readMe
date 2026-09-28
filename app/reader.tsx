@@ -6,6 +6,7 @@ import * as FileSystem from "expo-file-system/legacy";
 import * as NavigationBar from "expo-navigation-bar";
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { getCurrentTaskId } from "../modules/external-file-info/src";
+import { EPUBJS_SOURCE, JSZIP_SOURCE } from "../utils/epubLibraries";
 import { readExternalTextFile } from "external-file-info";
 import iconv from 'iconv-lite';
 import { Search, X } from "lucide-react-native";
@@ -2381,9 +2382,11 @@ useEffect(() => {
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
       <script>window.__readmeEpubBootStartedAt = performance.now();</script>
       <!-- JSZip을 먼저 로드 (epub.js가 의존) -->
-      <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+      <!-- CDN에서 받으면 HTML 문자열로 띄운 이 WebView는 스크립트를 영구 캐시하지 못해, 로컬 EPUB도
+           열 때마다 네트워크가 필요하다(오프라인이면 열리지 않음). 같은 버전을 앱에 포함해 인라인으로 넣는다. -->
+      <script>${JSZIP_SOURCE}</script>
       <!-- epub.js 로드 -->
-      <script src="https://cdn.jsdelivr.net/npm/epubjs/dist/epub.min.js"></script>
+      <script>${EPUBJS_SOURCE}</script>
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { 
