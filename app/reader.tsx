@@ -177,6 +177,10 @@ const TXT_RESUME_SETTLE_MAX_ATTEMPTS = 10;
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
 const READER_LOCAL_PROGRESS_KEY_PREFIX = "@reader_position:";
 const EPUB_LOCATIONS_CACHE_KEY_PREFIX = "@reader_epub_locations:";
+// Reader를 열 때 서버 파일 정보를 기다리는 상한. 기기에 저장된 이어읽기 위치가 있으면 그 값이 우선이라
+// 서버 응답이 결과를 바꾸지 않으므로 짧게, 없을 때만 서버 위치를 위해 더 기다린다.
+const LOCAL_RESUME_SERVER_WAIT_MS = 1000;
+const SERVER_RESUME_WAIT_MS = 10000;
 const ACTIVE_READER_SESSION_KEY = "@active_reader_session";
 
 interface LocalReaderPosition {
@@ -1113,9 +1117,21 @@ export default function ReaderScreen() {
       ? readerLocalPosition
       : localPosition;
 
+    // 기기에 이어읽기 위치가 있으면 아래 복원은 서버 응답과 관계없이 기기 값을 쓴다.
+    // 느리거나 멈춘 네트워크 때문에 본문 표시·이어읽기가 멈추지 않도록 서버 대기에 상한을 두고,
+    // 시간 안에 응답이 없으면 catch의 기기 위치 복원으로 진행한다.
+    const hasLocalResumePosition = !shouldResetProgress
+      && (Number(latestLocalPosition?.progress) || 0) > 0
+      && (latestLocalPosition?.format !== "EPUB" || typeof latestLocalPosition?.epubCfi === "string");
+    const fileInfoController = new AbortController();
+    const fileInfoTimer = setTimeout(
+      () => fileInfoController.abort(),
+      hasLocalResumePosition ? LOCAL_RESUME_SERVER_WAIT_MS : SERVER_RESUME_WAIT_MS,
+    );
+
     try {
       console.log("🔍 서버에서 파일 정보 불러오는 중...", fileId);
-      const res = await authenticatedFetch(`${BASE_URL}/files/${fileId}`);
+      const res = await authenticatedFetch(`${BASE_URL}/files/${fileId}`, { signal: fileInfoController.signal });
       const fileInfo = await res.json();
       if (!active) return;
       console.log("📚 서버에서 받은 데이터:", fileInfo);
@@ -1231,6 +1247,8 @@ export default function ReaderScreen() {
         }
       }
       setFileInfoLoaded(true); // 실패해도 EPUB 시작은 해야 함
+    } finally {
+      clearTimeout(fileInfoTimer);
     }
   };
 
