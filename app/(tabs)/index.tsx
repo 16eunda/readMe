@@ -1508,14 +1508,29 @@ export default function Home() {
   // -----------------------------
   // 파일 카드 클릭 기능
   // -----------------------------
+  // Reader로 이동을 시작한 뒤 화면이 바뀌는 동안 들어온 연속 탭이 Reader를 한 번 더 열지 않게 한다.
+  // Home으로 돌아오면 바로 풀리고, 이동이 이루어지지 않은 경우에도 잠시 뒤 풀린다.
+  const readerOpeningRef = useRef(false);
+  const markReaderOpening = () => {
+    readerOpeningRef.current = true;
+    setTimeout(() => {
+      readerOpeningRef.current = false;
+    }, 1000);
+  };
+  useFocusEffect(
+    useCallback(() => {
+      readerOpeningRef.current = false;
+    }, []),
+  );
+
   const handleFilePress = async (file : any) => {
+    if (readerOpeningRef.current) return;
     const previewRequestId = filePreviewRequestIdRef.current + 1;
     filePreviewRequestIdRef.current = previewRequestId;
 
-    // 1) 서버에서 진행도 가져오기
-    const res = await authenticatedFetch(`${BASE_URL}/files/${file.id}`, {}, deviceId ?? undefined);
-    const info = await res.json();
-    if (filePreviewRequestIdRef.current !== previewRequestId) return;
+    // 목록 응답(FileDto)에 서버의 진행도·미리보기가 이미 들어 있다. 파일을 누를 때마다 서버를 다시
+    // 조회하면 네트워크가 느릴 때 누른 뒤 아무 반응이 없고, 끊겼을 때는 오류로 아예 열리지 않는다.
+    const info = file;
     const isTxtFile = String(file.type || "").toUpperCase() === "TXT"
       || String(file.title || "").toLowerCase().endsWith(".txt");
     let localTxtPosition: {
@@ -1563,6 +1578,7 @@ export default function Home() {
 
     // progress 없으면 바로 Reader로 이동
     if (effectiveProgress <= 0) {
+      markReaderOpening();
       router.push({
         pathname: "/reader",
         // 읽기를 끝냈을 때 파일을 연 위치로 돌아가도록 현재 폴더를 함께 넘긴다.
