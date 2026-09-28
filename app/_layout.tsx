@@ -17,6 +17,7 @@ import {
   claimExternalFileIntent,
   clearExternalFileIntent,
   getCurrentExternalIntentInfo,
+  getCurrentTaskId,
   getExternalFileDisplayName,
 } from '../modules/external-file-info/src';
 import { isSupportedFileName, toExternalFileUrl } from '../utils/externalFile';
@@ -113,6 +114,18 @@ function AppContent() {
 
         const session = JSON.parse(serialized);
         if (!session?.fileId || !session?.uri || !session?.name) {
+          await AsyncStorage.removeItem(ACTIVE_READER_SESSION_KEY);
+          return;
+        }
+        // 읽던 태스크가 그대로 이어질 때(백그라운드에서 프로세스만 종료된 뒤 복귀)만 Reader 화면을 복원한다.
+        // 최근 앱에서 앱을 지우고 새로 실행하면 새 태스크이므로 Home부터 시작한다.
+        // 이어읽기 위치는 별도 저장소(기기·서버)에 있으므로 여기서 지우는 것은 화면 복원 정보뿐이다.
+        const currentTaskId = getCurrentTaskId();
+        if (currentTaskId == null || Number(session.taskId) !== currentTaskId) {
+          console.log('🏠 새 앱 실행 - Reader 화면 복원 없이 Home에서 시작', {
+            savedTaskId: session.taskId ?? null,
+            currentTaskId,
+          });
           await AsyncStorage.removeItem(ACTIVE_READER_SESSION_KEY);
           return;
         }

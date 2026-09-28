@@ -5,6 +5,7 @@ type ExternalFileInfoModule = {
   readTextFileAsync?: (uri: string) => Promise<string>;
   isGooglePlayInstallAsync?: () => Promise<boolean>;
   claimExternalIntentAsync?: (uri: string) => Promise<boolean>;
+  getTaskId?: () => number | null;
   clearCurrentIntentDataAsync?: (expectedUri: string) => Promise<void>;
   getCurrentIntentInfoAsync?: () => Promise<ExternalIntentInfo | null>;
 };
@@ -54,6 +55,17 @@ export async function claimExternalFileIntent(uri: string): Promise<boolean> {
     return (await ExternalFileInfo?.claimExternalIntentAsync?.(uri)) ?? true;
   } catch {
     return true;
+  }
+}
+
+// 현재 Android 태스크 ID. 최근 앱에서 앱을 지운 뒤 다시 실행하면 새 태스크가 되므로
+// 같은 태스크인지로 새 실행을 구분한다. 네이티브 모듈이 없거나(iOS 등) 알 수 없으면 null.
+export function getCurrentTaskId(): number | null {
+  try {
+    const taskId = ExternalFileInfo?.getTaskId?.();
+    return typeof taskId === "number" ? taskId : null;
+  } catch {
+    return null;
   }
 }
 

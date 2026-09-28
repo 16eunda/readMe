@@ -72,6 +72,12 @@ class ExternalFileInfoModule : Module() {
       installerPackage == "com.android.vending" && playStoreEnabled
     }
 
+    // 현재 Activity가 속한 태스크 ID. 최근 앱 목록에서 앱을 지우면 태스크가 사라지고 다음 실행은 새 태스크가 된다.
+    // 같은 태스크가 이어지는지로 "잠깐 백그라운드에 있었던 것"과 "새로 실행한 것"을 구분한다.
+    Function("getTaskId") {
+      appContext.currentActivity?.taskId
+    }
+
     // 외부 파일 Intent가 새로 전달된 요청이면 true. Activity 복원으로 이미 처리한 Intent를 다시 받은 경우 false.
     AsyncFunction("claimExternalIntentAsync") { uri: String ->
       // Activity 없이는 복원 여부를 판별할 근거가 없으므로 새 요청으로 취급하지 않는다.

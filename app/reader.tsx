@@ -5,6 +5,7 @@ import { Buffer } from 'buffer';
 import * as FileSystem from "expo-file-system/legacy";
 import * as NavigationBar from "expo-navigation-bar";
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
+import { getCurrentTaskId } from "../modules/external-file-info/src";
 import { readExternalTextFile } from "external-file-info";
 import iconv from 'iconv-lite';
 import { Search, X } from "lucide-react-native";
@@ -345,6 +346,8 @@ export default function ReaderScreen() {
         name: normalizedName,
         type: normalizedType,
         folder: normalizedFolder,
+        // 앱을 다시 띄웠을 때 같은 태스크가 이어지는 경우(잠깐 백그라운드)에만 이 화면을 복원한다.
+        taskId: getCurrentTaskId(),
       });
       const unregisterReaderSession = registerActiveReaderSession({
         sessionId: readerSessionIdRef.current,
