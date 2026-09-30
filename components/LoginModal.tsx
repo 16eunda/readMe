@@ -10,7 +10,7 @@ import {
     View
 } from "react-native";
 import { useUser } from "../contexts/UserContext";
-import { BASE_URL } from "../utils/api";
+import { API_REQUEST_TIMEOUT_MS, BASE_URL, fetchWithTimeout } from "../utils/api";
 import { setToken } from "../utils/tokenStorage";
 
 type LoginModalProps = {
@@ -45,7 +45,8 @@ export default function LoginModal({ visible, onClose, onLoginSuccess }: LoginMo
     setIsLoading(true);
     
     try {
-      const response = await fetch(`${BASE_URL}/auth/login`, {
+      // 응답이 없으면 로그인 버튼이 로딩 상태로 멈추므로 대기 시간에 상한을 둔다.
+      const response = await fetchWithTimeout(`${BASE_URL}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
@@ -53,7 +54,7 @@ export default function LoginModal({ visible, onClose, onLoginSuccess }: LoginMo
           password,
           deviceId  // ⭐ 중요: deviceId 전송
         }),
-      });
+      }, API_REQUEST_TIMEOUT_MS);
       
       if (!response.ok) {
         const error = await response.text();
@@ -104,11 +105,11 @@ export default function LoginModal({ visible, onClose, onLoginSuccess }: LoginMo
     setIsLoading(true);
     
     try {
-      const response = await fetch(`${BASE_URL}/auth/signup`, {
+      const response = await fetchWithTimeout(`${BASE_URL}/auth/signup`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password }),
-      });
+      }, API_REQUEST_TIMEOUT_MS);
       
       if (!response.ok) {
         const error = await response.text();
@@ -140,7 +141,7 @@ export default function LoginModal({ visible, onClose, onLoginSuccess }: LoginMo
   };
 
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={resetForm}>
       <View style={styles.overlay}>
         <View style={styles.modal}>
           <Text style={styles.title}>{isSignUp ? "회원가입" : "로그인"}</Text>

@@ -77,7 +77,12 @@ export default function AiAnalysisModal({
     setLoading(true);
     setFailed(false);
     try {
-      const res = await authenticatedFetch(`${BASE_URL}/files/${fileId}/ai-info`, {}, deviceId ?? undefined);
+      // 서버가 AI 분석을 요청하며 응답하므로 일반 요청보다 오래 기다린다.
+      const res = await authenticatedFetch(
+        `${BASE_URL}/files/${fileId}/ai-info`,
+        { timeoutMs: 90000 },
+        deviceId ?? undefined,
+      );
       if (res.ok) {
         const data = await res.json();
         console.log("📊 AI 분석 결과:", data);
@@ -196,7 +201,7 @@ export default function AiAnalysisModal({
   });
 
   return (
-    <Modal visible={visible} transparent animationType="slide">
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <View
         style={{
           flex: 1,

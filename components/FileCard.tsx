@@ -1,5 +1,4 @@
 import { FontAwesome5, Ionicons } from "@expo/vector-icons";
-import { useRouter } from "expo-router";
 import { GestureResponderEvent, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 // 아이콘
 import { formatDisplayDate } from "@/utils/date";
@@ -31,8 +30,6 @@ type FileCardProps = {
 export default function FileCard({ item, isSelectMode, isSelected, isLocated, onPress, onLongPress, onOptionsPress, onAiPress }: FileCardProps ) {
   if (!item) return null;
   if (!item.title) return null;
-
-  const router = useRouter();
 
   // path 표시용 함수 추가
   const formatPath = (path: string) => {

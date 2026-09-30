@@ -2630,7 +2630,10 @@ useEffect(() => {
       <script>
         (function() {
           // ⭐ console.log를 React Native로 전달 (오직 우리가 명시적으로 호출한 것만)
+          // 배포 빌드에서는 로그 메시지로 브리지를 쓰지 않는다.
+          var DEBUG_LOGS = ${__DEV__ ? "true" : "false"};
           function sendLog(message) {
+            if (!DEBUG_LOGS) return;
             try {
               window.ReactNativeWebView.postMessage(JSON.stringify({
                 type: "console",
@@ -6473,9 +6476,15 @@ useEffect(() => {
       {/* 상단바 */}
       {showUI && (
         <View style={[styles.topBar, { paddingTop: readerTopInset + 8 }]}>
-          <Text style={styles.back} onPress={() => void exitReader()}>
-            ←
-          </Text>
+          {/* 글자 하나 크기의 터치 영역은 손가락으로 누르면 자주 빗나가므로, 배치는 그대로 두고 누르는 범위만 넓힌다. */}
+          <TouchableOpacity
+            onPress={() => void exitReader()}
+            hitSlop={{ top: 16, bottom: 16, left: 16, right: 12 }}
+            accessibilityRole="button"
+            accessibilityLabel="뒤로 가기"
+          >
+            <Text style={styles.back}>←</Text>
+          </TouchableOpacity>
           <Text style={styles.title} numberOfLines={1}>
             {title}
           </Text>

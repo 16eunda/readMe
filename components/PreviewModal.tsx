@@ -1,5 +1,6 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
+import { useEffect, useRef } from "react";
 import { Modal, Pressable, ScrollView, Text, TouchableOpacity, View } from "react-native";
 import { createPreviewText } from "../utils/preview";
 
@@ -13,11 +14,34 @@ export default function PreviewModal({
 }: any) {
   const router = useRouter();
   const singleLinePreview = createPreviewText(previewText);
+  // 모달이 닫히는 동안 버튼을 한 번 더 누르면 Reader가 두 번 열려, 뒤로가기를 눌러도 같은 Reader가 다시 보인다.
+  // 한 번 이동을 시작하면 모달이 다시 열릴 때까지 추가 탭은 무시한다.
+  const openingRef = useRef(false);
+  useEffect(() => {
+    if (visible) openingRef.current = false;
+  }, [visible]);
 
   if (!file) return null;
 
+  const openReader = (resetProgress: boolean) => {
+    if (openingRef.current) return;
+    openingRef.current = true;
+    router.push({
+      pathname: "/reader",
+      params: {
+        fileId: file.id,
+        uri: file.uri,
+        name: file.title,
+        type: file.type,
+        ...(resetProgress ? { resetProgress: "true" } : {}),
+        folder,
+      },
+    });
+    onClose();
+  };
+
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View
         style={{
           flex: 1,
@@ -87,19 +111,7 @@ export default function PreviewModal({
             }}
           >
             <Pressable
-              onPress={() => {
-                router.push({
-                  pathname: "/reader",
-                  params: {
-                    fileId: file.id,
-                    uri: file.uri,
-                    name: file.title,
-                    resetProgress: "true",
-                    folder,
-                  },
-                });
-                onClose();
-              }}
+              onPress={() => openReader(true)}
               style={{
                 padding: 10,
                 backgroundColor: "#ddd",
@@ -112,18 +124,7 @@ export default function PreviewModal({
             </Pressable>
 
             <Pressable
-              onPress={() => {
-                router.push({
-                  pathname: "/reader",
-                  params: {
-                    fileId: file.id,
-                    uri: file.uri,
-                    name: file.title,
-                    folder,
-                  },
-                });
-                onClose();
-              }}
+              onPress={() => openReader(false)}
               style={{
                 padding: 10,
                 backgroundColor: "#b84a8c",

@@ -7,6 +7,9 @@ export const BASE_URL = API_BASE_URL;
 
 // 인증 관련 요청은 응답이 없으면 앱이 로딩 화면에서 멈추므로 반드시 상한을 둔다.
 const AUTH_REQUEST_TIMEOUT_MS = 10000;
+// 일반 API 요청의 상한. RN 기본 HTTP 클라이언트(OkHttp)는 타임아웃이 없어서 끊긴 연결에서는 응답을
+// 영원히 기다리고, 그동안 등록/삭제 오버레이나 목록 로딩이 풀리지 않는다.
+export const API_REQUEST_TIMEOUT_MS = 30000;
 
 export async function fetchWithTimeout(
   url: string,
@@ -14,11 +17,27 @@ export async function fetchWithTimeout(
   timeoutMs: number = AUTH_REQUEST_TIMEOUT_MS,
 ): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  // 호출부가 넘긴 signal(화면 이탈·새 작업 시작으로 인한 취소)도 그대로 적용한다.
+  const callerSignal = options.signal;
+  const abortFromCaller = () => controller.abort();
+  if (callerSignal?.aborted) controller.abort();
+  else callerSignal?.addEventListener('abort', abortFromCaller);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    // 시간 초과는 사용자가 취소한 것이 아니므로 AbortError와 구분해 호출부가 실패로 안내하게 한다.
+    if (timedOut && !callerSignal?.aborted) {
+      throw new Error(`서버 응답 시간이 초과되었습니다 (${Math.round(timeoutMs / 1000)}초)`);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
+    callerSignal?.removeEventListener('abort', abortFromCaller);
   }
 }
 
@@ -129,10 +148,13 @@ export function getRefreshedAccessToken(): Promise<RefreshOutcome> {
   return refreshPromise;
 }
 
+// timeoutMs: 요청 하나(401 재시도는 별도)의 응답 대기 상한. AI 분석처럼 서버 처리가 긴 요청만 늘려서 넘긴다.
+export type ApiRequestInit = RequestInit & { timeoutMs?: number };
+
 // 인증이 필요한 API 요청 헬퍼
 export async function authenticatedFetch(
   url: string,
-  options: RequestInit = {},
+  { timeoutMs = API_REQUEST_TIMEOUT_MS, ...options }: ApiRequestInit = {},
   deviceId?: string
 ): Promise<Response> {
   const [storedAccessToken, storedUser, resolvedDeviceId] = await Promise.all([
@@ -162,10 +184,10 @@ export async function authenticatedFetch(
   });
 
   // 첫 요청
-  let response = await fetch(url, {
+  let response = await fetchWithTimeout(url, {
     ...options,
     headers,
-  });
+  }, timeoutMs);
 
   // 401이 아니면 바로 반환
   if (response.status !== 401) {
@@ -191,8 +213,8 @@ export async function authenticatedFetch(
     'Authorization': `Bearer ${outcome.accessToken}`
   };
 
-  return fetch(url, {
+  return fetchWithTimeout(url, {
     ...options,
     headers: retryHeaders,
-  });
+  }, timeoutMs);
 }

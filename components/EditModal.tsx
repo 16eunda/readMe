@@ -13,9 +13,11 @@ export default function EditModal({ file, onClose, onSave }: any) {
   const [title, setTitle] = useState(file.title);
   const [review, setReview] = useState(file.review || "");
   const [rating, setRating] = useState(file.rating || 0);
+  // 제목이 비면 목록 카드가 표시되지 않아 다시 찾을 수 없으므로 빈 제목은 저장하지 않는다.
+  const canSave = String(title ?? "").trim().length > 0;
 
   return (
-    <Modal animationType="fade" transparent={true} visible={true}>
+    <Modal animationType="fade" transparent={true} visible={true} onRequestClose={onClose}>
       <View style={styles.overlay}>
         <View style={styles.modal}>
           <Text style={styles.header}>Info</Text>
@@ -66,7 +68,8 @@ export default function EditModal({ file, onClose, onSave }: any) {
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={styles.saveBtn}
+              style={[styles.saveBtn, !canSave && { opacity: 0.4 }]}
+              disabled={!canSave}
               onPress={() => onSave({ ...file, title, review, rating })}
             >
               <Text style={styles.saveText}>저장</Text>

@@ -20,7 +20,7 @@ export default function DuplicateConfirmModal({
   const isMultiple = duplicateNames.length > 1;
 
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
       <View
         style={{
           flex: 1,
@@ -95,7 +95,7 @@ export default function DuplicateConfirmModal({
                 lineHeight: 20,
               }}
             >
-              "{fileName}"{"\n"}
+              &quot;{fileName}&quot;{"\n"}
               이미 추가된 파일입니다.{"\n\n"}
               그래도 추가하시겠습니까?
             </Text>

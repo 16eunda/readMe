@@ -59,6 +59,7 @@ const MANAGED_FILE_DIRECTORY = "library-files";
 type PreparedPick = { file: any; managedPath: string; exists: boolean };
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
 const READER_LOCAL_PROGRESS_KEY_PREFIX = "@reader_position:";
+const EPUB_LOCATIONS_CACHE_KEY_PREFIX = "@reader_epub_locations:";
 const TXT_PREVIEW_SAMPLE_BYTES = 64 * 1024;
 
 // Home 화면이 이동 과정에서 다시 마운트되어도 같은 외부 파일 등록은 한 번만 진행한다.
@@ -157,10 +158,6 @@ function decodeTextSafe(buffer: Buffer): string {
 }
 
 export default function Home() {
-  // 렌더 횟수 추적 (디버깅용) - 실제 앱에서는 제거 권장
-  const renderCount = useRef(0);
-  renderCount.current += 1;
-
   // ========== 1. 외부 Hooks (useRouter, useLocalSearchParams) ==========
   const router = useRouter();
   const { folder, locateFileId } = useLocalSearchParams();
@@ -267,25 +264,6 @@ export default function Home() {
   const { user, deviceId, incomingFile, setIncomingFile, isLoading: isUserLoading } = useUser();
   const queryClient = useQueryClient();
 
-  // 🔍 어떤 값이 계속 바뀌는지 추적
-  const _prevDebug = useRef<Record<string, any>>({});
-  useEffect(() => {
-    const current: Record<string, any> = {
-      user, deviceId, incomingFile,
-      search, debouncedSearch, isSearching,
-      currentFolder, sortOption, extraFiles,
-      hasMore, refreshing,
-      isUploading, isDeleting,
-    };
-    const changed = Object.keys(current).filter(
-      (k) => _prevDebug.current[k] !== current[k]
-    );
-    if (changed.length > 0) {
-      console.log("🔴 변경된 값:", changed.join(", "), "렌더:", renderCount.current);
-    }
-    _prevDebug.current = current;
-  });
-
   // ========== React Query: 파일/폴더 조회 ==========
   // 정렬 파라미터 변환
   const sortParam = sortOption === "date-desc" ? "date,desc"
@@ -297,7 +275,12 @@ export default function Home() {
   // 앱 시작 중 user가 undefined → 로그인 사용자로 확정돼도 동일 목록 캐시를 유지한다.
   // 로그인/로그아웃 시에는 아래 userId 변경 effect에서 명시적으로 캐시를 무효화한다.
   const filesQueryKey = ['files', currentFolder, sortParam, deviceId];
-  const { data: filesData, isLoading: isInitialLoading, refetch: refetchFiles } = useQuery({
+  const {
+    data: filesData,
+    isLoading: isInitialLoading,
+    isError: isFilesError,
+    refetch: refetchFiles,
+  } = useQuery({
     queryKey: filesQueryKey,
     queryFn: async () => {
       const params = new URLSearchParams({
@@ -311,6 +294,8 @@ export default function Home() {
         {},
         deviceId!
       );
+      // 오류 응답을 빈 목록으로 처리하면 캐시된 목록까지 빈 목록으로 덮어써 "파일이 모두 사라진" 것처럼 보인다.
+      if (!response.ok) throw new Error(`파일 목록 조회 실패: ${response.status}`);
       const data = await response.json();
       if (data.content && Array.isArray(data.content)) {
         return { content: data.content, hasMore: !data.last };
@@ -326,12 +311,18 @@ export default function Home() {
 
   // 현재 폴더 폴더 목록
   const foldersQueryKey = ['folders', currentFolder, deviceId];
-  const { data: foldersData, isLoading: isFoldersLoading, refetch: refetchFolders } = useQuery({
+  const {
+    data: foldersData,
+    isLoading: isFoldersLoading,
+    isError: isFoldersError,
+    refetch: refetchFolders,
+  } = useQuery({
     queryKey: foldersQueryKey,
     queryFn: async () => {
       const url = `${BASE_URL}/folders?path=${String(currentFolder)}`;
       console.log("📁 폴더 쿼리 요청:", url);
       const response = await authenticatedFetch(url, {}, deviceId!);
+      if (!response.ok) throw new Error(`폴더 목록 조회 실패: ${response.status}`);
       const data = await response.json();
 
       console.log("📁 폴더 쿼리 응답:", Array.isArray(data) ? `배열 ${data.length}개` : data);
@@ -349,6 +340,7 @@ export default function Home() {
     queryKey: allFoldersQueryKey,
     queryFn: async () => {
       const response = await authenticatedFetch(`${BASE_URL}/folders`, {}, deviceId!);
+      if (!response.ok) throw new Error(`전체 폴더 조회 실패: ${response.status}`);
       const data = await response.json();
       return Array.isArray(data) ? data : [];
     },
@@ -458,6 +450,29 @@ export default function Home() {
       // 삭제한 폴더가 이동 위치 선택 목록에 남지 않도록 전체 폴더 목록도 맞춘다. (하위 폴더 포함 삭제는 재조회로 반영)
       queryClient.setQueriesData({ queryKey: ["allFolders"] }, (old: any) => (Array.isArray(old) ? old.filter(keep) : old));
       queryClient.invalidateQueries({ queryKey: ["allFolders"] });
+    }
+  };
+
+  // 서버에서 삭제한 파일의 앱 내부 복사본과 기기 이어읽기 기록을 정리한다. 지우지 않으면 삭제한 책이 기기 저장공간과
+  // AsyncStorage(Android 기본 6MB)에 계속 쌓인다. 앱이 등록할 때 만든 고유 경로(library-files/)의 파일만 지운다.
+  // (예전 버전이 만든 경로는 같은 이름의 다른 파일과 겹칠 수 있으므로 건드리지 않는다.)
+  const cleanUpDeletedFilesLocally = (deletedFiles: any[]) => {
+    const documentDirectory = FileSystem.documentDirectory;
+    const managedDirectory = documentDirectory ? `${documentDirectory}${MANAGED_FILE_DIRECTORY}/` : null;
+    for (const file of deletedFiles) {
+      if (!file) continue;
+      const uri = String(file.uri ?? "");
+      if (managedDirectory && uri.startsWith(managedDirectory)) {
+        void FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+      }
+      const id = String(file.id ?? "");
+      if (id) {
+        void AsyncStorage.multiRemove([
+          `${TXT_LOCAL_PROGRESS_KEY_PREFIX}${id}`,
+          `${READER_LOCAL_PROGRESS_KEY_PREFIX}${id}`,
+          `${EPUB_LOCATIONS_CACHE_KEY_PREFIX}${id}`,
+        ]).catch(() => {});
+      }
     }
   };
 
@@ -629,8 +644,17 @@ export default function Home() {
   const isCurrentFileRegistration = (operationId: number) =>
     fileRegistrationOperationIdRef.current === operationId;
 
+  // 앱 시작 시 계정(토큰·deviceId) 확인이 끝났는지. UserContext는 백그라운드에서 돌아올 때마다 토큰을 다시
+  // 확인하며 isLoading을 켜는데(느린 네트워크에서 최대 수십 초), 계정은 이미 정해져 있고 만료된 토큰은
+  // authenticatedFetch가 같은 재발급 결과를 기다려 처리하므로, 파일 탐색기에서 연 파일을 그동안 붙잡아 두지 않는다.
+  const userBootstrappedRef = useRef(false);
   useEffect(() => {
-    if (!incomingFile || isUserLoading) return;
+    if (!isUserLoading) userBootstrappedRef.current = true;
+  }, [isUserLoading]);
+
+  useEffect(() => {
+    if (!incomingFile) return;
+    if (isUserLoading && !userBootstrappedRef.current) return;
 
     setIncomingFile(null); // 중복 처리 방지
     
@@ -1392,6 +1416,10 @@ export default function Home() {
           return null;
         }
         console.error('❌ 서버 저장 실패:', saved);
+        // 여러 개 등록은 마지막 요약에서 알린다. 하나만 등록할 때 알리지 않으면 아무 반응 없이 끝난 것처럼 보인다.
+        if (!batchRegistrationRef.current) {
+          Alert.alert('파일 추가 실패', '서버에 파일을 저장하지 못했습니다.\n네트워크 연결을 확인한 뒤 다시 시도해 주세요.');
+        }
         return null;
       }
       savedToServer = true;
@@ -1399,18 +1427,11 @@ export default function Home() {
       
       console.log('✅ 서버 저장 완료:', saved.id);
 
-      // 2) Optimistic update: 캐시에 즉시 추가 → 기존 파일 유지하면서 새 파일 표시
-      if (saved) {
-        queryClient.setQueryData(filesQueryKey, (old: any) => ({
-          content: [
-            saved,
-            ...(old?.content ?? []).filter((item: any) => String(item.id) !== String(saved.id)),
-          ],
-          hasMore: old?.hasMore ?? false,
-        }));
-        // 백그라운드에서 서버와 동기화
-        refetchFiles();
-      }
+      // 2) 등록된 폴더의 목록 캐시에 바로 넣고 서버 기준으로 다시 확인한다.
+      // 외부 앱에서 연 파일은 보고 있는 폴더와 관계없이 root에 등록되므로 현재 폴더 캐시에 넣으면 안 된다.
+      const registeredFile = { ...saved, path: String(saved.path ?? folderPath) };
+      addFileToLists(registeredFile);
+      invalidateFileLists(registeredFile.path);
 
       return saved;
     } catch (e) {
@@ -1722,13 +1743,15 @@ export default function Home() {
                     // 폴더 삭제 완료 후 파일 삭제
                     if (selectedItems.files.length > 0) {
                       console.log(`🗑️ 파일 ${selectedItems.files.length}개 삭제:`, selectedItems.files);
-                      await authenticatedFetch(`${BASE_URL}/files`, {
+                      const deletedFiles = files.filter((file: any) => selectedItems.files.includes(file?.id));
+                      const fileRes = await authenticatedFetch(`${BASE_URL}/files`, {
                         method: "DELETE",
                         headers: {
                           "Content-Type": "application/json",
                         },
                         body: JSON.stringify({ ids: selectedItems.files })
                       }, deviceId ?? undefined);
+                      if (fileRes.ok) cleanUpDeletedFilesLocally(deletedFiles);
                     }
 
                     console.log("✅ 일괄 삭제 완료");
@@ -1757,13 +1780,15 @@ export default function Home() {
       // 2. 파일 삭제 (폴더 밖의 개별 파일들만)
       if (selectedItems.files.length > 0) {
         console.log(`🗑️ 파일 ${selectedItems.files.length}개 일괄 삭제:`, selectedItems.files);
-        await authenticatedFetch(`${BASE_URL}/files`, {
+        const deletedFiles = files.filter((file: any) => selectedItems.files.includes(file?.id));
+        const fileRes = await authenticatedFetch(`${BASE_URL}/files`, {
           method: "DELETE",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ ids: selectedItems.files })
         }, deviceId ?? undefined);
+        if (fileRes.ok) cleanUpDeletedFilesLocally(deletedFiles);
       }
 
       console.log("✅ 일괄 삭제 완료");
@@ -1924,8 +1949,18 @@ export default function Home() {
     !search &&
     filteredFiles.length === 0 &&
     visibleFolders.length === 0;
+  // 목록 조회가 실패했는데 보여 줄 캐시도 없으면 "파일이 없습니다" 대신 실패를 알리고 다시 시도할 수 있게 한다.
+  // (목록이 비어 있으면 당겨서 새로고침할 FlatList도 없다.)
+  const showListLoadError =
+    !showInitialLoading &&
+    !isSearching &&
+    !search &&
+    (isFilesError || isFoldersError) &&
+    files.length === 0 &&
+    visibleFolders.length === 0;
   const isInitial =
     !showInitialLoading &&
+    !showListLoadError &&
     files.length === 0 &&
     visibleFolders.length === 0 &&
     !search;
@@ -2076,6 +2111,24 @@ export default function Home() {
           </Text>
         </View>
     )}
+
+    {/* 목록 조회 실패 */}
+      {showListLoadError && (
+        <View style={styles.centerBox}>
+          <Text style={{ color: "#666", textAlign: "center" }}>
+            목록을 불러오지 못했어요.{"\n"}네트워크 연결을 확인해 주세요.
+          </Text>
+          <TouchableOpacity
+            onPress={onRefresh}
+            disabled={refreshing}
+            style={{ marginTop: 12, paddingHorizontal: 16, paddingVertical: 8 }}
+          >
+            <Text style={{ color: "#4A90E2", fontWeight: "600" }}>
+              {refreshing ? "불러오는 중..." : "다시 시도"}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
     {/* 검색 결과 없음 */}
     {noSearchResult && (
@@ -2485,6 +2538,7 @@ export default function Home() {
 
           // 캐시에서 즉시 제거 (같은 폴더의 다른 정렬 캐시와 2페이지 이후 목록 포함)
           removeFilesFromLists(String(selectedFile.path ?? currentFolder), [selectedFile.id]);
+          cleanUpDeletedFilesLocally([selectedFile]);
         } catch (error) {
           console.log("파일 삭제 실패:", error);
           Alert.alert("삭제 실패", "파일 삭제에 실패했습니다.");
