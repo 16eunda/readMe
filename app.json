@@ -134,7 +134,8 @@
           }
         }
       ],
-      "expo-secure-store"
+      "expo-secure-store",
+      "./plugins/withAsyncStorageDbSize"
     ],
     "experiments": {
       "typedRoutes": true,

@@ -6,7 +6,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Linking from 'expo-linking';
 import { Stack, usePathname, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Alert } from 'react-native';
 import 'react-native-reanimated';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -24,6 +24,15 @@ import { isSupportedFileName, toExternalFileUrl } from '../utils/externalFile';
 import { flushActiveReaderSession, getActiveReaderSessionFileId } from '../utils/readerLifecycle';
 
 const ACTIVE_READER_SESSION_KEY = '@active_reader_session';
+
+// 배포 빌드에서는 디버그 로그를 남기지 않는다. 앱 곳곳의 console.log가 JS 스레드를 쓰고, 파일 이름·본문 미리보기·
+// 요청 주소가 기기 로그(logcat)에 그대로 남는다. 문제 추적에 필요한 경고/오류(console.warn/error)는 유지한다.
+if (!__DEV__) {
+  const noop = () => {};
+  console.log = noop;
+  console.info = noop;
+  console.debug = noop;
+}
 
 export const unstable_settings = {
   anchor: '(tabs)',
@@ -347,7 +356,8 @@ function AppContent() {
 }
 
 export default function RootLayout() {
-  const queryClient = new QueryClient({
+  // 렌더마다 새로 만들면 목록 캐시가 통째로 사라지므로 앱 실행 동안 하나만 쓴다.
+  const [queryClient] = useState(() => new QueryClient({
     defaultOptions: {
       queries: {
         staleTime: 30 * 1000,        // 30초 내에는 캐시 반환 (네트워크 요청 안 함)
@@ -356,7 +366,7 @@ export default function RootLayout() {
         retry: 1,
       },
     },
-  });
+  }));
 
   return (
     <QueryClientProvider client={queryClient}>
