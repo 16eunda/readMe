@@ -4,14 +4,16 @@ import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Image,
   Platform,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { ICONS } from '../constants/icons';
 import { useUser } from '../contexts/UserContext';
 import {
   acquireIapConnection,
@@ -22,11 +24,11 @@ import {
 } from '../utils/subscriptionPurchases';
 
 const FEATURES = [
-  { emoji: '🤖', text: 'AI 독서 추천 무제한' },
-  { emoji: '📚', text: '파일 무제한 보관 및 AI로 자동 분석' },
-  { emoji: '⚡', text: 'AI 책 요약 & 핵심 정리' },
-  { emoji: '📊', text: '상세 독서 통계 (출시 예정)' },
-  { emoji: '🚫', text: '광고 없는 깔끔한 환경' },
+  { icon: ICONS.robot, text: 'AI 독서 추천 무제한' },
+  { icon: ICONS.books, text: '파일 무제한 보관 및 AI로 자동 분석' },
+  { icon: ICONS.lightning, text: 'AI 책 요약 & 핵심 정리' },
+  { icon: ICONS.chart, text: '상세 독서 통계 (출시 예정)' },
+  { icon: ICONS.noAds, text: '광고 없는 깔끔한 환경' },
 //   { emoji: '🤖', text: 'AI 독서 추천 무제한' },
 //   { emoji: '📚', text: '파일 무제한 보관 (무료: 최대 10개)' },
 //   { emoji: '🚫', text: '광고 없는 깔끔한 환경' },
@@ -248,7 +250,7 @@ export default function SubscriptionScreen() {
                   i < FEATURES.length - 1 && styles.featureRowBorder,
                 ]}
               >
-                <Text style={styles.featureEmoji}>{f.emoji}</Text>
+                <Image source={f.icon} style={styles.featureIcon} />
                 <Text style={styles.featureText}>{f.text}</Text>
                 <Text style={{ fontSize: 18 }}>✅</Text>
               </View>
@@ -282,7 +284,7 @@ export default function SubscriptionScreen() {
       >
         {/* 헤더 */}
         <View style={styles.header}>
-          <Text style={styles.bigEmoji}>✨</Text>
+          <Image source={ICONS.sparkle} style={styles.bigIcon} />
           <Text style={styles.title}>readMe Premium</Text>
           <Text style={styles.subtitle}>더 스마트하게 읽는 경험</Text>
         </View>
@@ -297,7 +299,7 @@ export default function SubscriptionScreen() {
                 i < FEATURES.length - 1 && styles.featureRowBorder,
               ]}
             >
-              <Text style={styles.featureEmoji}>{f.emoji}</Text>
+              <Image source={f.icon} style={styles.featureIcon} />
               <Text style={styles.featureText}>{f.text}</Text>
             </View>
           ))}
@@ -397,11 +399,12 @@ export default function SubscriptionScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#fff' },
-  scrollContent: { padding: 24, paddingBottom: 60 },
+  scrollContent: { padding: 24, paddingTop: 0, paddingBottom: 60 },
 
   // 헤더
   header: { alignItems: 'center', marginBottom: 28 },
   bigEmoji: { fontSize: 60, marginBottom: 12 },
+  bigIcon: { width: 76, height: 76, marginBottom: 12 },
   title: { fontSize: 26, fontWeight: '800', color: '#111', marginBottom: 6 },
   subtitle: { fontSize: 15, color: '#666' },
 
@@ -423,7 +426,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#F0EBFF',
   },
-  featureEmoji: { fontSize: 22, marginRight: 12 },
+  featureIcon: { width: 28, height: 28, marginRight: 12 },
   featureText: { flex: 1, fontSize: 15, color: '#333', fontWeight: '500' },
 
   // 플랜
@@ -517,7 +520,7 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     padding: 24,
-    paddingTop: 48,
+    paddingTop: 24,
   },
   premiumTitle: {
     fontSize: 26,

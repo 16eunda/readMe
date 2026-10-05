@@ -4,16 +4,18 @@ import { useCallback, useState } from "react";
 import {
   Alert,
   Dimensions,
+  Image,
   Linking,
   Platform,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import LoginModal from "../../components/LoginModal";
+import { ICONS } from "../../constants/icons";
 import { useUser } from "../../contexts/UserContext";
 import { authenticatedFetch, BASE_URL } from "../../utils/api";
 
@@ -151,7 +153,7 @@ export default function SettingsScreen() {
     }
   };
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={["top"]}>
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.content}
@@ -197,7 +199,11 @@ export default function SettingsScreen() {
         activeOpacity={0.8}
       >
         <View style={styles.bannerLeft}>
-          <Text style={styles.bannerEmoji}>{isPremium ? '👑' : '⭐'}</Text>
+          {isPremium ? (
+            <Text style={styles.bannerEmoji}>👑</Text>
+          ) : (
+            <Image source={ICONS.star} style={styles.bannerIcon} />
+          )}
           <View>
             <Text style={[styles.bannerTitle, isPremium && styles.bannerTitlePremium]}>
               {isPremium ? 'readMe 프리미엄' : 'readMe 무료 플랜'}
@@ -275,7 +281,7 @@ const styles = StyleSheet.create({
 
   content: {
     padding: 20,
-    paddingTop: 30,
+    paddingTop: 6,
     paddingBottom: 40,
   },
 
@@ -405,6 +411,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   bannerEmoji: { fontSize: 28 },
+  bannerIcon: { width: 34, height: 34 },
   bannerTitle: { fontSize: 14, fontWeight: '700', color: '#333' },
   bannerTitlePremium: { color: '#7C3AED' },
   bannerSub: { fontSize: 12, color: '#888', marginTop: 2 },

@@ -5,12 +5,12 @@ import {
   ActivityIndicator,
   FlatList,
   RefreshControl,
-  SafeAreaView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import HistoryCard from '../../components/HistoryCard';
 import { API_BASE_URL } from '../../constants/config';
 import { useUser } from '../../contexts/UserContext';
@@ -90,7 +90,7 @@ export default function HistoryScreen() {
   // 로딩 상태
   if (loading) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView style={styles.container} edges={['top']}>
         <Text style={styles.header}>History</Text>
         <View style={styles.centerContainer}>
           <ActivityIndicator size="large" color="#007AFF" />
@@ -103,7 +103,7 @@ export default function HistoryScreen() {
   // 에러 상태
   if (error) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView style={styles.container} edges={['top']}>
         <Text style={styles.header}>History</Text>
         <View style={styles.centerContainer}>
           <Text style={styles.errorText}>{error}</Text>
@@ -116,7 +116,7 @@ export default function HistoryScreen() {
   }
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={['top']}>
       <Text style={styles.header}>History</Text>
 
       <View style={styles.sectionHeader}>
@@ -164,7 +164,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 20,
-    paddingTop: 40,
+    paddingTop: 16,
   },
   header: {
     fontSize: 20,
@@ -191,7 +191,6 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    paddingTop: 60,
   },
   loadingText: {
     marginTop: 12,

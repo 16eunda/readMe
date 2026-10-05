@@ -7,6 +7,7 @@ import { router, Stack, useFocusEffect } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Image,
   NativeScrollEvent,
   NativeSyntheticEvent,
   RefreshControl,
@@ -16,6 +17,7 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { ICONS } from "../constants/icons";
 import { useUser } from "../contexts/UserContext";
 import { authenticatedFetch } from "../utils/api";
 
@@ -229,6 +231,7 @@ export default function RankingPremiumScreen() {
       />
       <ScrollView
         style={styles.container}
+        contentContainerStyle={{ flexGrow: 1 }}
         showsVerticalScrollIndicator={false}
         onScroll={handleScroll}
         scrollEventThrottle={100}
@@ -324,7 +327,7 @@ export default function RankingPremiumScreen() {
         {/* 빈 상태 */}
         {!loading && !error && rankings.length === 0 && (
           <View style={styles.centerContainer}>
-            <Text style={styles.emptyText}>📊</Text>
+            <Image source={ICONS.chart} style={styles.emptyIcon} />
             <Text style={styles.emptySubText}>
               해당 기간의 랭킹 데이터가 없습니다
             </Text>
@@ -486,7 +489,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     minHeight: 300,
-    paddingTop: 40,
   },
   loadingText: { marginTop: 12, fontSize: 14, color: "#666" },
   errorText: {
@@ -502,7 +504,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   retryButtonText: { color: "#fff", fontSize: 14, fontWeight: "600" },
-  emptyText: { fontSize: 48, marginBottom: 12 },
+  emptyIcon: { width: 64, height: 64, marginBottom: 12 },
   emptySubText: { fontSize: 15, color: "#999" },
 
 });

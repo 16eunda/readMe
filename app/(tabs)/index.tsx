@@ -18,12 +18,12 @@ import {
   FlatList,
   Modal,
   RefreshControl,
-  SafeAreaView,
   ScrollView,
   Text,
   TouchableOpacity,
   View
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 // 파일 카드
 import AiAnalysisModal from "../../components/AiAnalysisModal";
 import FileCard, { FileItem } from "../../components/FileCard";
@@ -537,9 +537,16 @@ export default function Home() {
 
   useFocusEffect(
     useCallback(() => {
-      if (currentFolder === "root") return;
+      if (!isSelectMode && currentFolder === "root") return;
 
       const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+        // 선택 모드에서는 앱을 나가거나 상위 폴더로 가지 않고 선택 모드만 끈다.
+        if (isSelectMode) {
+          setIsSelectMode(false);
+          setSelectedItems({ files: [], folders: [] });
+          return true;
+        }
+
         const current = allFolders.find(
           (candidate) => String(candidate.id) === currentFolder,
         );
@@ -548,7 +555,7 @@ export default function Home() {
       });
 
       return () => subscription.remove();
-    }, [allFolders, currentFolder, moveToFolder]),
+    }, [allFolders, currentFolder, isSelectMode, moveToFolder]),
   );
 
   // ========== 4. 모든 useEffect ==========
@@ -1970,7 +1977,7 @@ export default function Home() {
     search &&
     !isInitialLoading;
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={["top"]}>
        {/* 🔹 상단 전체 묶음 */}
     <View style={styles.topArea}>
       <Text style={styles.homeTitle}>

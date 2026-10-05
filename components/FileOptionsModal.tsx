@@ -1,4 +1,4 @@
-import { Modal, Text, TouchableOpacity, View } from "react-native";
+import { Modal, Pressable, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 
 type FileOptionsModalProps = {
   visible: boolean;
@@ -25,6 +25,8 @@ export default function FileOptionsModal({
           alignItems: "center",
         }}
       >
+        {/* 팝업 바깥을 누르면 취소 */}
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
         <View
           style={{
             width: "75%",

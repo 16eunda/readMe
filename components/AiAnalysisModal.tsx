@@ -2,6 +2,7 @@ import { useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Image,
   Modal,
   ScrollView,
   Text,
@@ -9,6 +10,7 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { ICONS } from "../constants/icons";
 import { useUser } from "../contexts/UserContext";
 import { authenticatedFetch, BASE_URL } from "../utils/api";
 
@@ -220,7 +222,10 @@ export default function AiAnalysisModal({
         >
           {/* 헤더 */}
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-            <Text style={{ fontSize: 18, fontWeight: "bold", color: "#1a1a1a" }}>✨ AI 분석</Text>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <Image source={ICONS.sparkle} style={{ width: 22, height: 22 }} />
+              <Text style={{ fontSize: 18, fontWeight: "bold", color: "#1a1a1a" }}>AI 분석</Text>
+            </View>
             {!editing ? (
               <TouchableOpacity onPress={onClose} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
                 <Text style={{ fontSize: 15, color: "#888" }}>닫기</Text>
@@ -248,7 +253,7 @@ export default function AiAnalysisModal({
           {/* ── 비프리미엄 ── */}
           {showPremiumLock && (
             <View style={{ alignItems: "center", paddingVertical: 32 }}>
-              <Text style={{ fontSize: 44, marginBottom: 14 }}>🔒</Text>
+              <Image source={ICONS.lock} style={{ width: 56, height: 56, marginBottom: 14 }} />
               <Text
                 style={{ fontSize: 17, fontWeight: "bold", marginBottom: 8, color: "#1a1a1a" }}
               >
