@@ -1,8 +1,10 @@
-import { Modal, Text, TouchableOpacity, View } from "react-native";
+import { Modal, ScrollView, Text, TouchableOpacity, View } from "react-native";
 
 type DuplicateConfirmModalProps = {
   visible: boolean;
   fileName: string;
+  /** 여러 개를 한 번에 등록할 때 발견된 중복 파일 이름들 */
+  fileNames?: string[];
   onConfirm: () => void;
   onCancel: () => void;
 };
@@ -10,11 +12,15 @@ type DuplicateConfirmModalProps = {
 export default function DuplicateConfirmModal({
   visible,
   fileName,
+  fileNames,
   onConfirm,
   onCancel,
 }: DuplicateConfirmModalProps) {
+  const duplicateNames = fileNames?.filter(Boolean) ?? [];
+  const isMultiple = duplicateNames.length > 1;
+
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
       <View
         style={{
           flex: 1,
@@ -44,19 +50,56 @@ export default function DuplicateConfirmModal({
           </Text>
 
           {/* 내용 */}
-          <Text
-            style={{
-              fontSize: 14,
-              color: "#555",
-              textAlign: "center",
-              marginBottom: 25,
-              lineHeight: 20,
-            }}
-          >
-            "{fileName}"{"\n"}
-            이미 추가된 파일입니다.{"\n\n"}
-            그래도 추가하시겠습니까?
-          </Text>
+          {isMultiple ? (
+            <View style={{ marginBottom: 25 }}>
+              <Text
+                style={{
+                  fontSize: 14,
+                  color: "#555",
+                  textAlign: "center",
+                  lineHeight: 20,
+                }}
+              >
+                {duplicateNames.length}개가 이미 추가된 파일입니다.
+              </Text>
+              <ScrollView style={{ maxHeight: 140, marginTop: 12 }}>
+                {duplicateNames.map((name) => (
+                  <Text
+                    key={name}
+                    numberOfLines={1}
+                    style={{ fontSize: 13, color: "#777", lineHeight: 20 }}
+                  >
+                    · {name}
+                  </Text>
+                ))}
+              </ScrollView>
+              <Text
+                style={{
+                  fontSize: 14,
+                  color: "#555",
+                  textAlign: "center",
+                  lineHeight: 20,
+                  marginTop: 12,
+                }}
+              >
+                그래도 모두 추가하시겠습니까?
+              </Text>
+            </View>
+          ) : (
+            <Text
+              style={{
+                fontSize: 14,
+                color: "#555",
+                textAlign: "center",
+                marginBottom: 25,
+                lineHeight: 20,
+              }}
+            >
+              &quot;{fileName}&quot;{"\n"}
+              이미 추가된 파일입니다.{"\n\n"}
+              그래도 추가하시겠습니까?
+            </Text>
+          )}
 
           {/* 버튼들 */}
           <View style={{ flexDirection: "row", gap: 10 }}>

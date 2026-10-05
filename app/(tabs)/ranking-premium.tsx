@@ -7,16 +7,18 @@ import { router, useFocusEffect } from "expo-router";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Image,
   NativeScrollEvent,
   NativeSyntheticEvent,
   RefreshControl,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { ICONS } from "../../constants/icons";
 import { useUser } from "../../contexts/UserContext";
 import { authenticatedFetch } from "../../utils/api";
 
@@ -224,9 +226,10 @@ export default function RankingPremiumScreen() {
   const showInitialLoading = loading && !hasRankings;
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
+    <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }} edges={["top"]}>
       <ScrollView
         style={styles.container}
+        contentContainerStyle={{ flexGrow: 1 }}
         showsVerticalScrollIndicator={false}
         onScroll={handleScroll}
         scrollEventThrottle={100}
@@ -322,7 +325,7 @@ export default function RankingPremiumScreen() {
         {/* 빈 상태 */}
         {!loading && !error && rankings.length === 0 && (
           <View style={styles.centerContainer}>
-            <Text style={styles.emptyText}>📊</Text>
+            <Image source={ICONS.chart} style={styles.emptyIcon} />
             <Text style={styles.emptySubText}>
               해당 기간의 랭킹 데이터가 없습니다
             </Text>
@@ -387,7 +390,7 @@ export default function RankingPremiumScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#fff", padding: 20 },
+  container: { flex: 1, backgroundColor: "#fff", padding: 20, paddingTop: 12 },
 
   premiumBadge: {
     alignSelf: "flex-start",
@@ -395,7 +398,6 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     paddingHorizontal: 14,
     paddingVertical: 6,
-    marginTop: 16,
     marginBottom: 12,
     borderWidth: 1,
     borderColor: "#E8DCFF",
@@ -484,7 +486,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     minHeight: 300,
-    paddingTop: 40,
   },
   loadingText: { marginTop: 12, fontSize: 14, color: "#666" },
   errorText: {
@@ -500,7 +501,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   retryButtonText: { color: "#fff", fontSize: 14, fontWeight: "600" },
-  emptyText: { fontSize: 48, marginBottom: 12 },
+  emptyIcon: { width: 64, height: 64, marginBottom: 12 },
   emptySubText: { fontSize: 15, color: "#999" },
 
 });

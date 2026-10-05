@@ -1,8 +1,11 @@
 package com.readme.externalfileinfo
 
+import android.content.ContentResolver
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Process
 import android.provider.OpenableColumns
 import expo.modules.kotlin.exception.Exceptions
 import expo.modules.kotlin.modules.Module
@@ -69,9 +72,49 @@ class ExternalFileInfoModule : Module() {
       installerPackage == "com.android.vending" && playStoreEnabled
     }
 
-    AsyncFunction("isLaunchedFromHistoryAsync") {
-      val flags = appContext.currentActivity?.intent?.flags ?: 0
-      flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+    // 현재 Activity가 속한 태스크 ID. 최근 앱 목록에서 앱을 지우면 태스크가 사라지고 다음 실행은 새 태스크가 된다.
+    // 같은 태스크가 이어지는지로 "잠깐 백그라운드에 있었던 것"과 "새로 실행한 것"을 구분한다.
+    Function("getTaskId") {
+      appContext.currentActivity?.taskId
+    }
+
+    // 외부 파일 Intent가 새로 전달된 요청이면 true. Activity 복원으로 이미 처리한 Intent를 다시 받은 경우 false.
+    AsyncFunction("claimExternalIntentAsync") { uri: String ->
+      // Activity 없이는 복원 여부를 판별할 근거가 없으므로 새 요청으로 취급하지 않는다.
+      val activity = appContext.currentActivity ?: return@AsyncFunction false
+      ExternalLaunchIntentRegistry.claim(activity, uri)
+    }
+
+    // 개발 로그용: 현재 Activity Intent(onNewIntent로 최신화됨)의 전달 형태와 URI 읽기 권한
+    AsyncFunction("getCurrentIntentInfoAsync") {
+      val activity = appContext.currentActivity ?: return@AsyncFunction null
+      val intent = activity.intent ?: return@AsyncFunction null
+      val data = intent.data
+      val clipUris = intent.clipData?.let { clip ->
+        (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri?.toString() }
+      } ?: emptyList()
+      val readPermission = when {
+        data == null -> "no-data"
+        data.scheme != ContentResolver.SCHEME_CONTENT -> "not-content-uri"
+        activity.checkUriPermission(
+          data,
+          Process.myPid(),
+          Process.myUid(),
+          Intent.FLAG_GRANT_READ_URI_PERMISSION,
+        ) == PackageManager.PERMISSION_GRANTED -> "granted"
+        else -> "denied"
+      }
+
+      mapOf(
+        "action" to intent.action,
+        "data" to intent.dataString,
+        "mimeType" to intent.type,
+        "flags" to "0x${Integer.toHexString(intent.flags)}",
+        "grantReadUriFlag" to (intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0),
+        "persistableGrantFlag" to (intent.flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION != 0),
+        "clipDataUris" to clipUris,
+        "readPermission" to readPermission,
+      )
     }
 
     AsyncFunction("clearCurrentIntentDataAsync") { expectedUri: String ->

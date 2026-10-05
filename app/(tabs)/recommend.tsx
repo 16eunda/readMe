@@ -6,13 +6,13 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { useUser } from '../../contexts/UserContext';
 import { authenticatedFetch } from '../../utils/api';
 
@@ -106,7 +106,8 @@ export default function Recommend() {
     );
     try {
       const deviceId = await getDeviceId();
-      const res = await authenticatedFetch(`${API_BASE_URL}/recommendations`, {}, deviceId);
+      // AI 추천은 서버가 외부 AI 응답을 기다리므로 일반 요청보다 오래 기다린다.
+      const res = await authenticatedFetch(`${API_BASE_URL}/recommendations`, { timeoutMs: 90000 }, deviceId);
       if (res.ok) {
         const data = await res.json();
         if (data?.premiumRequired === true || data?.quality === "PREMIUM_REQUIRED") {
@@ -159,7 +160,7 @@ export default function Recommend() {
   const showPremiumLock = !user || !isPremium || premiumRequired;
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={["top"]}>
       {/* ── 첫 진입 ── */}
       {!hasFetched && !loading && (
         <View style={styles.centerWrap}>
@@ -394,7 +395,7 @@ const styles = StyleSheet.create({
   tipText: { fontSize: 14, color: "#475569", lineHeight: 20 },
 
   // ── 결과 목록 ──
-  listContent: { paddingHorizontal: 20, paddingTop: 24, paddingBottom: 40 },
+  listContent: { paddingHorizontal: 20, paddingBottom: 40 },
   resultHeader: {
     flexDirection: "row", justifyContent: "space-between", alignItems: "flex-end",
     marginBottom: 20,

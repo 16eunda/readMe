@@ -44,7 +44,7 @@ export default function FileMoveModal({
   const breadcrumb = getBreadcrumb();
 
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View
         style={{
           flex: 1,

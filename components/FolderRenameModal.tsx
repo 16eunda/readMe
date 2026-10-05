@@ -14,7 +14,7 @@ export default function FolderRenameModal({
   onClose: () => void;
 }) {
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View
         style={{
           flex: 1,

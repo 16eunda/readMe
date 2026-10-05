@@ -23,6 +23,10 @@ export function registerActiveReaderSession(session: ActiveReaderSession) {
   };
 }
 
+export function getActiveReaderSessionFileId() {
+  return activeReaderSession?.fileId ?? null;
+}
+
 export async function flushActiveReaderSession(reason: ReaderFlushReason) {
   const session = activeReaderSession;
   if (!session) return;

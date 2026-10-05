@@ -54,7 +54,7 @@ export default StyleSheet.create({
 
   topArea: {
     paddingHorizontal: 20,
-    paddingTop: 40,
+    paddingTop: 16,
     paddingBottom: 10
   },
 

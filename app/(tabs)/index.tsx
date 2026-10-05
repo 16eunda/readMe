@@ -18,12 +18,12 @@ import {
   FlatList,
   Modal,
   RefreshControl,
-  SafeAreaView,
   ScrollView,
   Text,
   TouchableOpacity,
   View
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 // 파일 카드
 import AiAnalysisModal from "../../components/AiAnalysisModal";
 import FileCard, { FileItem } from "../../components/FileCard";
@@ -48,12 +48,18 @@ import FileOptionsModal from "../../components/FileOptionsModal";
 import FolderOptionsModal from "../../components/FolderOptionsModal";
 import FolderRenameModal from "../../components/FolderRenameModal";
 import PreviewModal from "../../components/PreviewModal";
+import { isSupportedFileName } from "../../utils/externalFile";
 import SortModal, { SortOption } from "../../components/SortModal";
 import { useUser } from "../../contexts/UserContext";
+import { flushActiveReaderSession } from "../../utils/readerLifecycle";
 
 const MANAGED_FILE_DIRECTORY = "library-files";
+
+// 선택한 파일을 앱 저장소로 복사해 둔 상태
+type PreparedPick = { file: any; managedPath: string; exists: boolean };
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
 const READER_LOCAL_PROGRESS_KEY_PREFIX = "@reader_position:";
+const EPUB_LOCATIONS_CACHE_KEY_PREFIX = "@reader_epub_locations:";
 const TXT_PREVIEW_SAMPLE_BYTES = 64 * 1024;
 
 // Home 화면이 이동 과정에서 다시 마운트되어도 같은 외부 파일 등록은 한 번만 진행한다.
@@ -152,10 +158,6 @@ function decodeTextSafe(buffer: Buffer): string {
 }
 
 export default function Home() {
-  // 렌더 횟수 추적 (디버깅용) - 실제 앱에서는 제거 권장
-  const renderCount = useRef(0);
-  renderCount.current += 1;
-
   // ========== 1. 외부 Hooks (useRouter, useLocalSearchParams) ==========
   const router = useRouter();
   const { folder, locateFileId } = useLocalSearchParams();
@@ -200,6 +202,16 @@ export default function Home() {
     externalRegistrationKey?: string;
     operationId: number;
   } | null>(null);
+  // 여러 개 등록에서 발견된 중복 파일들은 한 번만 모아서 묻는다.
+  const [pendingDuplicateFiles, setPendingDuplicateFiles] = useState<PreparedPick[]>([]);
+  // 팝업 대기 중인 복사본. 새 등록이 시작되면 정리해 앱 저장소에 남지 않게 한다.
+  const pendingPreparedPicksRef = useRef<PreparedPick[]>([]);
+  const [pendingBatchSummary, setPendingBatchSummary] = useState<{
+    newFiles: PreparedPick[];
+    failed: string[];
+    unsupported: string[];
+    total: number;
+  } | null>(null);
 
   // 페이지네이션 (추가 페이지 로딩용)
   const [currentPage, setCurrentPage] = useState(0);
@@ -235,32 +247,22 @@ export default function Home() {
 
   // 파일 등록 중 로딩
   const [isUploading, setIsUploading] = useState(false);
+  // 여러 개를 등록하는 중일 때만 진행 상황을 표시한다.
+  const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null);
+  // 여러 개 등록 중에는 파일별 오버레이 토글과 개별 실패 알림을 묶어서 처리한다.
+  const batchRegistrationRef = useRef(false);
 
   // 파일 삭제 중 로딩
   const [isDeleting, setIsDeleting] = useState(false);
 
+  // 여러 파일/폴더 이동 진행 표시
+  const [bulkMoveProgress, setBulkMoveProgress] = useState<{ done: number; total: number } | null>(null);
+  const [bulkMoveOverlayVisible, setBulkMoveOverlayVisible] = useState(false);
+  const bulkMoveInProgressRef = useRef(false);
+
   // 전역 상태에서 사용자 정보 가져오기
   const { user, deviceId, incomingFile, setIncomingFile, isLoading: isUserLoading } = useUser();
   const queryClient = useQueryClient();
-
-  // 🔍 어떤 값이 계속 바뀌는지 추적
-  const _prevDebug = useRef<Record<string, any>>({});
-  useEffect(() => {
-    const current: Record<string, any> = {
-      user, deviceId, incomingFile,
-      search, debouncedSearch, isSearching,
-      currentFolder, sortOption, extraFiles,
-      hasMore, refreshing,
-      isUploading, isDeleting,
-    };
-    const changed = Object.keys(current).filter(
-      (k) => _prevDebug.current[k] !== current[k]
-    );
-    if (changed.length > 0) {
-      console.log("🔴 변경된 값:", changed.join(", "), "렌더:", renderCount.current);
-    }
-    _prevDebug.current = current;
-  });
 
   // ========== React Query: 파일/폴더 조회 ==========
   // 정렬 파라미터 변환
@@ -273,7 +275,12 @@ export default function Home() {
   // 앱 시작 중 user가 undefined → 로그인 사용자로 확정돼도 동일 목록 캐시를 유지한다.
   // 로그인/로그아웃 시에는 아래 userId 변경 effect에서 명시적으로 캐시를 무효화한다.
   const filesQueryKey = ['files', currentFolder, sortParam, deviceId];
-  const { data: filesData, isLoading: isInitialLoading, refetch: refetchFiles } = useQuery({
+  const {
+    data: filesData,
+    isLoading: isInitialLoading,
+    isError: isFilesError,
+    refetch: refetchFiles,
+  } = useQuery({
     queryKey: filesQueryKey,
     queryFn: async () => {
       const params = new URLSearchParams({
@@ -287,6 +294,8 @@ export default function Home() {
         {},
         deviceId!
       );
+      // 오류 응답을 빈 목록으로 처리하면 캐시된 목록까지 빈 목록으로 덮어써 "파일이 모두 사라진" 것처럼 보인다.
+      if (!response.ok) throw new Error(`파일 목록 조회 실패: ${response.status}`);
       const data = await response.json();
       if (data.content && Array.isArray(data.content)) {
         return { content: data.content, hasMore: !data.last };
@@ -302,12 +311,18 @@ export default function Home() {
 
   // 현재 폴더 폴더 목록
   const foldersQueryKey = ['folders', currentFolder, deviceId];
-  const { data: foldersData, isLoading: isFoldersLoading, refetch: refetchFolders } = useQuery({
+  const {
+    data: foldersData,
+    isLoading: isFoldersLoading,
+    isError: isFoldersError,
+    refetch: refetchFolders,
+  } = useQuery({
     queryKey: foldersQueryKey,
     queryFn: async () => {
       const url = `${BASE_URL}/folders?path=${String(currentFolder)}`;
-      console.log("📁 폴더 쿼리 요청:", url, "deviceId:", deviceId);
+      console.log("📁 폴더 쿼리 요청:", url);
       const response = await authenticatedFetch(url, {}, deviceId!);
+      if (!response.ok) throw new Error(`폴더 목록 조회 실패: ${response.status}`);
       const data = await response.json();
 
       console.log("📁 폴더 쿼리 응답:", Array.isArray(data) ? `배열 ${data.length}개` : data);
@@ -325,6 +340,7 @@ export default function Home() {
     queryKey: allFoldersQueryKey,
     queryFn: async () => {
       const response = await authenticatedFetch(`${BASE_URL}/folders`, {}, deviceId!);
+      if (!response.ok) throw new Error(`전체 폴더 조회 실패: ${response.status}`);
       const data = await response.json();
       return Array.isArray(data) ? data : [];
     },
@@ -335,13 +351,130 @@ export default function Home() {
 
   // React Query 데이터 → 로컬 변수
   const page0Files: any[] = filesData?.content ?? [];
+  const firstPageFiles: any[] = locationPageFiles ?? page0Files;
+  // 파일이 빠진 뒤 첫 페이지를 다시 받으면 원래 2페이지에 있던 파일이 첫 페이지로 올라온다. 같은 파일을 두 번 표시하지 않는다.
+  const firstPageFileIds = new Set(firstPageFiles.map((file: any) => String(file?.id)));
   const files = isSearching
     ? searchResults
-    : locationPageFiles
-      ? [...locationPageFiles, ...extraFiles]
-      : [...page0Files, ...extraFiles];
+    : [...firstPageFiles, ...extraFiles.filter((file: any) => !firstPageFileIds.has(String(file?.id)))];
   const folders: any[] = foldersData ?? [];
   const allFolders: any[] = useMemo(() => allFoldersData ?? [], [allFoldersData]);
+
+  // ========== 목록 캐시 동기화 ==========
+  // Home과 폴더 화면은 같은 컴포넌트이고, 목록은 폴더(path)별 React Query 캐시(['files', path, sort, deviceId],
+  // ['folders', path, deviceId], ['allFolders', deviceId])와 현재 폴더의 2페이지 이후 state(extraFiles/locationPageFiles)로 나뉜다.
+  // 지금 보고 있지 않은 폴더의 캐시는 staleTime(30초) 안에는 다시 조회되지 않으므로, 위치가 바뀌는 작업 뒤에
+  // 원래 폴더와 새 폴더의 캐시를 함께 맞추지 않으면 새 폴더에 들어가도 작업 전 목록이 그대로 보인다.
+  const fileSortValue = (file: any, field: string) =>
+    field === "rating" ? Number(file?.rating ?? 0) : new Date(file?.date ?? 0).getTime() || 0;
+
+  // 해당 폴더의 모든 정렬 캐시와, 그 폴더를 보고 있다면 2페이지 이후 state에서도 파일을 뺀다.
+  const removeFilesFromLists = (path: string, ids: (string | number)[]) => {
+    const removedIds = new Set(ids.map(String));
+    const keep = (file: any) => !removedIds.has(String(file?.id));
+    queryClient.setQueriesData({ queryKey: ["files", path] }, (old: any) =>
+      old ? { ...old, content: (old.content ?? []).filter(keep) } : old
+    );
+    if (path === currentFolder) {
+      setExtraFiles((prev) => prev.filter(keep));
+      setLocationPageFiles((prev) => (prev ? prev.filter(keep) : prev));
+    }
+  };
+
+  // 새 폴더에 이미 캐시된 목록이 있으면 정렬 위치에 넣는다. 조회한 적 없는 폴더는 들어갈 때 처음 조회된다.
+  const addFileToLists = (file: any) => {
+    const path = String(file?.path ?? "root");
+    for (const [key, data] of queryClient.getQueriesData<any>({ queryKey: ["files", path] })) {
+      if (!data) continue;
+      const [field, direction] = String(key[2] ?? "date,desc").split(",");
+      const content = (data.content ?? []).filter((item: any) => String(item?.id) !== String(file.id));
+      const value = fileSortValue(file, field);
+      const index = content.findIndex((item: any) => {
+        const other = fileSortValue(item, field);
+        return direction === "asc" ? value < other : value > other;
+      });
+      // 첫 페이지보다 뒤에 속하는 파일은 다음 페이지를 불러올 때 표시되므로 첫 페이지에는 넣지 않는다.
+      if (index < 0 && data.hasMore) {
+        queryClient.setQueryData(key, { ...data, content });
+        continue;
+      }
+      const nextContent = [...content];
+      nextContent.splice(index < 0 ? nextContent.length : index, 0, file);
+      queryClient.setQueryData(key, { ...data, content: nextContent });
+    }
+  };
+
+  const replaceFileInLists = (file: any) => {
+    const replace = (item: any) => (String(item?.id) === String(file.id) ? file : item);
+    queryClient.setQueriesData({ queryKey: ["files", String(file?.path ?? currentFolder)] }, (old: any) =>
+      old ? { ...old, content: (old.content ?? []).map(replace) } : old
+    );
+    setExtraFiles((prev) => prev.map(replace));
+    setLocationPageFiles((prev) => (prev ? prev.map(replace) : prev));
+  };
+
+  // 캐시를 먼저 맞춘 뒤 서버 기준으로 재검증한다. 보고 있는 폴더는 바로 다시 조회되고,
+  // 나머지 폴더는 stale로 표시되어 그 폴더에 들어갈 때 다시 조회된다.
+  const invalidateFileLists = (...paths: string[]) => {
+    for (const path of new Set(paths.map(String))) {
+      queryClient.invalidateQueries({ queryKey: ["files", path] });
+    }
+  };
+
+  const moveFolderInLists = (folder: any, fromPath: string) => {
+    const folderId = String(folder.id);
+    const toPath = String(folder.path);
+    queryClient.setQueriesData({ queryKey: ["folders", fromPath] }, (old: any) =>
+      Array.isArray(old) ? old.filter((item: any) => String(item?.id) !== folderId) : old
+    );
+    queryClient.setQueriesData({ queryKey: ["folders", toPath] }, (old: any) =>
+      Array.isArray(old) ? [...old.filter((item: any) => String(item?.id) !== folderId), folder] : old
+    );
+    queryClient.setQueriesData({ queryKey: ["allFolders"] }, (old: any) =>
+      Array.isArray(old) ? old.map((item: any) => (String(item?.id) === folderId ? { ...item, path: toPath } : item)) : old
+    );
+    queryClient.invalidateQueries({ queryKey: ["folders", fromPath] });
+    queryClient.invalidateQueries({ queryKey: ["folders", toPath] });
+    queryClient.invalidateQueries({ queryKey: ["allFolders"] });
+  };
+
+  const removeDeletedItemsFromLists = (fileIds: (string | number)[], folderIds: (string | number)[]) => {
+    for (const id of fileIds) {
+      const file = files.find((item: any) => String(item?.id) === String(id));
+      removeFilesFromLists(String(file?.path ?? currentFolder), [id]);
+    }
+    if (folderIds.length > 0) {
+      const deletedIds = new Set(folderIds.map(String));
+      const keep = (item: any) => !deletedIds.has(String(item?.id));
+      queryClient.setQueriesData({ queryKey: ["folders"] }, (old: any) => (Array.isArray(old) ? old.filter(keep) : old));
+      // 삭제한 폴더가 이동 위치 선택 목록에 남지 않도록 전체 폴더 목록도 맞춘다. (하위 폴더 포함 삭제는 재조회로 반영)
+      queryClient.setQueriesData({ queryKey: ["allFolders"] }, (old: any) => (Array.isArray(old) ? old.filter(keep) : old));
+      queryClient.invalidateQueries({ queryKey: ["allFolders"] });
+    }
+  };
+
+  // 서버에서 삭제한 파일의 앱 내부 복사본과 기기 이어읽기 기록을 정리한다. 지우지 않으면 삭제한 책이 기기 저장공간과
+  // AsyncStorage(Android 기본 6MB)에 계속 쌓인다. 앱이 등록할 때 만든 고유 경로(library-files/)의 파일만 지운다.
+  // (예전 버전이 만든 경로는 같은 이름의 다른 파일과 겹칠 수 있으므로 건드리지 않는다.)
+  const cleanUpDeletedFilesLocally = (deletedFiles: any[]) => {
+    const documentDirectory = FileSystem.documentDirectory;
+    const managedDirectory = documentDirectory ? `${documentDirectory}${MANAGED_FILE_DIRECTORY}/` : null;
+    for (const file of deletedFiles) {
+      if (!file) continue;
+      const uri = String(file.uri ?? "");
+      if (managedDirectory && uri.startsWith(managedDirectory)) {
+        void FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+      }
+      const id = String(file.id ?? "");
+      if (id) {
+        void AsyncStorage.multiRemove([
+          `${TXT_LOCAL_PROGRESS_KEY_PREFIX}${id}`,
+          `${READER_LOCAL_PROGRESS_KEY_PREFIX}${id}`,
+          `${EPUB_LOCATIONS_CACHE_KEY_PREFIX}${id}`,
+        ]).catch(() => {});
+      }
+    }
+  };
 
   // hasMore 동기화 (queryFn 바깥에서 side effect 처리)
   useEffect(() => {
@@ -404,9 +537,16 @@ export default function Home() {
 
   useFocusEffect(
     useCallback(() => {
-      if (currentFolder === "root") return;
+      if (!isSelectMode && currentFolder === "root") return;
 
       const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+        // 선택 모드에서는 앱을 나가거나 상위 폴더로 가지 않고 선택 모드만 끈다.
+        if (isSelectMode) {
+          setIsSelectMode(false);
+          setSelectedItems({ files: [], folders: [] });
+          return true;
+        }
+
         const current = allFolders.find(
           (candidate) => String(candidate.id) === currentFolder,
         );
@@ -415,7 +555,7 @@ export default function Home() {
       });
 
       return () => subscription.remove();
-    }, [allFolders, currentFolder, moveToFolder]),
+    }, [allFolders, currentFolder, isSelectMode, moveToFolder]),
   );
 
   // ========== 4. 모든 useEffect ==========
@@ -437,11 +577,14 @@ export default function Home() {
       return;
     }
     if (prevUserIdRef.current !== nextUserId && deviceId) {
-      console.log(user ? "🔐 로그인 감지 → 캐시 무효화" : "🚪 로그아웃 감지 → 캐시 무효화");
+      console.log(user ? "🔐 로그인 감지 → 캐시 초기화" : "🚪 로그아웃 감지 → 캐시 초기화");
       prevUserIdRef.current = nextUserId;
-      queryClient.invalidateQueries({ queryKey: ['files'] });
-      queryClient.invalidateQueries({ queryKey: ['folders'] });
-      queryClient.invalidateQueries({ queryKey: ['allFolders'] });
+      // invalidateQueries는 새로 fetch가 끝나기 전까지 화면에 이전 데이터를 그대로 유지한다.
+      // 계정이 바뀐 직후에는 그 잠깐 사이에도 이전 계정의 파일/폴더 목록이 보이면 안 되므로,
+      // 캐시된 데이터 자체를 즉시 비우는 resetQueries를 사용한다.
+      queryClient.resetQueries({ queryKey: ['files'] });
+      queryClient.resetQueries({ queryKey: ['folders'] });
+      queryClient.resetQueries({ queryKey: ['allFolders'] });
     }
   }, [user?.userId, deviceId, isUserLoading, queryClient]);
 
@@ -494,14 +637,31 @@ export default function Home() {
     setDuplicateFileName("");
     setPendingFile(null);
     setPendingFileAction(null);
+    setPendingDuplicateFiles([]);
+    setPendingBatchSummary(null);
+
+    const abandoned = pendingPreparedPicksRef.current;
+    pendingPreparedPicksRef.current = [];
+    if (abandoned.length > 0) void discardPreparedPicksRef.current(abandoned);
     return operationId;
   };
+
+  const discardPreparedPicksRef = useRef<(items: PreparedPick[]) => Promise<void>>(async () => {});
 
   const isCurrentFileRegistration = (operationId: number) =>
     fileRegistrationOperationIdRef.current === operationId;
 
+  // 앱 시작 시 계정(토큰·deviceId) 확인이 끝났는지. UserContext는 백그라운드에서 돌아올 때마다 토큰을 다시
+  // 확인하며 isLoading을 켜는데(느린 네트워크에서 최대 수십 초), 계정은 이미 정해져 있고 만료된 토큰은
+  // authenticatedFetch가 같은 재발급 결과를 기다려 처리하므로, 파일 탐색기에서 연 파일을 그동안 붙잡아 두지 않는다.
+  const userBootstrappedRef = useRef(false);
   useEffect(() => {
-    if (!incomingFile || isUserLoading) return;
+    if (!isUserLoading) userBootstrappedRef.current = true;
+  }, [isUserLoading]);
+
+  useEffect(() => {
+    if (!incomingFile) return;
+    if (isUserLoading && !userBootstrappedRef.current) return;
 
     setIncomingFile(null); // 중복 처리 방지
     
@@ -538,6 +698,7 @@ export default function Home() {
     
     try {
       // 중복 체크 (root 폴더 기준)
+      if (__DEV__) console.log('[External File Handling] duplicate check start', { name, operationId });
       const checkRes = await authenticatedFetch(
         `${BASE_URL}/files/check?title=${encodeURIComponent(name)}&path=root`,
         { signal: fileRegistrationAbortRef.current?.signal },
@@ -562,8 +723,10 @@ export default function Home() {
       }
 
       // 새 파일 → root에 추가 후 바로 reader로 이동
+      if (__DEV__) console.log('[External File Handling] register start', { name, operationId });
       const saved = await addFileToSystem({ uri, name }, 'root', operationId);
       if (saved && isCurrentFileRegistration(operationId)) {
+        if (__DEV__) console.log('[Reader] new file open', { fileId: saved.id, name: saved.title });
         router.push({
           pathname: '/reader',
           params: { fileId: saved.id, uri: saved.uri, name: saved.title, type: saved.type },
@@ -572,6 +735,10 @@ export default function Home() {
     } catch (e) {
       if (!isCurrentFileRegistration(operationId)) return;
       console.error('❌ 외부 파일 처리 실패:', e);
+      // 앱 내부 파일 추가와 같이 실패를 알린다. (화면 이탈로 인한 요청 취소는 제외)
+      if ((e as any)?.name !== 'AbortError') {
+        Alert.alert('파일 추가 실패', String(e));
+      }
     } finally {
       if (!waitingForDuplicateConfirmation) {
         activeExternalRegistrations.delete(registrationKey);
@@ -766,7 +933,7 @@ export default function Home() {
         sort: sortParam
       });
       
-      console.log('🔍 검색 요청:', keyword, 'page:', page, 'sort:', sortParam, "deviceId:", deviceId);
+      console.log('🔍 검색 요청:', keyword, 'page:', page, 'sort:', sortParam);
 
       const response = await authenticatedFetch(
         `${BASE_URL}/files/search?${params.toString()}`,
@@ -827,7 +994,6 @@ export default function Home() {
       console.log('🚀 서버 요청 시작:', {
         url: `${BASE_URL}/files`,
         method: 'POST',
-        deviceId: resolvedDeviceId,
       });
       
       const response = await authenticatedFetch(`${BASE_URL}/files`, {
@@ -950,59 +1116,209 @@ export default function Home() {
       const res = await DocumentPicker.getDocumentAsync({
         type: ["text/plain", "application/epub+zip"],
         copyToCacheDirectory: true, // ★ 반드시 추가
+        multiple: true,             // 여러 개 선택 허용 (1개만 골라도 동일 흐름)
       });
-      
+
       console.log('📋 DocumentPicker 결과:', { canceled: res.canceled, assets: res.assets?.length });
-      
+
+      // 취소하면 아무 상태도 건드리지 않는다.
       if (res.canceled) {
         console.log('❌ 파일 선택 취소됨');
         return;
       }
 
-      const file = res.assets[0];
-      console.log('✅ 파일 선택됨:', { name: file.name, uri: file.uri });
+      const picked = Array.isArray(res.assets) ? res.assets.filter(Boolean) : [];
+      if (picked.length === 0) {
+        console.log('❌ 선택된 파일 없음');
+        return;
+      }
+
+      // 지원하지 않는 형식은 제외하되, 나머지 등록은 그대로 진행한다.
+      const supported = picked.filter((item: any) => isSupportedFileName(item?.name ?? ""));
+      const unsupported = picked
+        .filter((item: any) => !isSupportedFileName(item?.name ?? ""))
+        .map((item: any) => String(item?.name ?? ""));
+
+      if (supported.length === 0) {
+        Alert.alert(
+          '지원하지 않는 파일',
+          `EPUB 또는 TXT 파일만 등록할 수 있습니다.\n\n${unsupported.join('\n')}`,
+        );
+        return;
+      }
+
+      console.log('✅ 파일 선택됨:', supported.map((item: any) => item.name));
+
+      // 읽던 중이던 Reader가 있다면 최신 위치를 먼저 확정 저장한 뒤 등록을 시작한다.
+      await flushActiveReaderSession('background');
 
       const operationId = beginFileRegistrationOperation();
-      setIsUploading(true);
-      try {
-        // 🔵 서버 API로 중복 체크
-        console.log('🔎 중복 체크 중:', file.name);
-        const checkRes = await authenticatedFetch(
-          `${BASE_URL}/files/check?title=${encodeURIComponent(file.name)}&path=${currentFolder}`,
-          { signal: fileRegistrationAbortRef.current?.signal },
-          deviceId ?? undefined
-        );
-        const { exists } = await checkRes.json();
-        if (!isCurrentFileRegistration(operationId)) return;
-        
-        console.log('✓ 중복 체크 완료:', { exists, fileName: file.name });
-        
-        if (exists) {
-          // 중복 파일일 경우 모달 표시 (로딩 끄고)
-          console.log('⚠️ 중복 파일 발견, 모달 표시');
-          setIsUploading(false);
-          setDuplicateFileName(file.name);
-          setPendingFile(file);
-          setPendingFileAction({ openAfterSave: false, operationId });
-          setDuplicateModalVisible(true);
-          return;
-        }
-
-        // 중복이 아니면 바로 추가
-        console.log('➕ 새 파일 추가 시작');
-        await addFileToSystem(file, undefined, operationId);
-        console.log('✅ 파일 추가 완료');
-      } catch (e) {
-        if (!isCurrentFileRegistration(operationId)) return;
-        console.error('❌ 파일 추가 중 오류:', e);
-        Alert.alert('파일 추가 실패', String(e));
-      } finally {
-        if (isCurrentFileRegistration(operationId)) setIsUploading(false);
-      }
+      await registerPickedFiles(supported, unsupported, operationId);
     } catch (e) {
       console.error('❌ pickFile 오류:', e);
       Alert.alert('오류', String(e));
     }
+  };
+
+  // 1단계: 선택한 파일들을 앱 저장소로 먼저 복사하고 중복 여부를 확인한다.
+  // 파일 선택기가 넘겨주는 캐시 복사본은 수십 초 안에 시스템이 지울 수 있으므로,
+  // 중복 확인 팝업을 띄우기 전에 우리 저장소로 옮겨 둬야 안전하다.
+  const registerPickedFiles = async (
+    files: any[],
+    unsupported: string[],
+    operationId: number,
+  ) => {
+    setUploadProgress(files.length > 1 ? { done: 0, total: files.length } : null);
+    setIsUploading(true);
+
+    const prepared: PreparedPick[] = [];
+    const failed: string[] = [];
+
+    try {
+      for (let index = 0; index < files.length; index += 1) {
+        if (!isCurrentFileRegistration(operationId)) {
+          await discardPreparedPicks(prepared);
+          return;
+        }
+
+        const file = files[index];
+        if (files.length > 1) setUploadProgress({ done: index, total: files.length });
+
+        // 파일 단위로 독립 처리한다. 하나가 실패해도 나머지는 계속 진행한다.
+        let managedPath = "";
+        try {
+          managedPath = await createManagedFileUri(file.name);
+          await FileSystem.copyAsync({ from: file.uri, to: managedPath });
+
+          console.log('🔎 중복 체크 중:', file.name);
+          const checkRes = await authenticatedFetch(
+            `${BASE_URL}/files/check?title=${encodeURIComponent(file.name)}&path=${currentFolder}`,
+            { signal: fileRegistrationAbortRef.current?.signal },
+            deviceId ?? undefined
+          );
+          const checkJson = await checkRes.json();
+          prepared.push({ file, managedPath, exists: Boolean(checkJson?.exists) });
+        } catch (e) {
+          if (managedPath) {
+            await FileSystem.deleteAsync(managedPath, { idempotent: true }).catch(() => {});
+          }
+          if (!isCurrentFileRegistration(operationId)) {
+            await discardPreparedPicks(prepared);
+            return;
+          }
+          console.error('❌ 파일 준비 실패:', file.name, e);
+          if (files.length === 1) Alert.alert('파일 추가 실패', String(e));
+          failed.push(file.name);
+        }
+      }
+    } finally {
+      // 중복을 물어보는 동안에는 기존 단일 등록과 동일하게 오버레이를 내린다.
+      if (isCurrentFileRegistration(operationId) && prepared.some((item) => item.exists)) {
+        setIsUploading(false);
+        setUploadProgress(null);
+      }
+    }
+
+    if (!isCurrentFileRegistration(operationId)) {
+      await discardPreparedPicks(prepared);
+      return;
+    }
+
+    const newFiles = prepared.filter((item) => !item.exists);
+    const duplicates = prepared.filter((item) => item.exists);
+
+    if (duplicates.length > 0) {
+      setDuplicateFileName(duplicates[0].file.name);
+      setPendingDuplicateFiles(duplicates);
+      pendingPreparedPicksRef.current = [...newFiles, ...duplicates];
+      setPendingFile(null);
+      setPendingFileAction({ openAfterSave: false, operationId });
+      setPendingBatchSummary({ newFiles, failed, unsupported, total: files.length });
+      setDuplicateModalVisible(true);
+      return;
+    }
+
+    const result = await registerFilesSequentially(newFiles, operationId);
+    if (!isCurrentFileRegistration(operationId)) return;
+    reportRegistrationSummary({
+      added: result.added,
+      failed: [...failed, ...result.failed],
+      skipped: [],
+      unsupported,
+      total: files.length,
+    });
+  };
+
+  // 등록하지 않기로 한 복사본은 앱 저장소에 남기지 않는다.
+  const discardPreparedPicks = async (items: PreparedPick[]) => {
+    for (const item of items) {
+      await FileSystem.deleteAsync(item.managedPath, { idempotent: true }).catch(() => {});
+    }
+  };
+  discardPreparedPicksRef.current = discardPreparedPicks;
+
+  // 2단계: 실제 등록(미리보기 추출 + 서버 저장)은 한 개씩 순차로 한다.
+  // 대용량 EPUB 파싱(JSZip)이 겹치면 메모리가 급증하므로 병렬로 돌리지 않는다.
+  const registerFilesSequentially = async (items: PreparedPick[], operationId: number) => {
+    const added: string[] = [];
+    const failed: string[] = [];
+    if (items.length === 0) return { added, failed };
+
+    const isBatch = items.length > 1;
+    batchRegistrationRef.current = isBatch;
+    setUploadProgress(isBatch ? { done: 0, total: items.length } : null);
+    setIsUploading(true);
+
+    try {
+      for (let index = 0; index < items.length; index += 1) {
+        if (!isCurrentFileRegistration(operationId)) return { added, failed };
+        if (isBatch) setUploadProgress({ done: index, total: items.length });
+
+        const item = items[index];
+        const saved = await addFileToSystem(
+          item.file,
+          undefined,
+          operationId,
+          item.managedPath,
+        );
+        if (!isCurrentFileRegistration(operationId)) return { added, failed };
+        if (saved) added.push(item.file.name);
+        else failed.push(item.file.name);
+      }
+      if (isBatch) setUploadProgress({ done: items.length, total: items.length });
+    } finally {
+      // 등록 도중 사용자가 다시 "+"를 눌러 새 작업이 시작됐다면
+      // 이 작업의 뒷정리가 새 작업의 상태를 덮어쓰지 않게 한다.
+      if (isCurrentFileRegistration(operationId)) {
+        batchRegistrationRef.current = false;
+        setIsUploading(false);
+        setUploadProgress(null);
+      }
+    }
+
+    return { added, failed };
+  };
+
+  // 등록 결과 안내. 파일 하나만 문제없이 등록한 경우에는 기존처럼 조용히 끝낸다.
+  const reportRegistrationSummary = (result: {
+    added: string[];
+    failed: string[];
+    skipped: string[];
+    unsupported: string[];
+    total: number;
+  }) => {
+    const { added, failed, skipped, unsupported, total } = result;
+    // 지원 파일을 하나만 고른 경우는 기존 단일 등록 흐름 그대로(개별 알림/모달)로 끝낸다.
+    if (total <= 1 && unsupported.length === 0) return;
+
+    const lines = [`${added.length}개 등록`];
+    if (skipped.length > 0) lines.push(`중복 ${skipped.length}개 제외`);
+    if (failed.length > 0) lines.push(`실패 ${failed.length}개: ${failed.join(', ')}`);
+    if (unsupported.length > 0) {
+      lines.push(`지원하지 않는 형식 ${unsupported.length}개: ${unsupported.join(', ')}`);
+    }
+
+    Alert.alert('파일 등록 결과', lines.join('\n'));
   };
 
   // 실제 파일 추가 로직을 별도 함수로 분리 (isUploading은 호출자가 관리)
@@ -1010,10 +1326,12 @@ export default function Home() {
     file: any,
     targetFolder?: string,
     operationId = fileRegistrationOperationIdRef.current,
+    preparedPath?: string,
   ) => {
     console.log('📝 addFileToSystem 호출:', { fileName: file.name, uri: file.uri, targetFolder, currentFolder });
     if (!isCurrentFileRegistration(operationId)) return null;
-    setIsUploading(true);
+    // 여러 개 등록 중에는 호출자(루프)가 오버레이를 관리한다.
+    if (!batchRegistrationRef.current) setIsUploading(true);
     let managedPath = "";
     let savedToServer = false;
     
@@ -1022,14 +1340,20 @@ export default function Home() {
       const displayName = file.name;
       const title = displayName;
 
-      managedPath = await createManagedFileUri(displayName);
-      console.log('📂 파일 복사 시작:', { displayName, title, targetPath: managedPath });
+      // 이미 앱 저장소로 복사해 둔 파일이면 다시 복사하지 않는다.
+      if (preparedPath) {
+        managedPath = preparedPath;
+        console.log('📂 복사된 파일 사용:', { displayName, title, targetPath: managedPath });
+      } else {
+        managedPath = await createManagedFileUri(displayName);
+        console.log('📂 파일 복사 시작:', { displayName, title, targetPath: managedPath });
 
-      // 앱 전용 영구 폴더로 복사한 URI를 서버에도 저장한다.
-      await FileSystem.copyAsync({
-        from: file.uri,
-        to: managedPath,
-      });
+        // 앱 전용 영구 폴더로 복사한 URI를 서버에도 저장한다.
+        await FileSystem.copyAsync({
+          from: file.uri,
+          to: managedPath,
+        });
+      }
       if (!isCurrentFileRegistration(operationId)) {
         await FileSystem.deleteAsync(managedPath, { idempotent: true });
         return null;
@@ -1099,6 +1423,10 @@ export default function Home() {
           return null;
         }
         console.error('❌ 서버 저장 실패:', saved);
+        // 여러 개 등록은 마지막 요약에서 알린다. 하나만 등록할 때 알리지 않으면 아무 반응 없이 끝난 것처럼 보인다.
+        if (!batchRegistrationRef.current) {
+          Alert.alert('파일 추가 실패', '서버에 파일을 저장하지 못했습니다.\n네트워크 연결을 확인한 뒤 다시 시도해 주세요.');
+        }
         return null;
       }
       savedToServer = true;
@@ -1106,18 +1434,11 @@ export default function Home() {
       
       console.log('✅ 서버 저장 완료:', saved.id);
 
-      // 2) Optimistic update: 캐시에 즉시 추가 → 기존 파일 유지하면서 새 파일 표시
-      if (saved) {
-        queryClient.setQueryData(filesQueryKey, (old: any) => ({
-          content: [
-            saved,
-            ...(old?.content ?? []).filter((item: any) => String(item.id) !== String(saved.id)),
-          ],
-          hasMore: old?.hasMore ?? false,
-        }));
-        // 백그라운드에서 서버와 동기화
-        refetchFiles();
-      }
+      // 2) 등록된 폴더의 목록 캐시에 바로 넣고 서버 기준으로 다시 확인한다.
+      // 외부 앱에서 연 파일은 보고 있는 폴더와 관계없이 root에 등록되므로 현재 폴더 캐시에 넣으면 안 된다.
+      const registeredFile = { ...saved, path: String(saved.path ?? folderPath) };
+      addFileToLists(registeredFile);
+      invalidateFileLists(registeredFile.path);
 
       return saved;
     } catch (e) {
@@ -1126,10 +1447,13 @@ export default function Home() {
       }
       if (!isCurrentFileRegistration(operationId)) return null;
       console.error('❌ addFileToSystem 오류:', e);
-      Alert.alert('파일 추가 실패', String(e));
+      // 여러 개 등록 중에는 파일마다 알림을 띄우지 않고 마지막 요약에서 한 번에 알린다.
+      if (!batchRegistrationRef.current) Alert.alert('파일 추가 실패', String(e));
       return null;
     } finally {
-      if (isCurrentFileRegistration(operationId)) setIsUploading(false);
+      if (!batchRegistrationRef.current && isCurrentFileRegistration(operationId)) {
+        setIsUploading(false);
+      }
     }
   };
 
@@ -1212,14 +1536,29 @@ export default function Home() {
   // -----------------------------
   // 파일 카드 클릭 기능
   // -----------------------------
+  // Reader로 이동을 시작한 뒤 화면이 바뀌는 동안 들어온 연속 탭이 Reader를 한 번 더 열지 않게 한다.
+  // Home으로 돌아오면 바로 풀리고, 이동이 이루어지지 않은 경우에도 잠시 뒤 풀린다.
+  const readerOpeningRef = useRef(false);
+  const markReaderOpening = () => {
+    readerOpeningRef.current = true;
+    setTimeout(() => {
+      readerOpeningRef.current = false;
+    }, 1000);
+  };
+  useFocusEffect(
+    useCallback(() => {
+      readerOpeningRef.current = false;
+    }, []),
+  );
+
   const handleFilePress = async (file : any) => {
+    if (readerOpeningRef.current) return;
     const previewRequestId = filePreviewRequestIdRef.current + 1;
     filePreviewRequestIdRef.current = previewRequestId;
 
-    // 1) 서버에서 진행도 가져오기
-    const res = await authenticatedFetch(`${BASE_URL}/files/${file.id}`, {}, deviceId ?? undefined);
-    const info = await res.json();
-    if (filePreviewRequestIdRef.current !== previewRequestId) return;
+    // 목록 응답(FileDto)에 서버의 진행도·미리보기가 이미 들어 있다. 파일을 누를 때마다 서버를 다시
+    // 조회하면 네트워크가 느릴 때 누른 뒤 아무 반응이 없고, 끊겼을 때는 오류로 아예 열리지 않는다.
+    const info = file;
     const isTxtFile = String(file.type || "").toUpperCase() === "TXT"
       || String(file.title || "").toLowerCase().endsWith(".txt");
     let localTxtPosition: {
@@ -1267,9 +1606,11 @@ export default function Home() {
 
     // progress 없으면 바로 Reader로 이동
     if (effectiveProgress <= 0) {
+      markReaderOpening();
       router.push({
         pathname: "/reader",
-        params: { fileId: file.id, uri: file.uri, name: file.title, type: file.type }
+        // 읽기를 끝냈을 때 파일을 연 위치로 돌아가도록 현재 폴더를 함께 넘긴다.
+        params: { fileId: file.id, uri: file.uri, name: file.title, type: file.type, folder: currentFolder }
       });
       return;
     }
@@ -1409,16 +1750,19 @@ export default function Home() {
                     // 폴더 삭제 완료 후 파일 삭제
                     if (selectedItems.files.length > 0) {
                       console.log(`🗑️ 파일 ${selectedItems.files.length}개 삭제:`, selectedItems.files);
-                      await authenticatedFetch(`${BASE_URL}/files`, {
+                      const deletedFiles = files.filter((file: any) => selectedItems.files.includes(file?.id));
+                      const fileRes = await authenticatedFetch(`${BASE_URL}/files`, {
                         method: "DELETE",
                         headers: {
                           "Content-Type": "application/json",
                         },
                         body: JSON.stringify({ ids: selectedItems.files })
                       }, deviceId ?? undefined);
+                      if (fileRes.ok) cleanUpDeletedFilesLocally(deletedFiles);
                     }
 
                     console.log("✅ 일괄 삭제 완료");
+                    removeDeletedItemsFromLists(selectedItems.files, selectedItems.folders);
                     setIsSelectMode(false);
                     setSelectedItems({ files: [], folders: [] });
                     refetchFiles();
@@ -1443,16 +1787,19 @@ export default function Home() {
       // 2. 파일 삭제 (폴더 밖의 개별 파일들만)
       if (selectedItems.files.length > 0) {
         console.log(`🗑️ 파일 ${selectedItems.files.length}개 일괄 삭제:`, selectedItems.files);
-        await authenticatedFetch(`${BASE_URL}/files`, {
+        const deletedFiles = files.filter((file: any) => selectedItems.files.includes(file?.id));
+        const fileRes = await authenticatedFetch(`${BASE_URL}/files`, {
           method: "DELETE",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ ids: selectedItems.files })
         }, deviceId ?? undefined);
+        if (fileRes.ok) cleanUpDeletedFilesLocally(deletedFiles);
       }
 
       console.log("✅ 일괄 삭제 완료");
+      removeDeletedItemsFromLists(selectedItems.files, selectedItems.folders);
       setIsSelectMode(false);
       setSelectedItems({ files: [], folders: [] });
       refetchFiles();
@@ -1465,44 +1812,103 @@ export default function Home() {
 
   // 선택 모드에서 이동 버튼 핸들러 (파일 + 폴더 이동)
   const handleBulkMove = async (folder: any) => {
+    // 이동 버튼을 연타해도 같은 작업이 두 번 실행되지 않게 한다.
+    if (bulkMoveInProgressRef.current) return;
+    const fileIds = [...selectedItems.files];
+    const folderIds = [...selectedItems.folders];
+    const total = fileIds.length + folderIds.length;
+    if (total === 0) return;
+
+    bulkMoveInProgressRef.current = true;
+    const targetPath = String(folder.id);
+    const sourcePaths = [currentFolder];
+    const failedNames: string[] = [];
+    let processed = 0;
+    // 위치 선택 모달은 바로 닫고 진행 상황을 오버레이로 보여 준다.
+    setBulkMoveModalVisible(false);
+    setBulkMoveProgress({ done: 0, total });
+    // 금방 끝나는 작업에서 오버레이가 깜빡이지 않도록 잠깐 뒤에만 표시한다.
+    const overlayTimer = setTimeout(() => setBulkMoveOverlayVisible(true), 250);
+
     try {
       // 파일 이동
-      for (const id of selectedItems.files) {
+      for (const id of fileIds) {
         console.log(`🚀 파일 ${id} 이동 요청:`, folder.id);
-        const response = await authenticatedFetch(`${BASE_URL}/files/${id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: String(folder.id) })
-        }, deviceId ?? undefined);
+        const original = files.find((item: any) => String(item?.id) === String(id));
+        try {
+          const response = await authenticatedFetch(`${BASE_URL}/files/${id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: String(folder.id) })
+          }, deviceId ?? undefined);
 
-        if (!response.ok) {
-          console.error(`❌ 파일 ${id} 이동 실패:`, response.status);
+          if (!response.ok) {
+            console.error(`❌ 파일 ${id} 이동 실패:`, response.status);
+            failedNames.push(String(original?.title ?? `파일 ${id}`));
+          } else {
+            // 성공한 파일만 원래 폴더 목록에서 빼고 새 폴더 목록에 넣는다.
+            const updated = await response.json().catch(() => null);
+            const fromPath = String(original?.path ?? currentFolder);
+            sourcePaths.push(fromPath);
+            removeFilesFromLists(fromPath, [id]);
+            addFileToLists({ ...(original ?? { id }), ...(updated ?? {}), path: targetPath });
+          }
+        } catch (fileError) {
+          console.error(`❌ 파일 ${id} 이동 실패:`, fileError);
+          failedNames.push(String(original?.title ?? `파일 ${id}`));
         }
+        setBulkMoveProgress({ done: ++processed, total });
       }
 
       // 폴더 이동
-      for (const id of selectedItems.folders) {
+      for (const id of folderIds) {
         console.log(`📁 폴더 ${id} 이동 요청:`, folder.id);
-        const response = await authenticatedFetch(`${BASE_URL}/folders/${id}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: String(folder.id) })
-        }, deviceId ?? undefined);
+        const original = folders.find((item: any) => String(item?.id) === String(id));
+        try {
+          const response = await authenticatedFetch(`${BASE_URL}/folders/${id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: String(folder.id) })
+          }, deviceId ?? undefined);
 
-        if (!response.ok) {
-          console.error(`❌ 폴더 ${id} 이동 실패:`, response.status);
+          if (!response.ok) {
+            console.error(`❌ 폴더 ${id} 이동 실패:`, response.status);
+            failedNames.push(String(original?.name ?? `폴더 ${id}`));
+          } else {
+            moveFolderInLists({ ...(original ?? { id }), path: targetPath }, String(original?.path ?? currentFolder));
+          }
+        } catch (folderError) {
+          console.error(`❌ 폴더 ${id} 이동 실패:`, folderError);
+          failedNames.push(String(original?.name ?? `폴더 ${id}`));
         }
+        setBulkMoveProgress({ done: ++processed, total });
       }
 
-      console.log("✅ 일괄 이동 완료");
-      setBulkMoveModalVisible(false);
+      console.log(`✅ 일괄 이동 완료 (성공 ${total - failedNames.length} / ${total})`);
       setIsSelectMode(false);
       setSelectedItems({ files: [], folders: [] });
-      refetchFiles();
+      // 실패한 항목까지 포함해 원래 폴더와 새 폴더를 서버 기준으로 재검증한다.
+      invalidateFileLists(...sourcePaths, targetPath);
       refetchFolders();
+
+      // 실패가 있으면 전체 성공처럼 보이지 않도록 결과를 그대로 알린다.
+      if (failedNames.length > 0) {
+        const moved = total - failedNames.length;
+        const preview = failedNames.slice(0, 5).join("\n");
+        const rest = failedNames.length > 5 ? `\n외 ${failedNames.length - 5}개` : "";
+        Alert.alert(
+          moved > 0 ? "일부만 이동했습니다" : "이동하지 못했습니다",
+          `${moved}개 이동 완료, ${failedNames.length}개 실패\n\n${preview}${rest}`,
+        );
+      }
     } catch (error) {
       console.error("❌ 일괄 이동 실패:", error);
       Alert.alert("이동 실패", "파일/폴더 이동에 실패했습니다.");
+    } finally {
+      clearTimeout(overlayTimer);
+      setBulkMoveOverlayVisible(false);
+      setBulkMoveProgress(null);
+      bulkMoveInProgressRef.current = false;
     }
   };
 
@@ -1530,11 +1936,8 @@ export default function Home() {
 
       const saved = await res.json();
 
-      // 3. 캐시 즉시 업데이트
-      queryClient.setQueryData(filesQueryKey, (old: any) => ({
-        content: (old?.content ?? []).map((f: any) => (f.id === saved.id ? saved : f)),
-        hasMore: old?.hasMore ?? false,
-      }));
+      // 3. 캐시 즉시 업데이트 (같은 폴더의 다른 정렬 캐시와 2페이지 이후 목록 포함)
+      replaceFileInLists(saved);
     } catch (err) {
       console.log(err);
       Alert.alert("오류", "파일 정보를 업데이트하는데 실패했습니다.");
@@ -1553,8 +1956,18 @@ export default function Home() {
     !search &&
     filteredFiles.length === 0 &&
     visibleFolders.length === 0;
+  // 목록 조회가 실패했는데 보여 줄 캐시도 없으면 "파일이 없습니다" 대신 실패를 알리고 다시 시도할 수 있게 한다.
+  // (목록이 비어 있으면 당겨서 새로고침할 FlatList도 없다.)
+  const showListLoadError =
+    !showInitialLoading &&
+    !isSearching &&
+    !search &&
+    (isFilesError || isFoldersError) &&
+    files.length === 0 &&
+    visibleFolders.length === 0;
   const isInitial =
     !showInitialLoading &&
+    !showListLoadError &&
     files.length === 0 &&
     visibleFolders.length === 0 &&
     !search;
@@ -1564,7 +1977,7 @@ export default function Home() {
     search &&
     !isInitialLoading;
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={["top"]}>
        {/* 🔹 상단 전체 묶음 */}
     <View style={styles.topArea}>
       <Text style={styles.homeTitle}>
@@ -1705,6 +2118,24 @@ export default function Home() {
           </Text>
         </View>
     )}
+
+    {/* 목록 조회 실패 */}
+      {showListLoadError && (
+        <View style={styles.centerBox}>
+          <Text style={{ color: "#666", textAlign: "center" }}>
+            목록을 불러오지 못했어요.{"\n"}네트워크 연결을 확인해 주세요.
+          </Text>
+          <TouchableOpacity
+            onPress={onRefresh}
+            disabled={refreshing}
+            style={{ marginTop: 12, paddingHorizontal: 16, paddingVertical: 8 }}
+          >
+            <Text style={{ color: "#4A90E2", fontWeight: "600" }}>
+              {refreshing ? "불러오는 중..." : "다시 시도"}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
     {/* 검색 결과 없음 */}
     {noSearchResult && (
@@ -1850,6 +2281,7 @@ export default function Home() {
       file={selectedFile}
       previewText={previewText}
       lastProgress={lastProgress}
+      folder={currentFolder}
       onClose={() => {
         filePreviewRequestIdRef.current += 1;
         setPreviewModalVisible(false);
@@ -1985,12 +2417,36 @@ export default function Home() {
     <DuplicateConfirmModal
       visible={duplicateModalVisible}
       fileName={duplicateFileName}
+      fileNames={pendingDuplicateFiles.map((item) => String(item.file?.name ?? ""))}
       onConfirm={async () => {
         const file = pendingFile;
         const action = pendingFileAction;
+        const duplicateFiles = pendingDuplicateFiles;
+        const batchSummary = pendingBatchSummary;
         setDuplicateModalVisible(false);
         setPendingFile(null);
         setPendingFileAction(null);
+        setPendingDuplicateFiles([]);
+        setPendingBatchSummary(null);
+        pendingPreparedPicksRef.current = [];
+
+        // 파일 선택에서 모아둔 중복 파일들: 확인하면 신규 파일과 함께 순차 등록한다.
+        if (duplicateFiles.length > 0 && action) {
+          if (!isCurrentFileRegistration(action.operationId)) return;
+          const result = await registerFilesSequentially(
+            [...(batchSummary?.newFiles ?? []), ...duplicateFiles],
+            action.operationId,
+          );
+          if (!isCurrentFileRegistration(action.operationId)) return;
+          reportRegistrationSummary({
+            added: result.added,
+            failed: [...(batchSummary?.failed ?? []), ...result.failed],
+            skipped: [],
+            unsupported: batchSummary?.unsupported ?? [],
+            total: batchSummary?.total ?? duplicateFiles.length,
+          });
+          return;
+        }
 
         try {
           if (file && action && isCurrentFileRegistration(action.operationId)) {
@@ -2032,9 +2488,35 @@ export default function Home() {
             pendingExternalRegistrationRef.current = null;
           }
         }
+        const duplicateFiles = pendingDuplicateFiles;
+        const batchSummary = pendingBatchSummary;
+        const pendingAction = pendingFileAction;
         setDuplicateModalVisible(false);
         setPendingFile(null);
         setPendingFileAction(null);
+        setPendingDuplicateFiles([]);
+        setPendingBatchSummary(null);
+        pendingPreparedPicksRef.current = [];
+
+        // 중복만 건너뛰고 나머지 신규 파일은 그대로 등록한다.
+        if (duplicateFiles.length > 0 && pendingAction) {
+          void (async () => {
+            // 추가하지 않기로 한 중복 파일의 복사본은 지운다.
+            await discardPreparedPicks(duplicateFiles);
+            const result = await registerFilesSequentially(
+              batchSummary?.newFiles ?? [],
+              pendingAction.operationId,
+            );
+            if (!isCurrentFileRegistration(pendingAction.operationId)) return;
+            reportRegistrationSummary({
+              added: result.added,
+              failed: [...(batchSummary?.failed ?? []), ...result.failed],
+              skipped: duplicateFiles.map((item) => String(item.file?.name ?? "")),
+              unsupported: batchSummary?.unsupported ?? [],
+              total: batchSummary?.total ?? duplicateFiles.length,
+            });
+          })();
+        }
       }}
     />
 
@@ -2061,11 +2543,9 @@ export default function Home() {
             return;
           }
 
-          // 캐시에서 즉시 제거
-          queryClient.setQueryData(filesQueryKey, (old: any) => ({
-            content: (old?.content ?? []).filter((f: any) => f.id !== selectedFile!.id),
-            hasMore: old?.hasMore ?? false,
-          }));
+          // 캐시에서 즉시 제거 (같은 폴더의 다른 정렬 캐시와 2페이지 이후 목록 포함)
+          removeFilesFromLists(String(selectedFile.path ?? currentFolder), [selectedFile.id]);
+          cleanUpDeletedFilesLocally([selectedFile]);
         } catch (error) {
           console.log("파일 삭제 실패:", error);
           Alert.alert("삭제 실패", "파일 삭제에 실패했습니다.");
@@ -2123,8 +2603,12 @@ export default function Home() {
           const updatedFile = await response.json();
           console.log("✅ 파일 이동 완료:", updatedFile);
 
-          // 현재 폴더 목록 새로고침 (파일이 사라지도록)
-          refetchFiles();
+          // 원래 폴더 목록에서 빼고 새 폴더 목록에 넣은 뒤, 두 폴더 모두 서버 기준으로 재검증한다.
+          const fromPath = String(selectedFile.path ?? currentFolder);
+          const movedFile = { ...selectedFile, ...updatedFile, path: String(folder.id) };
+          removeFilesFromLists(fromPath, [selectedFile.id]);
+          addFileToLists(movedFile);
+          invalidateFileLists(fromPath, movedFile.path);
         } catch (error) {
           console.log("❌ 파일 이동 실패:", error);
           Alert.alert("이동 실패", "파일 이동에 실패했습니다.");
@@ -2152,9 +2636,11 @@ export default function Home() {
 
         const ok = await moveFolderToServer(selectedFolder.id, String(folder.id));
         if (ok) {
-          await refetchFolders();
-          await refetchAllFolders();
-          await refetchFiles();
+          // 원래 위치와 새 위치의 폴더 목록, 전체 폴더 목록을 함께 맞춘다.
+          moveFolderInLists(
+            { ...selectedFolder, path: String(folder.id) },
+            String(selectedFolder.path ?? currentFolder),
+          );
           setFolderMoveModalVisible(false);
         } else {
           Alert.alert("이동 실패", "폴더 이동에 실패했습니다.");
@@ -2178,6 +2664,33 @@ export default function Home() {
       onMove={handleBulkMove}
       onClose={() => setBulkMoveModalVisible(false)}
     />
+
+    {/* 여러 파일/폴더 이동 중 진행 오버레이 */}
+    <Modal visible={bulkMoveOverlayVisible} transparent animationType="fade">
+      <View style={{
+        flex: 1,
+        backgroundColor: "rgba(0,0,0,0.5)",
+        justifyContent: "center",
+        alignItems: "center",
+      }}>
+        <View style={{
+          backgroundColor: "#fff",
+          borderRadius: 16,
+          padding: 32,
+          alignItems: "center",
+          gap: 16,
+          minWidth: 200,
+        }}>
+          <ActivityIndicator size="large" color="#4A90E2" />
+          <Text style={{ fontSize: 16, fontWeight: "600", color: "#333" }}>
+            {bulkMoveProgress && bulkMoveProgress.total > 1
+              ? `파일 이동 중... (${Math.min(bulkMoveProgress.done + 1, bulkMoveProgress.total)} / ${bulkMoveProgress.total})`
+              : "파일 이동 중..."}
+          </Text>
+          <Text style={{ fontSize: 13, color: "#888", textAlign: "center" }}>잠시만 기다려 주세요</Text>
+        </View>
+      </View>
+    </Modal>
 
     {/* 파일 삭제 중 로딩 오버레이 */}
     <Modal visible={isDeleting} transparent animationType="fade">
@@ -2219,7 +2732,11 @@ export default function Home() {
           minWidth: 200,
         }}>
           <ActivityIndicator size="large" color="#4A90E2" />
-          <Text style={{ fontSize: 16, fontWeight: "600", color: "#333" }}>파일 등록 중...</Text>
+          <Text style={{ fontSize: 16, fontWeight: "600", color: "#333" }}>
+            {uploadProgress
+              ? `파일 등록 중... (${Math.min(uploadProgress.done + 1, uploadProgress.total)} / ${uploadProgress.total})`
+              : "파일 등록 중..."}
+          </Text>
           <Text style={{ fontSize: 13, color: "#888", textAlign: "center" }}>잠시만 기다려 주세요</Text>
         </View>
       </View>

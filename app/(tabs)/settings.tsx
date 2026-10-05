@@ -4,14 +4,18 @@ import { useCallback, useState } from "react";
 import {
   Alert,
   Dimensions,
-  SafeAreaView,
+  Image,
+  Linking,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import LoginModal from "../../components/LoginModal";
+import { ICONS } from "../../constants/icons";
 import { useUser } from "../../contexts/UserContext";
 import { authenticatedFetch, BASE_URL } from "../../utils/api";
 
@@ -22,6 +26,8 @@ type FileStats = {
 };
 
 const SCREEN_HEIGHT = Dimensions.get("window").height;
+
+const PLAY_SUBSCRIPTIONS_URL = "https://play.google.com/store/account/subscriptions";
 
 export default function SettingsScreen() {
   // 전역 상태 사용
@@ -73,6 +79,30 @@ export default function SettingsScreen() {
   };
 
   const handleWithdraw = () => {
+    // Google Play 정기 결제는 앱 계정을 지워도 해지되지 않고 계속 청구되므로 탈퇴 전에 알린다.
+    if (isPremium && Platform.OS === "android") {
+      Alert.alert(
+        "구독 해지 안내",
+        "탈퇴해도 Google Play 정기 결제는 자동으로 해지되지 않아요.\n결제를 멈추려면 Play 스토어에서 구독을 해지해 주세요.",
+        [
+          { text: "취소", style: "cancel" },
+          {
+            text: "구독 관리",
+            onPress: () => {
+              Linking.openURL(PLAY_SUBSCRIPTIONS_URL).catch((e) =>
+                console.error("구독 관리 페이지 열기 실패:", e)
+              );
+            },
+          },
+          { text: "계속 탈퇴", style: "destructive", onPress: confirmWithdraw },
+        ]
+      );
+      return;
+    }
+    confirmWithdraw();
+  };
+
+  const confirmWithdraw = () => {
     // 1단계: 탈퇴 의사 확인
     Alert.alert(
       "회원 탈퇴",
@@ -105,7 +135,7 @@ export default function SettingsScreen() {
   // 실제 탈퇴 처리 함수
   const withdrawAccount = async () => {
     try {
-      const res = await authenticatedFetch(`${BASE_URL}/auth/user/me`, {
+      const res = await authenticatedFetch(`${BASE_URL}/auth/users/me`, {
         method: "DELETE",
       }, deviceId ?? undefined);
 
@@ -123,7 +153,7 @@ export default function SettingsScreen() {
     }
   };
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={["top"]}>
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.content}
@@ -169,7 +199,11 @@ export default function SettingsScreen() {
         activeOpacity={0.8}
       >
         <View style={styles.bannerLeft}>
-          <Text style={styles.bannerEmoji}>{isPremium ? '👑' : '⭐'}</Text>
+          {isPremium ? (
+            <Text style={styles.bannerEmoji}>👑</Text>
+          ) : (
+            <Image source={ICONS.star} style={styles.bannerIcon} />
+          )}
           <View>
             <Text style={[styles.bannerTitle, isPremium && styles.bannerTitlePremium]}>
               {isPremium ? 'readMe 프리미엄' : 'readMe 무료 플랜'}
@@ -247,7 +281,7 @@ const styles = StyleSheet.create({
 
   content: {
     padding: 20,
-    paddingTop: 30,
+    paddingTop: 6,
     paddingBottom: 40,
   },
 
@@ -377,6 +411,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   bannerEmoji: { fontSize: 28 },
+  bannerIcon: { width: 34, height: 34 },
   bannerTitle: { fontSize: 14, fontWeight: '700', color: '#333' },
   bannerTitlePremium: { color: '#7C3AED' },
   bannerSub: { fontSize: 12, color: '#888', marginTop: 2 },

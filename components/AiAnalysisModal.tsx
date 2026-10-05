@@ -2,6 +2,7 @@ import { useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Image,
   Modal,
   ScrollView,
   Text,
@@ -9,6 +10,7 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { ICONS } from "../constants/icons";
 import { useUser } from "../contexts/UserContext";
 import { authenticatedFetch, BASE_URL } from "../utils/api";
 
@@ -77,12 +79,22 @@ export default function AiAnalysisModal({
     setLoading(true);
     setFailed(false);
     try {
-      const res = await authenticatedFetch(`${BASE_URL}/files/${fileId}/ai-info`, {}, deviceId ?? undefined);
+      // 서버가 AI 분석을 요청하며 응답하므로 일반 요청보다 오래 기다린다.
+      const res = await authenticatedFetch(
+        `${BASE_URL}/files/${fileId}/ai-info`,
+        { timeoutMs: 90000 },
+        deviceId ?? undefined,
+      );
       if (res.ok) {
         const data = await res.json();
         console.log("📊 AI 분석 결과:", data);
         if (data.analysisStatus === "PREMIUM_REQUIRED") {
           await handlePremiumRequired();
+          return;
+        }
+        // 서버는 분석 실패도 200 OK + analysisStatus: "FAILED" 로 응답한다.
+        if (data.analysisStatus === "FAILED") {
+          setFailed(true);
           return;
         }
         // keywords가 문자열로 오면 파싱, 없으면 빈 배열
@@ -191,7 +203,7 @@ export default function AiAnalysisModal({
   });
 
   return (
-    <Modal visible={visible} transparent animationType="slide">
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <View
         style={{
           flex: 1,
@@ -210,7 +222,10 @@ export default function AiAnalysisModal({
         >
           {/* 헤더 */}
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-            <Text style={{ fontSize: 18, fontWeight: "bold", color: "#1a1a1a" }}>✨ AI 분석</Text>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <Image source={ICONS.sparkle} style={{ width: 22, height: 22 }} />
+              <Text style={{ fontSize: 18, fontWeight: "bold", color: "#1a1a1a" }}>AI 분석</Text>
+            </View>
             {!editing ? (
               <TouchableOpacity onPress={onClose} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
                 <Text style={{ fontSize: 15, color: "#888" }}>닫기</Text>
@@ -238,7 +253,7 @@ export default function AiAnalysisModal({
           {/* ── 비프리미엄 ── */}
           {showPremiumLock && (
             <View style={{ alignItems: "center", paddingVertical: 32 }}>
-              <Text style={{ fontSize: 44, marginBottom: 14 }}>🔒</Text>
+              <Image source={ICONS.lock} style={{ width: 56, height: 56, marginBottom: 14 }} />
               <Text
                 style={{ fontSize: 17, fontWeight: "bold", marginBottom: 8, color: "#1a1a1a" }}
               >

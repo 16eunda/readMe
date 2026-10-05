@@ -1,5 +1,5 @@
 import { FontAwesome5, MaterialCommunityIcons } from "@expo/vector-icons";
-import { Modal, Text, TouchableOpacity, View } from "react-native";
+import { Modal, Pressable, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 
 export type SortOption = "rating-desc" | "rating-asc" | "date-desc" | "date-asc";
 
@@ -22,7 +22,7 @@ export default function SortModal({
   ];
 
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View
         style={{
           flex: 1,
@@ -31,6 +31,8 @@ export default function SortModal({
           alignItems: "center",
         }}
       >
+        {/* 팝업 바깥을 누르면 취소 */}
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
         <View
           style={{
             width: "75%",

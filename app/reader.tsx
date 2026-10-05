@@ -5,6 +5,8 @@ import { Buffer } from 'buffer';
 import * as FileSystem from "expo-file-system/legacy";
 import * as NavigationBar from "expo-navigation-bar";
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
+import { getCurrentTaskId } from "../modules/external-file-info/src";
+import { EPUBJS_SOURCE, JSZIP_SOURCE } from "../utils/epubLibraries";
 import { readExternalTextFile } from "external-file-info";
 import iconv from 'iconv-lite';
 import { Search, X } from "lucide-react-native";
@@ -175,6 +177,10 @@ const TXT_RESUME_SETTLE_MAX_ATTEMPTS = 10;
 const TXT_LOCAL_PROGRESS_KEY_PREFIX = "@reader_txt_position:";
 const READER_LOCAL_PROGRESS_KEY_PREFIX = "@reader_position:";
 const EPUB_LOCATIONS_CACHE_KEY_PREFIX = "@reader_epub_locations:";
+// Reader를 열 때 서버 파일 정보를 기다리는 상한. 기기에 저장된 이어읽기 위치가 있으면 그 값이 우선이라
+// 서버 응답이 결과를 바꾸지 않으므로 짧게, 없을 때만 서버 위치를 위해 더 기다린다.
+const LOCAL_RESUME_SERVER_WAIT_MS = 1000;
+const SERVER_RESUME_WAIT_MS = 10000;
 const ACTIVE_READER_SESSION_KEY = "@active_reader_session";
 
 interface LocalReaderPosition {
@@ -317,7 +323,7 @@ function splitTextIntoRenderChunks(text: string): TxtRenderChunk[] {
 
 export default function ReaderScreen() {
   const router = useRouter();
-  const { fileId, uri, name, type, resetProgress } = useLocalSearchParams();
+  const { fileId, uri, name, type, resetProgress, folder } = useLocalSearchParams();
   const insets = useSafeAreaInsets();
   const readerTopInset = Math.max(
     insets.top,
@@ -333,6 +339,9 @@ export default function ReaderScreen() {
       const normalizedUri = Array.isArray(uri) ? String(uri[0] ?? "") : String(uri ?? "");
       const normalizedName = Array.isArray(name) ? String(name[0] ?? "") : String(name ?? "");
       const normalizedType = Array.isArray(type) ? String(type[0] ?? "") : String(type ?? "");
+      // 파일을 연 위치(Home 또는 폴더)를 세션에 함께 저장한다. 앱이 재시작돼 Reader가 복원되면
+      // 돌아갈 화면이 없으므로, 이 값이 있어야 읽기를 끝냈을 때 원래 폴더로 돌아갈 수 있다.
+      const normalizedFolder = Array.isArray(folder) ? String(folder[0] ?? "") : String(folder ?? "");
       if (!normalizedFileId || !normalizedUri || !normalizedName) return;
 
       const serializedSession = JSON.stringify({
@@ -341,6 +350,9 @@ export default function ReaderScreen() {
         uri: normalizedUri,
         name: normalizedName,
         type: normalizedType,
+        folder: normalizedFolder,
+        // 앱을 다시 띄웠을 때 같은 태스크가 이어지는 경우(잠깐 백그라운드)에만 이 화면을 복원한다.
+        taskId: getCurrentTaskId(),
       });
       const unregisterReaderSession = registerActiveReaderSession({
         sessionId: readerSessionIdRef.current,
@@ -359,7 +371,7 @@ export default function ReaderScreen() {
           })
           .catch(() => {});
       };
-    }, [fileId, name, type, uri]),
+    }, [fileId, folder, name, type, uri]),
   );
 
   const [isEpub, setIsEpub] = useState(false);
@@ -458,10 +470,13 @@ export default function ReaderScreen() {
 
   // epub 전용 base64 데이터
   const [epubBase64, setEpubBase64] = useState("");
+  // location 간격 정책은 "파일 크기" 기준을 유지한다. (로딩 방식과 분리)
+  const [epubFileSize, setEpubFileSize] = useState(0);
   const [epubLoadKey, setEpubLoadKey] = useState("");
   const epubLoadRetryRef = useRef(0);
   const webViewRef = useRef<WebView>(null);
   const epubOpenStartedAtRef = useRef(0);
+  const txtOpenStartedAtRef = useRef(0);
   const epubTouchStartRef = useRef({
     x: 0,
     y: 0,
@@ -758,6 +773,7 @@ export default function ReaderScreen() {
     
     setIsEpub(isEpubFile);
     setEpubBase64("");
+    setEpubFileSize(0);
     setEpubLoadKey("");
     epubLoadRetryRef.current = 0;
     setEpubReady(false);
@@ -866,14 +882,19 @@ export default function ReaderScreen() {
               `⏱️ EPUB [${Date.now() - epubOpenStartedAtRef.current}ms] 파일 정보 조회 완료`,
               `${(fileSize / 1024 / 1024).toFixed(1)}MB`,
             );
-            if (fileSize >= 5 * 1024 * 1024) {
-              console.log("✅ 대용량 EPUB 파일 URI 직접 로드:", (fileSize / 1024 / 1024).toFixed(1), "MB");
+            // 파일 URI로 바로 여는 경로가 압도적으로 빠르다.
+            // base64로 읽으면 파일 전체가 문자열이 되어 WebView HTML에 박히고,
+            // RN 브리지 전달 + 거대 HTML 파싱 비용이 파일 크기에 비례해 붙는다.
+            if (decoded.startsWith("file://")) {
+              console.log("✅ EPUB 파일 URI 직접 로드:", (fileSize / 1024 / 1024).toFixed(1), "MB");
               if (!active) return;
+              setEpubFileSize(fileSize);
               setEpubBase64("__FILE_URI__");
               setEpubLoadKey(`${String(fileId || '')}-${Date.now()}-${Math.random()}`);
               return;
             }
 
+            // file:// 이 아닌 예외적인 경로만 기존 base64 방식으로 처리한다.
             const b64 = await readWithFallback(decoded, {
               encoding: FileSystem.EncodingType.Base64,
             });
@@ -885,6 +906,7 @@ export default function ReaderScreen() {
               return;
             }
             if (!active) return;
+            setEpubFileSize(fileSize);
             setEpubBase64(b64);
             setEpubLoadKey(`${String(fileId || '')}-${Date.now()}-${Math.random()}`);
           } catch (epubError) {
@@ -893,7 +915,8 @@ export default function ReaderScreen() {
           }
         } else {
           // TXT 파일
-          console.log("text 파일 읽기");
+          txtOpenStartedAtRef.current = Date.now();
+          console.log("⏱️ TXT [0ms] 파일 열기 시작:", fileName);
           hasResumedRef.current = false;
           setTxtLoading(true);
           setTxtError(null);
@@ -923,6 +946,8 @@ export default function ReaderScreen() {
           currentReadingPreviewRef.current = "";
 
           let text = await readTextWithNativeFallback(decoded);
+          console.log(`⏱️ TXT [${Date.now() - txtOpenStartedAtRef.current}ms] 파일 읽기/디코딩 완료`,
+            text == null ? "native-fail" : `${text.length}자`);
           if (text == null) {
             console.log("⚠️ 네이티브 TXT 읽기 실패, JS base64 폴백 사용");
             const base64 = await readWithFallback(decoded, {
@@ -934,7 +959,9 @@ export default function ReaderScreen() {
 
           if (!active) return;
           const normalizedText = text.includes('\r') ? text.replace(/\r/g, '') : text;
+          console.log(`⏱️ TXT [${Date.now() - txtOpenStartedAtRef.current}ms] 개행 정규화 완료`);
           const chunks = splitTextIntoRenderChunks(normalizedText);
+          console.log(`⏱️ TXT [${Date.now() - txtOpenStartedAtRef.current}ms] 구간 분할 완료`, `${chunks.length}개`);
           rawTextRef.current = normalizedText; // progress 비율 fallback용
           currentTxtCharOffsetRef.current = 0;
           currentTxtPreviewCharOffsetRef.current = 0;
@@ -955,6 +982,7 @@ export default function ReaderScreen() {
           setContent(chunks);
           contentRef.current = chunks;
           setTxtLoading(false);
+          console.log(`⏱️ TXT [${Date.now() - txtOpenStartedAtRef.current}ms] 본문 렌더 요청`);
         }
       } catch (e) {
         console.error("❌ 파일 읽기 오류:", e);
@@ -985,7 +1013,10 @@ export default function ReaderScreen() {
 
     // 실제 기기의 대용량 EPUB은 HTML 주입, base64 디코딩, ZIP 분석에 오래 걸릴 수 있다.
     // 시간 초과만으로 정상 WebView를 파괴하거나 파일 오류로 판정하지 않는다.
-    const estimatedMegabytes = epubBase64.length / 4 * 3 / (1024 * 1024);
+    // 파일 URI로 열면 base64 길이가 없으므로 실제 파일 크기를 쓴다.
+    const estimatedMegabytes = epubFileSize > 0
+      ? epubFileSize / (1024 * 1024)
+      : epubBase64.length / 4 * 3 / (1024 * 1024);
     const readyTimeoutMs = Math.min(300000, Math.max(90000, 60000 + estimatedMegabytes * 6000));
     const timer = setTimeout(() => {
       if (epubReady) return;
@@ -996,7 +1027,7 @@ export default function ReaderScreen() {
     }, readyTimeoutMs);
 
     return () => clearTimeout(timer);
-  }, [isEpub, epubBase64, epubLoadKey, epubReady, fileId]);
+  }, [isEpub, epubBase64, epubFileSize, epubLoadKey, epubReady, fileId]);
 
   // 서버에서 불러온 초기 progress (이어읽기 시작점)
   const [initialProgress, setInitialProgress] = useState<number>(0);
@@ -1086,9 +1117,21 @@ export default function ReaderScreen() {
       ? readerLocalPosition
       : localPosition;
 
+    // 기기에 이어읽기 위치가 있으면 아래 복원은 서버 응답과 관계없이 기기 값을 쓴다.
+    // 느리거나 멈춘 네트워크 때문에 본문 표시·이어읽기가 멈추지 않도록 서버 대기에 상한을 두고,
+    // 시간 안에 응답이 없으면 catch의 기기 위치 복원으로 진행한다.
+    const hasLocalResumePosition = !shouldResetProgress
+      && (Number(latestLocalPosition?.progress) || 0) > 0
+      && (latestLocalPosition?.format !== "EPUB" || typeof latestLocalPosition?.epubCfi === "string");
+    const fileInfoController = new AbortController();
+    const fileInfoTimer = setTimeout(
+      () => fileInfoController.abort(),
+      hasLocalResumePosition ? LOCAL_RESUME_SERVER_WAIT_MS : SERVER_RESUME_WAIT_MS,
+    );
+
     try {
       console.log("🔍 서버에서 파일 정보 불러오는 중...", fileId);
-      const res = await authenticatedFetch(`${BASE_URL}/files/${fileId}`);
+      const res = await authenticatedFetch(`${BASE_URL}/files/${fileId}`, { signal: fileInfoController.signal });
       const fileInfo = await res.json();
       if (!active) return;
       console.log("📚 서버에서 받은 데이터:", fileInfo);
@@ -1204,6 +1247,8 @@ export default function ReaderScreen() {
         }
       }
       setFileInfoLoaded(true); // 실패해도 EPUB 시작은 해야 함
+    } finally {
+      clearTimeout(fileInfoTimer);
     }
   };
 
@@ -1720,8 +1765,8 @@ useEffect(() => {
     if (actual == null) return;
 
     if (Math.abs(actual - settle.characterOffset) <= TXT_RESUME_SETTLE_TOLERANCE) {
-      console.log("[Restore] 완료 char=" + actual
-        + " (재정렬 " + settle.attempts + "회) 본문=\"" + txtSnippetAt(actual) + "\"");
+      console.log(`⏱️ TXT [${Date.now() - txtOpenStartedAtRef.current}ms] 이어읽기 복원 완료`
+        + " char=" + actual + " (재정렬 " + settle.attempts + "회)");
       txtResumeSettleRef.current = null;
       return;
     }
@@ -2355,9 +2400,11 @@ useEffect(() => {
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
       <script>window.__readmeEpubBootStartedAt = performance.now();</script>
       <!-- JSZip을 먼저 로드 (epub.js가 의존) -->
-      <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+      <!-- CDN에서 받으면 HTML 문자열로 띄운 이 WebView는 스크립트를 영구 캐시하지 못해, 로컬 EPUB도
+           열 때마다 네트워크가 필요하다(오프라인이면 열리지 않음). 같은 버전을 앱에 포함해 인라인으로 넣는다. -->
+      <script>${JSZIP_SOURCE}</script>
       <!-- epub.js 로드 -->
-      <script src="https://cdn.jsdelivr.net/npm/epubjs/dist/epub.min.js"></script>
+      <script>${EPUBJS_SOURCE}</script>
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { 
@@ -2583,7 +2630,10 @@ useEffect(() => {
       <script>
         (function() {
           // ⭐ console.log를 React Native로 전달 (오직 우리가 명시적으로 호출한 것만)
+          // 배포 빌드에서는 로그 메시지로 브리지를 쓰지 않는다.
+          var DEBUG_LOGS = ${__DEV__ ? "true" : "false"};
           function sendLog(message) {
+            if (!DEBUG_LOGS) return;
             try {
               window.ReactNativeWebView.postMessage(JSON.stringify({
                 type: "console",
@@ -2757,7 +2807,8 @@ useEffect(() => {
             var book;
             var rawZipPromise = null;
             var archiveBytes = null;
-            var archiveDecodedLength = 0;
+            // 파일 URI로 열면 디코딩한 바이트가 없으므로 RN이 알려준 파일 크기를 쓴다.
+            var archiveDecodedLength = ${Number(epubFileSize) || 0};
             if (useDirectFile) {
               sendLog("📂 대용량 EPUB 파일 URI 직접 초기화: " + directFileUri);
               book = ePub(directFileUri, { openAs: "epub" });
@@ -2843,13 +2894,17 @@ useEffect(() => {
             var contentTouchActive = false;
             var contentScrolledDuringTouch = false;
 
-            function buildThemeCss(t, preserveLayout) {
+            function buildThemeCss(t, preserveLayout, pageHeight) {
               var ff = (t.fontFamily && t.fontFamily !== 'default')
                 ? t.fontFamily + ', sans-serif'
                 : 'Roboto, "Noto Sans KR", "Noto Sans CJK KR", sans-serif';
               if (preserveLayout) {
                 return 'html,body{background:' + t.bgColor + '!important}' +
-                  'img,svg,object,video,canvas{max-width:100%!important;max-height:100vh!important;object-fit:contain!important}';
+                  // 표지·그림 페이지는 한 화면을 페이지로 전제하고 만들어진다(svg height:100%, max-height:100vh 등).
+                  // scrolled-doc iframe의 뷰포트는 본문 높이에 맞춰 늘어나므로 vh·백분율 높이가 화면이 아니라
+                  // 아직 작은 iframe 높이에 묶인다. 뷰포트 단위 대신 Reader 화면 높이(px)를 페이지 높이로 준다.
+                  (pageHeight > 0 ? 'html{height:' + pageHeight + 'px!important}body{height:100%!important;margin:0}' : '') +
+                  'img,svg,object,video,canvas{max-width:100%!important;max-height:' + (pageHeight > 0 ? pageHeight + 'px' : '100vh') + '!important;object-fit:contain!important}';
               }
               var fontCss = t.usePublisherFont
                 ? ':where(body){font-family:' + ff + '}'
@@ -2862,10 +2917,15 @@ useEffect(() => {
                 // WebView 자체가 safe area 아래에서 시작하므로 여기에는 읽기용 최소 여백만 둔다.
                 'padding-top:16px!important;padding-bottom:36px!important;' +
                 'margin:0!important;box-sizing:border-box!important;width:100%!important;' +
-                'word-break:keep-all!important;overflow-wrap:break-word!important;' +
-                'text-align:left!important}' + fontCss +
-                'p{line-height:' + t.lineSpacing + '!important;margin-left:0!important;margin-right:0!important;word-break:keep-all!important;text-align:left!important}' +
-                'img,svg,object,video,canvas{max-width:100%!important;max-height:100vh!important;width:auto!important;height:auto!important;object-fit:contain!important}';
+                'word-break:keep-all!important;overflow-wrap:break-word!important}' + fontCss +
+                'p{line-height:' + t.lineSpacing + '!important;word-break:keep-all!important}' +
+                'img,svg,object,video,canvas{max-width:100%!important;max-height:100vh!important;object-fit:contain!important}' +
+                // 정렬·좌우 여백·미디어 크기는 사용자 설정이 아니라 Reader 기본값이다. !important 없이 요소 선택자로 두면
+                // EPUB CSS 뒤에 주입되므로 p{text-align:justify} 같은 제작자의 일반 요소 규칙은 이 기본값이 이기고,
+                // .kakao-out{text-align:right}, .center, .chapter-header img{width:42%} 같은 클래스 레이아웃은
+                // 선택자 우선순위대로 유지된다. (!important는 선택자와 무관하게 제작자 레이아웃까지 덮어쓴다)
+                'body,p{text-align:left}p{margin-left:0;margin-right:0}' +
+                'img,svg,object,video,canvas{width:auto;height:auto}';
             }
 
             function injectTheme(contents) {
@@ -2877,7 +2937,9 @@ useEffect(() => {
                 var hasViewport = Boolean(doc.querySelector && doc.querySelector('meta[name="viewport"]'));
                 var bodyText = doc.body ? String(doc.body.textContent || '').replace(/\\s+/g, '').trim() : '';
                 var preserveLayout = metadataLayout === 'pre-paginated' || (hasViewport && bodyText.length < 20);
-                var css = buildThemeCss(currentTheme, preserveLayout);
+                var pageContainer = rendition.manager && rendition.manager.container;
+                var pageHeight = metadataLayout === 'pre-paginated' || !pageContainer ? 0 : pageContainer.clientHeight;
+                var css = buildThemeCss(currentTheme, preserveLayout, pageHeight);
                 if (el) { el.textContent = css; }
                 else {
                   var s = doc.createElement('style');
@@ -3446,7 +3508,7 @@ useEffect(() => {
                 estimatedTextLength += fallbackTextLengths[key] || 0;
               });
               var locationBreakSize;
-              if (useDirectFile || archiveDecodedLength >= 5 * 1024 * 1024) {
+              if (archiveDecodedLength >= 5 * 1024 * 1024) {
                 locationBreakSize = 1000;
               } else if (estimatedTextLength > 0) {
                 // 최대 약 1,200개 location, 최소 180자 간격
@@ -4421,6 +4483,32 @@ useEffect(() => {
               sendLog("📚 book.ready 완료");
               reportPerformance("book.ready 완료");
 
+              // epub.js는 챕터 XHTML의 documentElement만 직렬화해 iframe에 document.write 하므로 DOCTYPE이 빠지고,
+              // 모든 챕터가 quirks mode로 렌더링된다. quirks mode에서는 height:100% 같은 백분율 높이가
+              // iframe 뷰포트 기준으로 계산되는데, scrolled-doc은 iframe 높이를 본문 높이에 맞춰 늘리므로
+              // 둘이 서로를 키우며 본문이 화면 밖 수백만 px 아래로 밀려난다. XHTML은 원래 표준 모드 문서이므로
+              // 다른 EPUB 리더와 같이 표준 모드로 렌더링한다.
+              // epub.js가 book 열기 중 등록한 리소스 치환 hook이 section.output을 다시 쓰므로,
+              // 그 뒤(book.ready 이후)에 등록하고 치환이 끝난 section.output에 DOCTYPE을 붙인다.
+              book.spine.hooks.serialize.register(function(output, section) {
+                if (typeof section.output === 'string' && !/^\\s*<!DOCTYPE/i.test(section.output)) {
+                  section.output = '<!DOCTYPE html>' + section.output;
+                }
+              });
+
+              // OPF spine의 itemref가 manifest에 없는 항목은 읽을 문서(href)가 없다. epub.js는 이 항목을
+              // 그대로 두어 불러올 때 동기 예외가 나고, locations 생성 큐가 그 자리에서 멈춰
+              // 전체 페이지 계산과 슬라이더 이동이 끝내 준비되지 않는다. 읽기 순서에서 제외하고,
+              // 어떤 경로로 불러오더라도 멈추지 않고 오류로 끝나게 한다. (CFI 기준 spine 번호는 유지)
+              (book.spine && book.spine.spineItems ? book.spine.spineItems : []).forEach(function(section) {
+                if (section.url) return;
+                section.linear = false;
+                section.load = section.render = function() {
+                  return Promise.reject(new Error('manifest에 없는 spine 항목: ' + (section.idref || section.index)));
+                };
+                sendLog('⚠️ manifest에 없는 spine 항목 제외 index=' + section.index + ' idref=' + section.idref);
+              });
+
               // 준비 완료 알림(빠른 시작)
               window.ReactNativeWebView.postMessage(JSON.stringify({
                 type: "ready"
@@ -4765,12 +4853,13 @@ useEffect(() => {
                 'color:' + t.textColor + '!important;' +
                 'font-size:' + t.fontSize + 'px!important;' +
                 'line-height:' + t.lineSpacing + '!important;' +
-                'word-break:keep-all!important;overflow-wrap:break-word!important;' +
-                'text-align:left!important}' + fontCss +
+                'word-break:keep-all!important;overflow-wrap:break-word!important}' + fontCss +
                 '#fallback-section #fallback-document p{' +
                 'line-height:' + t.lineSpacing + '!important;' +
-                'word-break:keep-all!important;' +
-                'text-align:left!important}' +
+                'word-break:keep-all!important}' +
+                // 정렬 기본값은 범위가 지정된 EPUB CSS(#fallback-document p 등)와 같은 선택자 우선순위로 두어
+                // 제작자의 클래스 정렬(#fallback-document .center 등)이 유지되게 한다.
+                '#fallback-document,#fallback-document p{text-align:left}' +
                 '#fallback-section #fallback-document.fallback-prose-page p{' +
                 'margin-top:0!important;' +
                 'margin-bottom:1em!important;' +
@@ -4790,7 +4879,9 @@ useEffect(() => {
               var currentMedia = renderedDoc.querySelectorAll
                 ? renderedDoc.querySelectorAll('img,svg,image,object,video,canvas').length
                 : 0;
-              if (!forceRecovery && renderedBody && renderedBody.scrollHeight > 0) {
+              // 빈 섹션 여부는 높이가 아니라 실제 내용(텍스트·미디어)으로 판단한다. 높이는 렌더링 모드와
+              // 여백 CSS에 따라 달라져, 내용이 있는 그림 페이지를 빈 페이지로 오판하거나 그 반대가 된다.
+              if (!forceRecovery && (currentText || currentMedia > 0)) {
                 return Promise.resolve(false);
               }
 
@@ -5052,7 +5143,7 @@ useEffect(() => {
                     sendLog('⏳ EPUB 이미지 로딩 대기 index=' + lastDisplayedSectionIndex
                       + ' pending=' + pendingImageCount);
                     recoverRenderedImagesAfterSettlement(section, renderedContents, renderedImages);
-                  } else if (renderedBody && (renderedBody.scrollHeight === 0
+                  } else if (renderedBody && ((!renderedText && renderedMedia === 0)
                     || (renderedImages.length > 0 && loadedImageCount === 0))) {
                     recoverEmptyRenderedSection(
                       section,
@@ -5067,7 +5158,7 @@ useEffect(() => {
                         }, 100);
                       }
                     });
-                  } else if (renderedBody && renderedBody.scrollHeight > 0) {
+                  } else if (renderedBody) {
                     hideFallbackSection('정상 EPUB 본문 렌더링', false);
                     applyPendingSectionEdge(false);
                   }
@@ -5859,7 +5950,7 @@ useEffect(() => {
       </script>
     </body>
   </html>
-  `, [epubBase64, uri]);
+  `, [epubBase64, epubFileSize, uri]);
 
   const epubSource = useMemo(() => ({
     html: epubHtml,
@@ -5932,7 +6023,7 @@ useEffect(() => {
   };
 
   // 서버에 저장하는 함수
-  const saveProgressToServer = async (forceLog = false, refreshEpubLocation = false) => {
+  const saveProgressToServer = async (forceLog = false, refreshEpubLocation = false, waitForServer = true) => {
     if (!fileId) return;
     const saveFileId = Array.isArray(fileId) ? String(fileId[0] ?? "") : String(fileId);
     if (hasSupersedingReaderSession(readerSessionIdRef.current, saveFileId)) return;
@@ -6047,6 +6138,8 @@ useEffect(() => {
       return;
     }
     if (positionSignature === lastQueuedPositionSignatureRef.current) {
+      // 같은 위치가 이미 서버 저장 대기열에 있다. 화면을 떠날 때는 그 완료를 기다리지 않는다.
+      if (!waitForServer) return;
       await waitForReaderWrites(`server-progress:${saveFileId}`);
       if (positionSignature === lastSavedPositionSignatureRef.current) return;
     }
@@ -6089,6 +6182,7 @@ useEffect(() => {
           }
         }
       });
+    if (!waitForServer) return;
     await saveRequest;
   };
 
@@ -6098,8 +6192,11 @@ useEffect(() => {
     saveProgressRef.current = saveProgressToServer;
   });
   flushReaderSessionRef.current = async (reason) => {
-    await saveProgressRef.current(true, true);
-    if (reason === "external-file" || reason === "hardware-back" || reason === "reader-exit") {
+    // Reader를 떠날 때는 최신 위치를 확보해 기기에 저장한 뒤 바로 화면을 이동한다.
+    // 서버 저장은 파일별 저장 큐에서 순서대로 이어서 완료되므로, 느린 네트워크 때문에 이동이 멈추지 않는다.
+    const leavingReader = reason === "external-file" || reason === "hardware-back" || reason === "reader-exit";
+    await saveProgressRef.current(true, true, !leavingReader);
+    if (leavingReader) {
       exitFlushCompletedRef.current = true;
     }
   };
@@ -6128,7 +6225,18 @@ useEffect(() => {
         void flushReaderSessionRef.current("background");
       }
     });
-    return () => subscription.remove();
+    // 최근 앱 화면을 열어도 앱을 멈추지 않고 미리보기로 유지하는 기기에서는 background 없이
+    // 창 포커스만 잃는다. 그 상태에서 카드를 밀어 앱을 지우면 저장 없이 프로세스가 종료되므로,
+    // 포커스를 잃는 시점에도 같은 방식으로 최신 위치를 저장해 둔다.
+    const blurSubscription = Platform.OS === 'android'
+      ? AppState.addEventListener('blur', () => {
+          void flushReaderSessionRef.current("background");
+        })
+      : null;
+    return () => {
+      subscription.remove();
+      blurSubscription?.remove();
+    };
   }, []);
 
   const exitReader = async (reason: "hardware-back" | "reader-exit" = "reader-exit") => {
@@ -6146,7 +6254,13 @@ useEffect(() => {
     if (router.canGoBack()) {
       router.back();
     } else {
-      router.replace('/(tabs)');
+      // 세션 복원으로 열린 Reader는 쌓인 화면이 없다. 파일을 열었던 폴더로 돌려보낸다.
+      const originFolder = Array.isArray(folder) ? String(folder[0] ?? "") : String(folder ?? "");
+      router.replace(
+        originFolder && originFolder !== "root"
+          ? { pathname: '/(tabs)', params: { folder: originFolder } }
+          : '/(tabs)',
+      );
     }
   };
 
@@ -6362,9 +6476,15 @@ useEffect(() => {
       {/* 상단바 */}
       {showUI && (
         <View style={[styles.topBar, { paddingTop: readerTopInset + 8 }]}>
-          <Text style={styles.back} onPress={() => void exitReader()}>
-            ←
-          </Text>
+          {/* 글자 하나 크기의 터치 영역은 손가락으로 누르면 자주 빗나가므로, 배치는 그대로 두고 누르는 범위만 넓힌다. */}
+          <TouchableOpacity
+            onPress={() => void exitReader()}
+            hitSlop={{ top: 16, bottom: 16, left: 16, right: 12 }}
+            accessibilityRole="button"
+            accessibilityLabel="뒤로 가기"
+          >
+            <Text style={styles.back}>←</Text>
+          </TouchableOpacity>
           <Text style={styles.title} numberOfLines={1}>
             {title}
           </Text>

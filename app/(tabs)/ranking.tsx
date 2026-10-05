@@ -7,6 +7,7 @@ import { router, useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Image,
   NativeScrollEvent,
   NativeSyntheticEvent,
   RefreshControl,
@@ -16,6 +17,8 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { ICONS } from '../../constants/icons';
 import { useUser } from '../../contexts/UserContext';
 import { authenticatedFetch } from '../../utils/api';
 
@@ -169,127 +172,130 @@ export default function RankingScreen() {
   const showInitialLoading = loading && !hasRankings;
 
   return (
-    <ScrollView 
-      style={styles.container} 
-      showsVerticalScrollIndicator={false}
-      onScroll={handleScroll}
-      scrollEventThrottle={100}
-      refreshControl={
-        <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
-      }
-    >
-      {/* 기간 탭 */}
-      <View style={styles.tabContainer}>
-        {(["한달", "올해"] as const).map((tab) => (
-          <TouchableOpacity
-            key={tab}
-            style={[
-              styles.tab,
-              period === tab && styles.activeTab,
-            ]}
-            onPress={() => setPeriod(tab)}
-          >
-            <Text
+    <SafeAreaView style={{ flex: 1, backgroundColor: "#fff" }} edges={['top']}>
+      <ScrollView 
+        style={styles.container} 
+        contentContainerStyle={{ flexGrow: 1 }}
+        showsVerticalScrollIndicator={false}
+        onScroll={handleScroll}
+        scrollEventThrottle={100}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+        }
+      >
+        {/* 기간 탭 */}
+        <View style={styles.tabContainer}>
+          {(["한달", "올해"] as const).map((tab) => (
+            <TouchableOpacity
+              key={tab}
               style={[
-                styles.tabText,
-                period === tab && styles.activeTabText,
+                styles.tab,
+                period === tab && styles.activeTab,
               ]}
+              onPress={() => setPeriod(tab)}
             >
-              {tab}
-            </Text>
+              <Text
+                style={[
+                  styles.tabText,
+                  period === tab && styles.activeTabText,
+                ]}
+              >
+                {tab}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        {/* 타이틀 */}
+        <Text style={styles.sectionTitle}>{getPeriodTitle()}</Text>
+
+        {/* 프리미엄 유도 배너 */}
+        {!isPremium && rankings.length > 0 && (
+          <TouchableOpacity
+            style={styles.premiumTeaser}
+            onPress={() => router.push('/subscription' as any)}
+            activeOpacity={0.8}
+          >
+            <View style={styles.teaserLeft}>
+              <Text style={styles.teaserEmoji}>📅</Text>
+              <View>
+                <Text style={styles.teaserTitle}>지난 달 / 다른 년도 랭킹도 보고 싶다면?</Text>
+                <Text style={styles.teaserSub}>프리미엄으로 모든 기간 조회 + 상세 통계</Text>
+              </View>
+            </View>
+            <Text style={styles.teaserChevron}>›</Text>
+          </TouchableOpacity>
+        )}
+
+        {/* 로딩 상태 */}
+        {showInitialLoading && (
+          <View style={styles.centerContainer}>
+            <ActivityIndicator size="large" color="#007AFF" />
+            <Text style={styles.loadingText}>랭킹을 불러오는 중...</Text>
+          </View>
+        )}
+
+        {/* 에러 상태 */}
+        {error && (
+          <View style={styles.centerContainer}>
+            <Text style={styles.errorText}>{error}</Text>
+            <TouchableOpacity 
+              style={styles.retryButton} 
+              onPress={() => fetchRankings()}
+            >
+              <Text style={styles.retryButtonText}>다시 시도</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {/* 빈 상태 */}
+        {!loading && !error && rankings.length === 0 && (
+          <View style={styles.centerContainer}>
+            <Image source={ICONS.chart} style={styles.emptyIcon} />
+            <Text style={styles.emptySubText}>아직 랭킹 데이터가 없습니다</Text>
+          </View>
+        )}
+
+        {/* 랭킹 카드 목록 */}
+        {!error && visibleRankings.map((item, index) => (
+          <TouchableOpacity key={item.fileId} style={styles.card} 
+          onPress={() => {
+            // 파일 상세 페이지로 이동
+            router.push({
+              pathname: "/reader",
+              params: { fileId: item.fileId, uri: item.uri, name: item.title }
+            })
+          }}>
+            <Text style={styles.rank}>{index + 1}.</Text>
+
+            <View style={styles.cardContent}>
+              <Text style={styles.title} numberOfLines={2}>
+                {item.title}
+              </Text>
+
+              <Text style={styles.date}>
+                {item.lastReadAt
+                  ? formatRankingDate(item.lastReadAt)
+                  : '날짜 정보 없음'}
+              </Text>
+              <Text style={styles.progress}>
+                진행도: {Math.round(item.progress * 100)}%
+              </Text>
+
+              <View style={styles.starRow}>
+                {renderStars(item.rating)}
+              </View>
+            </View>
+
+            <Text style={styles.readCount}>{item.readCount}회</Text>
           </TouchableOpacity>
         ))}
-      </View>
 
-      {/* 타이틀 */}
-      <Text style={styles.sectionTitle}>{getPeriodTitle()}</Text>
-
-      {/* 프리미엄 유도 배너 */}
-      {!isPremium && rankings.length > 0 && (
-        <TouchableOpacity
-          style={styles.premiumTeaser}
-          onPress={() => router.push('/subscription' as any)}
-          activeOpacity={0.8}
-        >
-          <View style={styles.teaserLeft}>
-            <Text style={styles.teaserEmoji}>📅</Text>
-            <View>
-              <Text style={styles.teaserTitle}>지난 달 / 다른 년도 랭킹도 보고 싶다면?</Text>
-              <Text style={styles.teaserSub}>프리미엄으로 모든 기간 조회 + 상세 통계</Text>
-            </View>
-          </View>
-          <Text style={styles.teaserChevron}>›</Text>
-        </TouchableOpacity>
-      )}
-
-      {/* 로딩 상태 */}
-      {showInitialLoading && (
-        <View style={styles.centerContainer}>
-          <ActivityIndicator size="large" color="#007AFF" />
-          <Text style={styles.loadingText}>랭킹을 불러오는 중...</Text>
-        </View>
-      )}
-
-      {/* 에러 상태 */}
-      {error && (
-        <View style={styles.centerContainer}>
-          <Text style={styles.errorText}>{error}</Text>
-          <TouchableOpacity 
-            style={styles.retryButton} 
-            onPress={() => fetchRankings()}
-          >
-            <Text style={styles.retryButtonText}>다시 시도</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      {/* 빈 상태 */}
-      {!loading && !error && rankings.length === 0 && (
-        <View style={styles.centerContainer}>
-          <Text style={styles.emptyText}>📊</Text>
-          <Text style={styles.emptySubText}>아직 랭킹 데이터가 없습니다</Text>
-        </View>
-      )}
-
-      {/* 랭킹 카드 목록 */}
-      {!error && visibleRankings.map((item, index) => (
-        <TouchableOpacity key={item.fileId} style={styles.card} 
-        onPress={() => {
-          // 파일 상세 페이지로 이동
-          router.push({
-            pathname: "/reader",
-            params: { fileId: item.fileId, uri: item.uri, name: item.title }
-          })
-        }}>
-          <Text style={styles.rank}>{index + 1}.</Text>
-
-          <View style={styles.cardContent}>
-            <Text style={styles.title} numberOfLines={2}>
-              {item.title}
-            </Text>
-
-            <Text style={styles.date}>
-              {item.lastReadAt
-                ? formatRankingDate(item.lastReadAt)
-                : '날짜 정보 없음'}
-            </Text>
-            <Text style={styles.progress}>
-              진행도: {Math.round(item.progress * 100)}%
-            </Text>
-
-            <View style={styles.starRow}>
-              {renderStars(item.rating)}
-            </View>
-          </View>
-
-          <Text style={styles.readCount}>{item.readCount}회</Text>
-        </TouchableOpacity>
-      ))}
-
-      {visibleRankings.length > 0 && (
-        <View style={styles.bottomPadding} />
-      )}
-    </ScrollView>
+        {visibleRankings.length > 0 && (
+          <View style={styles.bottomPadding} />
+        )}
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
@@ -298,6 +304,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#fff",
     padding: 20,
+    paddingTop: 16,
   },
 
   /* 탭 */
@@ -306,7 +313,6 @@ const styles = StyleSheet.create({
     backgroundColor: "#e0e0e0",
     borderRadius: 20,
     padding: 4,
-    marginTop: 20,
     marginBottom: 20,
   },
   tab: {
@@ -414,8 +420,9 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
   },
-  emptyText: {
-    fontSize: 48,
+  emptyIcon: {
+    width: 64,
+    height: 64,
     marginBottom: 12,
   },
   emptySubText: {

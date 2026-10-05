@@ -1,4 +1,4 @@
-import { Modal, Text, TouchableOpacity, View } from "react-native";
+import { Modal, Pressable, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 
 export default function FolderOptionsModal({
   visible,
@@ -14,7 +14,7 @@ export default function FolderOptionsModal({
   onDelete: () => void;
 }) {
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View
         style={{
           flex: 1,
@@ -23,6 +23,8 @@ export default function FolderOptionsModal({
           alignItems: "center",
         }}
       >
+        {/* 팝업 바깥을 누르면 취소 */}
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
         <View
           style={{
             width: "75%",

@@ -4,23 +4,35 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { File as ExpoFile, type FileHandle } from 'expo-file-system';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Linking from 'expo-linking';
-import { Stack, useRouter } from 'expo-router';
+import { Stack, usePathname, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect, useRef } from 'react';
-import { Platform } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { Alert } from 'react-native';
 import 'react-native-reanimated';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { UserProvider, useUser } from '../contexts/UserContext';
 import {
+  claimExternalFileIntent,
   clearExternalFileIntent,
+  getCurrentExternalIntentInfo,
+  getCurrentTaskId,
   getExternalFileDisplayName,
-  isLaunchedFromHistory,
 } from '../modules/external-file-info/src';
-import { flushActiveReaderSession } from '../utils/readerLifecycle';
+import { isSupportedFileName, toExternalFileUrl } from '../utils/externalFile';
+import { flushActiveReaderSession, getActiveReaderSessionFileId } from '../utils/readerLifecycle';
 
 const ACTIVE_READER_SESSION_KEY = '@active_reader_session';
+
+// 배포 빌드에서는 디버그 로그를 남기지 않는다. 앱 곳곳의 console.log가 JS 스레드를 쓰고, 파일 이름·본문 미리보기·
+// 요청 주소가 기기 로그(logcat)에 그대로 남는다. 문제 추적에 필요한 경고/오류(console.warn/error)는 유지한다.
+if (!__DEV__) {
+  const noop = () => {};
+  console.log = noop;
+  console.info = noop;
+  console.debug = noop;
+}
 
 export const unstable_settings = {
   anchor: '(tabs)',
@@ -75,10 +87,22 @@ const makeExternalFileName = (sourceUrl: string, ext: string, displayName?: stri
   return `external${suffix}${ext}`;
 };
 
+// 앱 내부 [+ 파일 추가]와 같은 안내 문구를 쓴다.
+const showUnsupportedFileAlert = (fileName: string) => {
+  Alert.alert(
+    '지원하지 않는 파일',
+    `EPUB 또는 TXT 파일만 등록할 수 있습니다.\n\n${fileName}`,
+  );
+};
+
+type IncomingUrlSource = 'initial' | 'event';
+
 // UserProvider 안에서 실행되는 컴포넌트 (useUser 사용 가능)
 function AppContent() {
   const colorScheme = useColorScheme();
   const router = useRouter();
+  const pathname = usePathname();
+  const pathnameRef = useRef(pathname);
   const processingUrlsRef = useRef(new Set<string>());
   const lastIncomingUrlRef = useRef<{ url: string; handledAt: number } | null>(null);
   const incomingOperationIdRef = useRef(0);
@@ -86,7 +110,13 @@ function AppContent() {
   const { setIncomingFile } = useUser();
 
   useEffect(() => {
+    pathnameRef.current = pathname;
+  }, [pathname]);
+
+  useEffect(() => {
     const restoreActiveReader = async () => {
+      // 복원 확인(비동기) 도중 외부 파일이 들어오면 새 파일이 우선이다.
+      const operationIdAtStart = incomingOperationIdRef.current;
       try {
         const serialized = await AsyncStorage.getItem(ACTIVE_READER_SESSION_KEY);
         if (!serialized) return;
@@ -96,9 +126,26 @@ function AppContent() {
           await AsyncStorage.removeItem(ACTIVE_READER_SESSION_KEY);
           return;
         }
+        // 읽던 태스크가 그대로 이어질 때(백그라운드에서 프로세스만 종료된 뒤 복귀)만 Reader 화면을 복원한다.
+        // 최근 앱에서 앱을 지우고 새로 실행하면 새 태스크이므로 Home부터 시작한다.
+        // 이어읽기 위치는 별도 저장소(기기·서버)에 있으므로 여기서 지우는 것은 화면 복원 정보뿐이다.
+        const currentTaskId = getCurrentTaskId();
+        if (currentTaskId == null || Number(session.taskId) !== currentTaskId) {
+          console.log('🏠 새 앱 실행 - Reader 화면 복원 없이 Home에서 시작', {
+            savedTaskId: session.taskId ?? null,
+            currentTaskId,
+          });
+          await AsyncStorage.removeItem(ACTIVE_READER_SESSION_KEY);
+          return;
+        }
         const fileInfo = await FileSystem.getInfoAsync(String(session.uri));
         if (!fileInfo.exists) {
           await AsyncStorage.removeItem(ACTIVE_READER_SESSION_KEY);
+          return;
+        }
+
+        if (incomingOperationIdRef.current !== operationIdAtStart) {
+          console.log('↩️ 외부 파일 수신이 시작되어 이전 리더 세션 복원 취소');
           return;
         }
 
@@ -109,6 +156,8 @@ function AppContent() {
             uri: String(session.uri),
             name: String(session.name),
             type: session.type ? String(session.type) : undefined,
+            // 읽기를 끝냈을 때 파일을 열었던 폴더로 돌아가기 위해 함께 복원한다.
+            folder: session.folder ? String(session.folder) : undefined,
           },
         });
       } catch (error) {
@@ -116,29 +165,17 @@ function AppContent() {
       }
     };
 
-    const processIncomingUrl = async (url: string | null) => {
+    const processIncomingUrl = async (url: string | null, source: IncomingUrlSource) => {
       if (!url) return;
 
       console.log('🔗 수신 URL:', url);
 
-      // 앱 스킴(myreaderapp2://)으로 온 content URI 복원
-      // 예: myreaderapp2://media/external/file/1234 → content://media/external/file/1234
-      let normalizedUrl = url;
-      if (url.startsWith('myreaderapp2://')) {
-        const path = url.replace('myreaderapp2://', '');
-        // 파일 경로 패턴이면 content://로 변환
-        if (path.startsWith('media/') || path.startsWith('com.') || path.includes('/file/')) {
-          normalizedUrl = 'content://' + path;
-          console.log('🔄 content URI 복원:', normalizedUrl);
-        } else {
-          // 일반 �ープ링크 (앱 내부 라우팅) → 처리 안 함
-          return;
-        }
+      // 파일 열기 URL(file:// / content://, 앱 스킴으로 감싼 content URI)만 처리한다.
+      const normalizedUrl = toExternalFileUrl(url);
+      if (!normalizedUrl) return;
+      if (normalizedUrl !== url) {
+        console.log('🔄 content URI 복원:', normalizedUrl);
       }
-
-      // 파일 열기 URL인지 확인 (file:// 또는 content://)
-      const isFileUrl = normalizedUrl.startsWith('file://') || normalizedUrl.startsWith('content://');
-      if (!isFileUrl) return;
 
       const now = Date.now();
       const lastIncoming = lastIncomingUrlRef.current;
@@ -152,16 +189,38 @@ function AppContent() {
       processingUrlsRef.current.add(normalizedUrl);
       const operationId = incomingOperationIdRef.current + 1;
       incomingOperationIdRef.current = operationId;
+      const isCurrentOperation = () => incomingOperationIdRef.current === operationId;
+
+      if (__DEV__) {
+        const intentInfo = await getCurrentExternalIntentInfo();
+        console.log('[External Intent Received]', {
+          source,
+          url,
+          action: intentInfo?.action,
+          data: intentInfo?.data,
+          mimeType: intentInfo?.mimeType,
+          flags: intentInfo?.flags,
+          grantReadUriFlag: intentInfo?.grantReadUriFlag,
+          persistableGrantFlag: intentInfo?.persistableGrantFlag,
+          clipData: intentInfo?.clipDataUris,
+        });
+        console.log('[App State]', {
+          start: source === 'initial' ? 'cold start (initial intent)' : 'warm start (new intent event)',
+          route: pathnameRef.current,
+          currentReaderFileId: getActiveReaderSessionFileId(),
+        });
+        console.log('[External File Handling] permission', {
+          uri: normalizedUrl,
+          readPermission: intentInfo?.data === url ? intentInfo?.readPermission : 'intent-changed',
+        });
+      }
 
       let name = 'unknown';
       let finalUri = '';
 
       try {
-        // Reader가 열린 상태에서 새 파일이 들어오면 기존 파일 위치를 먼저 확정한다.
-        await flushActiveReaderSession('external-file');
-        if (incomingOperationIdRef.current !== operationId) return;
-
         const cacheDir = FileSystem.cacheDirectory ?? '';
+        if (__DEV__) console.log('[External File Handling] copy start', { operationId, uri: normalizedUrl });
         
         if (normalizedUrl.startsWith('content://')) {
           // content URI는 제공자에 따라 원본 파일명이 없을 수 있으므로 먼저 복사 후 타입을 판별한다.
@@ -175,6 +234,14 @@ function AppContent() {
             displayNamePromise,
           ]);
           console.log('✅ 임시 복사 완료:', tempUri);
+
+          // 앱 내부 파일 추가와 같은 기준: 확장자가 있는데 TXT/EPUB가 아니면 등록하지 않는다.
+          if (displayName && !isSupportedFileName(displayName)) {
+            await FileSystem.deleteAsync(tempUri, { idempotent: true }).catch(() => {});
+            console.log('⚠️ 지원되지 않는 파일:', displayName);
+            if (isCurrentOperation()) showUnsupportedFileAlert(displayName);
+            return;
+          }
 
           const displayExtension = displayName?.match(/\.(txt|epub)$/i)?.[0]?.toLowerCase();
           const ext = displayExtension || await getFileExtensionFromUri(tempUri);
@@ -191,6 +258,10 @@ function AppContent() {
           // 확장자가 없거나 지원되지 않으면 거절
           if (!urlName) {
             console.log('⚠️ 지원되지 않는 파일:', normalizedUrl);
+            if (isCurrentOperation()) {
+              const rawName = decodeURIComponent(normalizedUrl.split('?')[0]).split('/').pop();
+              showUnsupportedFileAlert(rawName || normalizedUrl);
+            }
             return;
           }
           name = urlName;
@@ -203,20 +274,39 @@ function AppContent() {
           console.log('✅ 파일 복사 완료:', finalUri);
         }
 
-        if (incomingOperationIdRef.current !== operationId) {
+        if (!isCurrentOperation()) {
           await FileSystem.deleteAsync(finalUri, { idempotent: true }).catch(() => {});
           console.log('↩️ 더 최신 파일이 선택되어 이전 외부 파일 결과 폐기:', name);
           return;
         }
 
         console.log('📂 외부 파일 수신 완료:', name);
+        if (__DEV__) console.log('[External File Handling] normalized file', { name, uri: finalUri });
         lastIncomingUrlRef.current = { url: normalizedUrl, handledAt: Date.now() };
         await clearExternalFileIntent(url);
+
+        // 새 파일로 전환이 확정된 뒤에만 열려 있던 Reader의 최신 위치를 저장하고 session을 닫는다.
+        // 복사 실패·지원하지 않는 파일·더 최신 파일 수신으로 끝나는 경우에는 읽던 Reader를 그대로 둔다.
+        const previousReaderFileId = getActiveReaderSessionFileId();
+        if (previousReaderFileId) console.log('[Reader] previous reader close', { fileId: previousReaderFileId });
+        await flushActiveReaderSession('external-file');
+        if (previousReaderFileId) console.log('[Reader] position saved', { fileId: previousReaderFileId });
+
+        // 스택에 이미 있는 Home까지 화면을 닫는다. replace는 Reader 자리에 새 Home을 하나 더 만들어
+        // Home이 중복 마운트되고, 각 Home이 같은 외부 파일을 두고 경쟁하게 된다.
+        // 위치 저장으로 Reader session을 끝냈으므로 더 최신 파일이 들어왔더라도 Reader는 닫는다.
+        router.dismissTo('/(tabs)' as any);
+        if (!isCurrentOperation()) {
+          await FileSystem.deleteAsync(finalUri, { idempotent: true }).catch(() => {});
+          console.log('↩️ 더 최신 파일이 선택되어 이전 외부 파일 결과 폐기:', name);
+          return;
+        }
         setIncomingFile({ uri: finalUri, name });
-        // 리더가 열려 있더라도 중복 확인창과 등록 상태가 보이는 홈으로 이동한다.
-        router.replace('/(tabs)' as any);
       } catch (e) {
         console.error('❌ 외부 파일 처리 실패:', e);
+        if (isCurrentOperation()) {
+          Alert.alert('파일 추가 실패', String(e));
+        }
       } finally {
         processingUrlsRef.current.delete(normalizedUrl);
       }
@@ -227,13 +317,14 @@ function AppContent() {
     if (!didReadInitialUrlRef.current) {
       didReadInitialUrlRef.current = true;
       Linking.getInitialURL().then(async (initialUrl) => {
-        const isHistoryRelaunch = Platform.OS === 'android'
-          && await isLaunchedFromHistory();
-        if (initialUrl && !isHistoryRelaunch) {
-          await processIncomingUrl(initialUrl);
+        // 백그라운드에서 프로세스가 종료된 뒤 복귀하면 Activity가 복원되면서 처음 파일을 연 Intent가
+        // 그대로 다시 전달된다. 새로 전달된 Intent만 등록하고, 복원이면 읽던 Reader를 되살린다.
+        const isNewIntent = initialUrl ? await claimExternalFileIntent(initialUrl) : false;
+        if (initialUrl && isNewIntent) {
+          await processIncomingUrl(initialUrl, 'initial');
         } else {
-          if (initialUrl && isHistoryRelaunch) {
-            console.log('↩️ 최근 앱에서 재실행된 기존 파일 intent는 다시 등록하지 않음');
+          if (initialUrl) {
+            console.log('↩️ 이미 처리한 외부 파일 intent가 Activity 복원으로 다시 전달됨 - 등록하지 않음');
           }
           await restoreActiveReader();
         }
@@ -242,7 +333,10 @@ function AppContent() {
 
     // 앱이 백그라운드에 있다가 파일로 열린 경우
     const subscription = Linking.addEventListener('url', ({ url }) => {
-      processIncomingUrl(url);
+      // onNewIntent로 온 URL은 항상 새 요청이다. 처리했다고 기록해 두어야
+      // 이후 Activity가 이 Intent로 복원될 때 다시 등록하지 않는다.
+      void claimExternalFileIntent(url);
+      processIncomingUrl(url, 'event');
     });
 
     return () => subscription.remove();
@@ -262,7 +356,8 @@ function AppContent() {
 }
 
 export default function RootLayout() {
-  const queryClient = new QueryClient({
+  // 렌더마다 새로 만들면 목록 캐시가 통째로 사라지므로 앱 실행 동안 하나만 쓴다.
+  const [queryClient] = useState(() => new QueryClient({
     defaultOptions: {
       queries: {
         staleTime: 30 * 1000,        // 30초 내에는 캐시 반환 (네트워크 요청 안 함)
@@ -271,7 +366,7 @@ export default function RootLayout() {
         retry: 1,
       },
     },
-  });
+  }));
 
   return (
     <QueryClientProvider client={queryClient}>

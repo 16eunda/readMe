@@ -14,7 +14,7 @@ export default function CreateFolderModal({
   onClose: () => void;
 }) {
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View style={styles.overlay}>
         <View style={styles.modal}>
           <Text style={styles.header}>새 폴더 이름</Text>
