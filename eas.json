@@ -9,12 +9,18 @@
       "distribution": "internal"
     },
     "preview": {
-      "distribution": "internal"
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://api.myreadmeapp.com"
+      }
     },
     "production": {
       "autoIncrement": true,
       "node": "22.0.0",
-      "pnpm": "10.28.1"
+      "pnpm": "10.28.1",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://api.myreadmeapp.com"
+      }
     }
   },
   "submit": {
