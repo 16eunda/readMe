@@ -320,6 +320,21 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = async () => {
+    // 서버의 로그인 세션을 끝내 이 기기의 refreshToken을 무효로 만든다.
+    // 토큰을 지우기 전에 읽어 요청만 보내고 응답은 기다리지 않는다. 오프라인이거나 실패해도 로그아웃은 그대로 진행한다.
+    // (재발급이 거부돼 로그아웃되는 경우에는 토큰이 이미 지워져 있어 보내지 않는다)
+    try {
+      const refreshToken = await getToken('refreshToken');
+      if (refreshToken) {
+        void fetchWithTimeout(`${API_BASE_URL}/auth/logout`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${refreshToken}` },
+        }).catch(() => {});
+      }
+    } catch (error) {
+      console.log('⚠️ 서버 로그아웃 요청 생략:', error);
+    }
+
     // 저장소를 먼저 비운 뒤 state를 바꾼다.
     // 순서가 반대면, 로그아웃을 감지한 화면이 재조회를 시작하는 시점에 토큰이 아직 남아 있어
     // 이전 사용자의 데이터를 받아와 로그아웃된 화면에 그대로 보여줄 수 있다.
