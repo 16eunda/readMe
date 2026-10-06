@@ -49,3 +49,6 @@ app-example
 /.vscode/
 
 modules/*/android/build/
+
+# 개인 작업 메모
+/CURRENT_CHANGES_GUIDE.md
