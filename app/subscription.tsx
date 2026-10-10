@@ -1,5 +1,6 @@
 // app/subscription.tsx
-import { Stack, useRouter } from 'expo-router';
+import { useRouter } from 'expo-router';
+import { X } from 'lucide-react-native';
 import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
@@ -228,11 +229,34 @@ export default function SubscriptionScreen() {
     }
   };
 
+  // 구독하지 않고 나가는 경로. 결제 진행 상태와 관계없이 항상 보이고 눌려야 한다(Google Play 정기 결제 정책).
+  // Android 뒤로가기는 네이티브 스택이 같은 방식(이전 화면으로 pop)으로 처리한다.
+  const handleClose = () => {
+    if (router.canGoBack()) router.back();
+    else router.replace('/(tabs)');
+  };
+
+  // 루트 Stack이 이 화면의 헤더를 숨기므로(app/_layout.tsx) 닫기 버튼은 화면이 직접 그린다.
+  // ScrollView 밖에 두어 스크롤·플랜 선택과 관계없이 상단에 고정된다.
+  const closeBar = (
+    <View style={styles.topBar}>
+      <TouchableOpacity
+        style={styles.closeBtn}
+        onPress={handleClose}
+        accessibilityRole="button"
+        accessibilityLabel="닫기"
+        hitSlop={8}
+      >
+        <X size={26} color="#111" strokeWidth={2.5} />
+      </TouchableOpacity>
+    </View>
+  );
+
   // ── 이미 구독 중인 경우 ──
   if (isPremium) {
     return (
       <SafeAreaView style={styles.container}>
-        <Stack.Screen options={{ title: '구독 관리', headerBackTitle: '뒤로' }} />
+        {closeBar}
         <ScrollView
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.premiumActive}
@@ -277,7 +301,7 @@ export default function SubscriptionScreen() {
   // ── 구독 유도 화면 ──
   return (
     <SafeAreaView style={styles.container}>
-      <Stack.Screen options={{ title: 'readMe Premium', headerBackTitle: '뒤로' }} />
+      {closeBar}
       <ScrollView
         showsVerticalScrollIndicator={false}
         contentContainerStyle={styles.scrollContent}
@@ -374,7 +398,11 @@ export default function SubscriptionScreen() {
         </TouchableOpacity>
 
         <Text style={styles.trialText}>
-          매월 자동 결제 · 언제든 취소 가능
+          {selectedPlan === 'yearly' ? '매년' : '매월'} 자동 결제 · 언제든 취소 가능
+        </Text>
+        <Text style={styles.freeNote}>
+          구독하지 않아도 책 읽기·독서 기록 등{'\n'}
+          기본 기능은 무료로 계속 이용할 수 있어요.
         </Text>
         <Text style={styles.finePrint}>
           구독은 App Store / Google Play 계정으로 청구됩니다.{'\n'}
@@ -399,6 +427,21 @@ export default function SubscriptionScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#fff' },
+  // 닫기 버튼: 48dp 터치 영역, 흰 배경과 구분되는 회색 원 + 진한 X (테마와 무관하게 고정 색)
+  topBar: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+  },
+  closeBtn: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#F0F0F3',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   scrollContent: { padding: 24, paddingTop: 0, paddingBottom: 60 },
 
   // 헤더
@@ -496,6 +539,13 @@ const styles = StyleSheet.create({
     color: '#666',
     fontSize: 13,
     marginBottom: 16,
+  },
+  freeNote: {
+    textAlign: 'center',
+    color: '#555',
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 12,
   },
   finePrint: {
     textAlign: 'center',
