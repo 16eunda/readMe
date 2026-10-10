@@ -16,6 +16,7 @@ import {
   Alert,
   BackHandler,
   FlatList,
+  Keyboard,
   Modal,
   RefreshControl,
   ScrollView,
@@ -222,6 +223,12 @@ export default function Home() {
   const [isLoadingMore, setIsLoadingMore] = useState(false); // UI 표시용만
   const [isSearching, setIsSearching] = useState(false); // 검색 모드 추적
   const [searchResults, setSearchResults] = useState<any[]>([]); // 검색 결과
+  // 검색은 폴더 목록과 페이지 상태를 따로 둔다. 같이 쓰면 검색을 끝낸 뒤 폴더 목록이 검색의 페이지 번호로
+  // 다음 페이지를 불러와 이미 본 카드가 다시 붙거나, 검색의 hasMore 때문에 다음 페이지를 못 불러온다.
+  const [searchPage, setSearchPage] = useState(0);
+  const [searchHasMore, setSearchHasMore] = useState(false);
+  const [isSearchLoadingMore, setIsSearchLoadingMore] = useState(false);
+  const searchRequestIdRef = useRef(0); // 검색을 끝내거나 새로 시작하면 이전 검색 응답은 버린다.
   const [locationPageFiles, setLocationPageFiles] = useState<any[] | null>(null);
   const [locatedFileId, setLocatedFileId] = useState<string | null>(null);
   const [isLocatingFile, setIsLocatingFile] = useState(false);
@@ -365,6 +372,8 @@ export default function Home() {
   // ['folders', path, deviceId], ['allFolders', deviceId])와 현재 폴더의 2페이지 이후 state(extraFiles/locationPageFiles)로 나뉜다.
   // 지금 보고 있지 않은 폴더의 캐시는 staleTime(30초) 안에는 다시 조회되지 않으므로, 위치가 바뀌는 작업 뒤에
   // 원래 폴더와 새 폴더의 캐시를 함께 맞추지 않으면 새 폴더에 들어가도 작업 전 목록이 그대로 보인다.
+  // 검색 중에는 이 목록 대신 검색 응답 복사본(searchResults)을 표시한다. 검색 결과는 폴더와 관계없는 목록이므로
+  // 파일 정보가 바뀌면(수정·이동) 교체하고, 삭제되면 뺀다. 폴더에서 빼는 것만으로는 검색 결과에서 빼지 않는다(이동도 폴더에서 뺀다).
   const fileSortValue = (file: any, field: string) =>
     field === "rating" ? Number(file?.rating ?? 0) : new Date(file?.date ?? 0).getTime() || 0;
 
@@ -402,6 +411,8 @@ export default function Home() {
       nextContent.splice(index < 0 ? nextContent.length : index, 0, file);
       queryClient.setQueryData(key, { ...data, content: nextContent });
     }
+    // 이동한 파일은 검색 결과에서도 새 위치로 바꾼다. 검색 결과에 없던 새 파일은 검색어 일치 여부를 모르므로 넣지 않는다.
+    setSearchResults((prev) => prev.map((item: any) => (String(item?.id) === String(file.id) ? file : item)));
   };
 
   const replaceFileInLists = (file: any) => {
@@ -411,6 +422,7 @@ export default function Home() {
     );
     setExtraFiles((prev) => prev.map(replace));
     setLocationPageFiles((prev) => (prev ? prev.map(replace) : prev));
+    setSearchResults((prev) => prev.map(replace));
   };
 
   // 캐시를 먼저 맞춘 뒤 서버 기준으로 재검증한다. 보고 있는 폴더는 바로 다시 조회되고,
@@ -443,6 +455,8 @@ export default function Home() {
       const file = files.find((item: any) => String(item?.id) === String(id));
       removeFilesFromLists(String(file?.path ?? currentFolder), [id]);
     }
+    const deletedFileIds = new Set(fileIds.map(String));
+    setSearchResults((prev) => prev.filter((item: any) => !deletedFileIds.has(String(item?.id))));
     if (folderIds.length > 0) {
       const deletedIds = new Set(folderIds.map(String));
       const keep = (item: any) => !deletedIds.has(String(item?.id));
@@ -535,15 +549,33 @@ export default function Home() {
     });
   }, [router]);
 
+  // 검색 취소(뒤로가기, 검색창 X 버튼, 파일 위치 열기). 디바운스를 기다리지 않고 바로 보던 폴더 목록으로 돌아간다.
+  // 결과 비우기와 진행 중인 검색 응답 버리기는 검색어가 비었을 때의 effect가 맡는다.
+  const clearSearch = useCallback(() => {
+    setSearch("");
+    setDebouncedSearch("");
+    setIsSearching(false);
+  }, []);
+
+  const hasActiveSearch = search.length > 0 || isSearching;
+
   useFocusEffect(
     useCallback(() => {
-      if (!isSelectMode && currentFolder === "root") return;
+      if (!isSelectMode && !hasActiveSearch && currentFolder === "root") return;
 
       const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
         // 선택 모드에서는 앱을 나가거나 상위 폴더로 가지 않고 선택 모드만 끈다.
         if (isSelectMode) {
           setIsSelectMode(false);
           setSelectedItems({ files: [], folders: [] });
+          return true;
+        }
+
+        // 검색 중에는 검색만 취소한다. 키보드가 떠 있으면 첫 번째 뒤로가기는 Android가 키보드를 내리는 데 쓰고,
+        // 여기로는 그다음 뒤로가기가 온다. 포커스가 검색창에 남지 않도록 키보드도 함께 정리한다.
+        if (hasActiveSearch) {
+          clearSearch();
+          Keyboard.dismiss();
           return true;
         }
 
@@ -555,7 +587,7 @@ export default function Home() {
       });
 
       return () => subscription.remove();
-    }, [allFolders, currentFolder, isSelectMode, moveToFolder]),
+    }, [allFolders, clearSearch, currentFolder, hasActiveSearch, isSelectMode, moveToFolder]),
   );
 
   // ========== 4. 모든 useEffect ==========
@@ -760,11 +792,13 @@ export default function Home() {
     if (debouncedSearch.trim()) {
       console.log("🔍 검색 시작:", debouncedSearch);
       setIsSearching(true);
-      setCurrentPage(0);
       searchFilesFromServer(debouncedSearch, 0, true);
     } else {
+      // 검색어가 비면(직접 지우기·검색 취소) 검색을 끝내고, 아직 오지 않은 검색 응답은 버린다.
+      searchRequestIdRef.current += 1;
       setIsSearching(false);
       setSearchResults([]);
+      setIsSearchLoadingMore(false);
     }
   }, [debouncedSearch]);
 
@@ -905,13 +939,14 @@ export default function Home() {
   // 서버 검색 (디바운싱 + 페이지네이션)
   // -----------------------------
   async function searchFilesFromServer(keyword: string, page = 0, reset = false) {
+    const requestId = ++searchRequestIdRef.current;
     try {
       if (reset) {
-        setCurrentPage(0);
-        setHasMore(true);
+        setSearchPage(0);
+        setSearchHasMore(true);
       }
       
-      setIsLoadingMore(true);
+      setIsSearchLoadingMore(true);
       
       // 정렬 옵션을 서버 형식으로 변환
       const sortParam = sortOption === "date-desc" ? "date,desc" 
@@ -922,7 +957,6 @@ export default function Home() {
       // deviceId가 없으면 요청하지 않음
       if (!deviceId) {
         console.log('⚠️ 디바이스 ID 없음, 검색 대기');
-        setIsLoadingMore(false);
         return;
       }
       
@@ -941,6 +975,7 @@ export default function Home() {
         deviceId
       );
       const data = await response.json();
+      if (requestId !== searchRequestIdRef.current) return;
       
       console.log('🔍 검색 결과 (page=' + page + '):', data);
       
@@ -950,16 +985,16 @@ export default function Home() {
         fileList = data.content;
         // Spring Data 새 형식: data.page.number, data.page.totalPages
         if (data.page) {
-          setHasMore(data.page.number + 1 < data.page.totalPages);
+          setSearchHasMore(data.page.number + 1 < data.page.totalPages);
         } else {
-          setHasMore(!data.last); // 구형 형식 폴백
+          setSearchHasMore(!data.last); // 구형 형식 폴백
         }
       } else if (Array.isArray(data)) {
         fileList = data;
-        setHasMore(false);
+        setSearchHasMore(false);
       } else {
         fileList = [];
-        setHasMore(false);
+        setSearchHasMore(false);
       }
       
       // 페이지 누적 또는 초기화
@@ -969,13 +1004,14 @@ export default function Home() {
         setSearchResults((prev: any[]) => [...prev, ...fileList]);
       }
       
-      setCurrentPage(page);
+      setSearchPage(page);
     } catch (e) {
+      if (requestId !== searchRequestIdRef.current) return;
       console.log("Error searching files:", e);
       setSearchResults([]);
-      setHasMore(false);
+      setSearchHasMore(false);
     } finally {
-      setIsLoadingMore(false);
+      if (requestId === searchRequestIdRef.current) setIsSearchLoadingMore(false);
     }
   }
 
@@ -2030,7 +2066,7 @@ export default function Home() {
       )}
 
       {/* 검색창 */}
-      <SearchBar value={search} onChange={setSearch} />
+      <SearchBar value={search} onChange={setSearch} onClear={clearSearch} />
 
       {/* 폴더 메뉴 - 검색 중이 아닐 때만 */}
       {!isSearching && (
@@ -2184,12 +2220,12 @@ export default function Home() {
           />
         )}
         onEndReached={() => {
-          if (!isLoadingMore && hasMore) {
-            if (isSearching && debouncedSearch.trim()) {
-              searchFilesFromServer(debouncedSearch, currentPage + 1, false);
-            } else {
-              loadMoreFiles();
+          if (isSearching) {
+            if (!isSearchLoadingMore && searchHasMore && debouncedSearch.trim()) {
+              searchFilesFromServer(debouncedSearch, searchPage + 1, false);
             }
+          } else if (!isLoadingMore && hasMore) {
+            loadMoreFiles();
           }
         }}
         onEndReachedThreshold={0.5}
@@ -2203,7 +2239,10 @@ export default function Home() {
           }, 120);
         }}
         ListFooterComponent={() => {
-          if (isLoadingMore && currentPage > 0) {
+          const showFooter = isSearching
+            ? isSearchLoadingMore && searchPage > 0
+            : isLoadingMore && currentPage > 0;
+          if (showFooter) {
             return (
               <View style={{ padding: 20, alignItems: 'center' }}>
                 <Text style={{ color: '#999' }}>로딩 중...</Text>
@@ -2543,8 +2582,8 @@ export default function Home() {
             return;
           }
 
-          // 캐시에서 즉시 제거 (같은 폴더의 다른 정렬 캐시와 2페이지 이후 목록 포함)
-          removeFilesFromLists(String(selectedFile.path ?? currentFolder), [selectedFile.id]);
+          // 캐시에서 즉시 제거 (같은 폴더의 다른 정렬 캐시와 2페이지 이후 목록, 검색 결과 포함)
+          removeDeletedItemsFromLists([selectedFile.id], []);
           cleanUpDeletedFilesLocally([selectedFile]);
         } catch (error) {
           console.log("파일 삭제 실패:", error);
@@ -2562,10 +2601,8 @@ export default function Home() {
         setFileOptionsVisible(false);
         
         // 검색 모드 해제
-        setSearch("");
-        setDebouncedSearch("");
-        setIsSearching(false);
-        
+        clearSearch();
+
         // 파일이 있는 폴더로 이동한 뒤, 대상 파일이 포함된 페이지까지 불러와 카드로 스크롤한다.
         moveToFolder(selectedFile.path || "root", String(selectedFile.id));
       }}

@@ -1,12 +1,14 @@
 import { Ionicons } from "@expo/vector-icons";
-import { StyleSheet, TextInput, View } from "react-native";
+import { StyleSheet, TextInput, TouchableOpacity, View } from "react-native";
 
 export default function SearchBar({
   value,
   onChange,
+  onClear,
 }: {
   value: string;
   onChange: (text: string) => void;
+  onClear?: () => void;
 }) {
   return (
     <View style={styles.container}>
@@ -18,6 +20,17 @@ export default function SearchBar({
         value={value}
         onChangeText={onChange}
       />
+      {/* 검색어가 있을 때만 지우기 버튼을 보여 준다. 새 검색어를 바로 입력할 수 있게 키보드는 그대로 둔다. */}
+      {value.length > 0 && onClear && (
+        <TouchableOpacity
+          onPress={onClear}
+          hitSlop={{ top: 10, right: 10, bottom: 10, left: 10 }}
+          accessibilityRole="button"
+          accessibilityLabel="검색어 지우기"
+        >
+          <Ionicons name="close-circle" size={20} color="#999" />
+        </TouchableOpacity>
+      )}
     </View>
   );
 }
