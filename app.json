@@ -135,7 +135,16 @@
         }
       ],
       "expo-secure-store",
-      "./plugins/withAsyncStorageDbSize"
+      "./plugins/withAsyncStorageDbSize",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "enableMinifyInReleaseBuilds": true,
+            "extraProguardRules": "# react-native-iap 15 (openiap-google 2.1.4) looks up Play Billing APIs by name and serializes purchases with Gson.\n-keep public class com.android.billingclient.api.** { public *; }\n-keep class dev.hyo.openiap.** { *; }"
+          }
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,
