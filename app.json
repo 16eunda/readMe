@@ -6,7 +6,7 @@
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "myreaderapp2",
-    "userInterfaceStyle": "automatic",
+    "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
@@ -136,6 +136,7 @@
       ],
       "expo-secure-store",
       "./plugins/withAsyncStorageDbSize",
+      "./plugins/withEarlyUserInterfaceStyle",
       [
         "expo-build-properties",
         {

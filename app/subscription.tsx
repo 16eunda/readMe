@@ -18,10 +18,13 @@ import { ICONS } from '../constants/icons';
 import { useUser } from '../contexts/UserContext';
 import {
   acquireIapConnection,
+  getSubscriptionPlanPrices,
+  getYearlyPlanComparison,
   registerSubscriptionPurchase,
   releaseIapConnection,
   restorePurchases,
   SUBSCRIPTION_PRODUCT_IDS,
+  type SubscriptionPlanPrices,
 } from '../utils/subscriptionPurchases';
 
 const FEATURES = [
@@ -38,21 +41,10 @@ const FEATURES = [
 //   { emoji: '📊', text: '상세 독서 통계 (출시 예정)' },
 ];
 
+// 가격·월 환산 금액·절약률은 Google Play 상품 정보에서 가져온다(getSubscriptionPlanPrices).
 const PLANS = [
-  {
-    id: 'monthly' as const,
-    label: '월간',
-    price: '₩2,900',
-    sub: '매월 결제',
-    badge: null,
-  },
-  {
-    id: 'yearly' as const,
-    label: '연간',
-    price: '₩19,900',
-    sub: '매년 결제 · 월 ₩1,658',
-    badge: '43% 절약',
-  },
+  { id: 'monthly' as const, label: '월간', period: '매월 결제' },
+  { id: 'yearly' as const, label: '연간', period: '매년 결제' },
 ];
 
 const PURPLE = '#7C3AED';
@@ -66,6 +58,9 @@ export default function SubscriptionScreen() {
   const [isLoading, setIsLoading] = useState(false);
   const [iapReady, setIapReady] = useState(false);
   const [isRestoring, setIsRestoring] = useState(false);
+  const [planPrices, setPlanPrices] = useState<SubscriptionPlanPrices>({});
+  const [pricesLoading, setPricesLoading] = useState(true);
+  const yearlyComparison = getYearlyPlanComparison(planPrices);
 
   // IAP 초기화 및 결제 리스너 등록
   useEffect(() => {
@@ -78,7 +73,10 @@ export default function SubscriptionScreen() {
       // Billing 연결은 앱 시작 시 구매 복원과 공유한다. 이 화면이 직접 initConnection/endConnection을
       // 부르면 복원이 끝나면서 이 화면의 연결까지 끊긴다.
       const iap = await acquireIapConnection();
-      if (!iap) return;
+      if (!iap) {
+        if (active) setPricesLoading(false);
+        return;
+      }
       if (!active) {
         releaseIapConnection();
         return;
@@ -86,11 +84,13 @@ export default function SubscriptionScreen() {
       connected = true;
 
       try {
-        await iap.fetchProducts({
+        const products = await iap.fetchProducts({
           skus: Object.values(SUBSCRIPTION_PRODUCT_IDS),
           type: 'subs',
         });
         if (!active) return;
+        setPlanPrices(getSubscriptionPlanPrices(products));
+        setPricesLoading(false);
         setIapReady(true);
 
         // 결제 실패/취소 리스너.
@@ -150,6 +150,7 @@ export default function SubscriptionScreen() {
         console.log('IAP 초기화 실패:', e);
         if (active) {
           setIapReady(false);
+          setPricesLoading(false);
           connected = false;
           releaseIapConnection();
         }
@@ -331,58 +332,77 @@ export default function SubscriptionScreen() {
 
         {/* 플랜 선택 */}
         <Text style={styles.planTitle}>플랜 선택</Text>
-        {PLANS.map((plan) => (
-          <TouchableOpacity
-            key={plan.id}
-            style={[
-              styles.planCard,
-              selectedPlan === plan.id && styles.planCardActive,
-            ]}
-            onPress={() => setSelectedPlan(plan.id)}
-            activeOpacity={0.8}
-          >
-            <View style={styles.planLeft}>
-              <Text
-                style={[
-                  styles.planLabel,
-                  selectedPlan === plan.id && styles.planLabelActive,
-                ]}
-              >
-                {plan.label}
-              </Text>
-              <Text
-                style={[
-                  styles.planSub,
-                  selectedPlan === plan.id && styles.planSubActive,
-                ]}
-              >
-                {plan.sub}
-              </Text>
-            </View>
+        {PLANS.map((plan) => {
+          const price = planPrices[plan.id];
+          const isYearly = plan.id === 'yearly';
+          const sub = isYearly && yearlyComparison.perMonth
+            ? `${plan.period} · 월 ${yearlyComparison.perMonth}`
+            : plan.period;
+          const badge = isYearly && yearlyComparison.savingsPercent
+            ? `${yearlyComparison.savingsPercent}% 절약`
+            : null;
+          return (
+            <TouchableOpacity
+              key={plan.id}
+              style={[
+                styles.planCard,
+                selectedPlan === plan.id && styles.planCardActive,
+              ]}
+              onPress={() => setSelectedPlan(plan.id)}
+              activeOpacity={0.8}
+            >
+              <View style={styles.planLeft}>
+                <Text
+                  style={[
+                    styles.planLabel,
+                    selectedPlan === plan.id && styles.planLabelActive,
+                  ]}
+                >
+                  {plan.label}
+                </Text>
+                <Text
+                  style={[
+                    styles.planSub,
+                    selectedPlan === plan.id && styles.planSubActive,
+                  ]}
+                >
+                  {sub}
+                </Text>
+              </View>
 
-            <View style={styles.planRight}>
-              {plan.badge && (
-                <View style={styles.saveBadge}>
-                  <Text style={styles.saveBadgeText}>{plan.badge}</Text>
+              <View style={styles.planRight}>
+                {badge && (
+                  <View style={styles.saveBadge}>
+                    <Text style={styles.saveBadgeText}>{badge}</Text>
+                  </View>
+                )}
+                {!price && pricesLoading ? (
+                  <ActivityIndicator color={PURPLE} />
+                ) : (
+                  <Text
+                    style={[
+                      styles.planPrice,
+                      selectedPlan === plan.id && styles.planPriceActive,
+                    ]}
+                  >
+                    {price?.displayPrice ?? '-'}
+                  </Text>
+                )}
+              </View>
+
+              {selectedPlan === plan.id && (
+                <View style={styles.checkCircle}>
+                  <Text style={styles.checkMark}>✓</Text>
                 </View>
               )}
-              <Text
-                style={[
-                  styles.planPrice,
-                  selectedPlan === plan.id && styles.planPriceActive,
-                ]}
-              >
-                {plan.price}
-              </Text>
-            </View>
-
-            {selectedPlan === plan.id && (
-              <View style={styles.checkCircle}>
-                <Text style={styles.checkMark}>✓</Text>
-              </View>
-            )}
-          </TouchableOpacity>
-        ))}
+            </TouchableOpacity>
+          );
+        })}
+        {!pricesLoading && PLANS.some((plan) => !planPrices[plan.id]) && (
+          <Text style={styles.priceUnavailable}>
+            Google Play에서 가격 정보를 불러오지 못했어요.
+          </Text>
+        )}
 
         {/* 구독 버튼 */}
         <TouchableOpacity
@@ -518,6 +538,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   checkMark: { color: '#fff', fontSize: 14, fontWeight: '800' },
+  priceUnavailable: {
+    textAlign: 'center',
+    color: '#888',
+    fontSize: 12,
+    marginBottom: 12,
+  },
 
   // 구독 버튼
   subscribeBtn: {

@@ -4,6 +4,7 @@ import { authenticatedFetch, BASE_URL } from './api';
 
 type Iap = typeof import('react-native-iap');
 type Purchase = import('react-native-iap').Purchase;
+type FetchProductsResult = import('react-native-iap').FetchProductsResult;
 
 // Google Play Console에 등록한 구독 상품 ID와 일치해야 한다.
 export const SUBSCRIPTION_PRODUCT_IDS = {
@@ -15,6 +16,53 @@ const PLAN_TYPE_BY_PRODUCT_ID: Record<string, 'monthly' | 'yearly'> = {
   [SUBSCRIPTION_PRODUCT_IDS.monthly]: 'monthly',
   [SUBSCRIPTION_PRODUCT_IDS.yearly]: 'yearly',
 };
+
+// ========== 상품 가격 ==========
+// 구독 화면의 가격은 Google Play 상품 정보가 기준이다. 국가·통화별 가격과 Play Console의 가격 변경이
+// 앱 수정 없이 그대로 표시된다. openiap-google은 구독 상품의 displayPrice/price/currency를
+// 반복 결제 단계(무료 체험·할인 단계가 아니라 매 주기 청구되는 기본 요금)에서 채운다.
+export type PlanType = keyof typeof SUBSCRIPTION_PRODUCT_IDS;
+export type PlanPrice = { displayPrice: string; amount: number | null; currency: string };
+export type SubscriptionPlanPrices = Partial<Record<PlanType, PlanPrice>>;
+
+export function getSubscriptionPlanPrices(products: FetchProductsResult): SubscriptionPlanPrices {
+  const prices: SubscriptionPlanPrices = {};
+  for (const product of products ?? []) {
+    const plan = PLAN_TYPE_BY_PRODUCT_ID[product.id];
+    if (!plan || product.type !== 'subs' || !product.displayPrice) continue;
+    prices[plan] = {
+      displayPrice: product.displayPrice,
+      amount: product.price ?? null,
+      currency: product.currency,
+    };
+  }
+  return prices;
+}
+
+// 연간 요금의 월 환산 금액(표시용 문자열)과 월간 12개월 대비 절약률(%).
+// 금액을 모르거나 두 요금의 통화가 다르면 해당 값은 null이다.
+export function getYearlyPlanComparison(prices: SubscriptionPlanPrices): {
+  perMonth: string | null;
+  savingsPercent: number | null;
+} {
+  const { monthly, yearly } = prices;
+  if (!yearly?.amount) return { perMonth: null, savingsPercent: null };
+
+  let perMonth: string | null = null;
+  try {
+    perMonth = new Intl.NumberFormat(undefined, { style: 'currency', currency: yearly.currency })
+      .format(yearly.amount / 12);
+  } catch {
+    // 통화 코드를 형식화하지 못하면 월 환산 금액은 표시하지 않는다.
+  }
+
+  let savingsPercent: number | null = null;
+  if (monthly?.amount && monthly.currency === yearly.currency) {
+    const percent = Math.round((1 - yearly.amount / (monthly.amount * 12)) * 100);
+    if (percent > 0) savingsPercent = percent;
+  }
+  return { perMonth, savingsPercent };
+}
 
 // ========== Billing 연결 공유 ==========
 // react-native-iap 연결은 앱 전체에서 하나이고, initConnection/endConnection은 호출 횟수를 세지 않는다.
